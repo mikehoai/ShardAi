@@ -7,17 +7,28 @@ Complies with `.antigravity/rules.md`:
 """
 
 import asyncio
+import hashlib
 import logging
 import random
 from typing import Any
 
 import httpx
 
-from shard_engine.schemas import PeerNodeInfo, StartNodeRequest
+from shard_engine.schemas import PeerNodeInfo, RoomLobbyItem, StartNodeRequest
 
 logger = logging.getLogger("shardai.tracker")
 
 RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def hash_room_key(room_key: str | None) -> str | None:
+    """Compute a deterministic SHA-256 hex digest of a private room secret key."""
+    if room_key is None:
+        return None
+    cleaned = room_key.strip()
+    if not cleaned:
+        return None
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
 
 
 class SignalingTrackerClient:
@@ -110,12 +121,21 @@ class SignalingTrackerClient:
     async def register_node_and_fetch_peers(
         self, config: StartNodeRequest
     ) -> list[PeerNodeInfo]:
-        """Announce this node via HTTP POST /announce and retrieve active peer IPs for the model."""
+        """Announce this node via HTTP POST /announce with SHA-256 hashed room_key."""
+        n_layers: int = max(1, config.shard_layer_end - config.shard_layer_start + 1)
+        room_key_hash: str | None = hash_room_key(config.room_key)
         payload: dict[str, Any] = {
             "node_id": config.node_id,
             "model": config.model_id,
             "model_id": config.model_id,
+            "network_mode": config.network_mode.value,
+            "room_id": config.room_id,
+            "room_key_hash": room_key_hash,
+            "is_unlisted": config.is_unlisted,
+            "available_ram_gb": float(config.ram_gb),
             "ram_gb": config.ram_gb,
+            "n_layers": n_layers,
+            "port": config.p2p_listen_port,
             "p2p_port": config.p2p_listen_port,
             "shard_layer_start": config.shard_layer_start,
             "shard_layer_end": config.shard_layer_end,
@@ -127,22 +147,69 @@ class SignalingTrackerClient:
             json_payload=payload,
         )
         raw_peers: list[dict[str, Any]] = response_data.get("peers", [])
-        return [PeerNodeInfo.model_validate(peer) for peer in raw_peers]
+        normalized: list[PeerNodeInfo] = []
+        for raw in raw_peers:
+            normalized.append(
+                PeerNodeInfo(
+                    peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
+                    ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
+                    port=int(raw.get("port") or 49152),
+                    shard_layer_start=int(raw.get("shard_layer_start") or 0),
+                    shard_layer_end=int(raw.get("shard_layer_end") or 31),
+                    available_vram_mb=int(raw.get("available_vram_mb") or 0),
+                    room_id=str(raw.get("room_id") or config.room_id),
+                )
+            )
+        return normalized
 
-    async def fetch_peers(self, model_id: str) -> list[PeerNodeInfo]:
-        """Query the Signaling Server via HTTP GET for active peers hosting a specific model."""
+    async def fetch_available_rooms(self) -> list[RoomLobbyItem]:
+        """Fetch active public & locked rooms from Cloudflare Tracker GET /rooms."""
         response_data: dict[str, Any] = await self._request_with_retry(
             method="GET",
-            endpoint="/nodes/peers",
-            params={"model_id": model_id},
+            endpoint="/rooms",
+        )
+        raw_rooms: list[dict[str, Any]] = response_data.get("rooms", [])
+        return [RoomLobbyItem.model_validate(room) for room in raw_rooms]
+
+    async def fetch_peers(
+        self,
+        model_id: str,
+        room_id: str = "public",
+        room_key: str | None = None,
+    ) -> list[PeerNodeInfo]:
+        """Query the Signaling Server via HTTP GET for active peers in a room."""
+        params: dict[str, Any] = {"room_id": room_id}
+        key_hash = hash_room_key(room_key)
+        if key_hash is not None:
+            params["room_key_hash"] = key_hash
+        response_data: dict[str, Any] = await self._request_with_retry(
+            method="GET",
+            endpoint=f"/peers/{model_id}",
+            params=params,
         )
         raw_peers: list[dict[str, Any]] = response_data.get("peers", [])
-        return [PeerNodeInfo.model_validate(peer) for peer in raw_peers]
+        return [
+            PeerNodeInfo(
+                peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
+                ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
+                port=int(raw.get("port") or 49152),
+                shard_layer_start=int(raw.get("shard_layer_start") or 0),
+                shard_layer_end=int(raw.get("shard_layer_end") or 31),
+                available_vram_mb=int(raw.get("available_vram_mb") or 0),
+                room_id=str(raw.get("room_id") or room_id),
+            )
+            for raw in raw_peers
+        ]
 
-    async def unregister_node(self, node_id: str) -> None:
+    async def unregister_node(
+        self, node_id: str, room_id: str | None = None
+    ) -> None:
         """Notify the Signaling Server that this node is going offline."""
+        payload: dict[str, Any] = {"node_id": node_id}
+        if room_id is not None:
+            payload["room_id"] = room_id
         await self._request_with_retry(
             method="POST",
             endpoint="/nodes/leave",
-            json_payload={"node_id": node_id},
+            json_payload=payload,
         )

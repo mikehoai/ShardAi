@@ -1,7 +1,8 @@
-"""Pydantic schemas with strict typing for Tauri UI IPC and Signaling Server payloads."""
+"""Pydantic schemas with strict typing for Tauri UI IPC, Signaling Server, and OpenAI Gateway."""
 
 from enum import StrEnum
-from pydantic import BaseModel, Field
+from typing import Any, Literal
+from pydantic import BaseModel, Field, field_validator
 
 
 class NodeState(StrEnum):
@@ -21,6 +22,13 @@ class ComputeBackend(StrEnum):
     PYTORCH = "pytorch"
 
 
+class NetworkMode(StrEnum):
+    """Transport scope for P2P node discovery and direct tensor streaming."""
+
+    LAN = "lan"
+    INTERNET = "internet"
+
+
 class PeerNodeInfo(BaseModel):
     """Peer metadata returned by the central Signaling Server (Cloudflare Tracker)."""
 
@@ -30,6 +38,10 @@ class PeerNodeInfo(BaseModel):
     shard_layer_start: int = Field(..., ge=0, description="Starting transformer layer index")
     shard_layer_end: int = Field(..., ge=0, description="Ending transformer layer index")
     available_vram_mb: int = Field(default=0, ge=0, description="Available VRAM shared by peer")
+    room_id: str = Field(
+        default="public",
+        description="Room identifier ('public' or custom private room passphrase)",
+    )
 
 
 class StartNodeRequest(BaseModel):
@@ -43,7 +55,27 @@ class StartNodeRequest(BaseModel):
     )
     model_id: str = Field(
         default="meta-llama/Llama-3.1-8B-Instruct",
-        description="Target distributed LLM identifier (e.g., meta-llama/Llama-3.1-8B-Instruct, Qwen/Qwen2.5-7B-Instruct)",
+        min_length=1,
+        max_length=512,
+        description="HuggingFace Repo ID, HuggingFace URL, or local .gguf file path",
+    )
+    network_mode: NetworkMode = Field(
+        default=NetworkMode.INTERNET,
+        description="Network scope: 'lan' or 'internet'",
+    )
+    room_id: str = Field(
+        default="public",
+        max_length=128,
+        description="Room ID ('public' by default, or custom room name)",
+    )
+    room_key: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Optional secret key for private rooms; hashed with SHA-256 before transmission",
+    )
+    is_unlisted: bool = Field(
+        default=False,
+        description="If true, hide this room from the public Room Lobby browser",
     )
     backend: ComputeBackend = Field(
         default=ComputeBackend.LLAMA_CPP,
@@ -52,14 +84,14 @@ class StartNodeRequest(BaseModel):
     ram_gb: int = Field(
         default=4,
         ge=2,
-        le=16,
-        description="Shared system RAM in GB selected on the UI slider (2GB - 16GB)",
+        le=256,
+        description="Shared system RAM in GB selected on the UI slider",
     )
     shared_ram_gb: int = Field(
         default=4,
         ge=2,
-        le=16,
-        description="Alias for ram_gb selected on the Tauri UI slider (2GB - 16GB)",
+        le=256,
+        description="Alias for ram_gb selected on the Tauri UI slider",
     )
     max_ram_mb: int = Field(
         default=4096,
@@ -88,26 +120,61 @@ class StartNodeRequest(BaseModel):
         description="Total transformer layers across the distributed model pipeline",
     )
 
+    @field_validator("room_id", mode="before")
+    @classmethod
+    def _normalize_room_id(cls, value: str | None) -> str:
+        if value is None:
+            return "public"
+        cleaned = value.strip()
+        return cleaned if cleaned else "public"
+
+    @field_validator("room_key", mode="before")
+    @classmethod
+    def _normalize_room_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned if cleaned else None
+
+    @field_validator("model_id", mode="before")
+    @classmethod
+    def _normalize_model_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        # Normalize full HuggingFace URLs into owner/repo format
+        if cleaned.startswith("https://huggingface.co/") or cleaned.startswith(
+            "http://huggingface.co/"
+        ):
+            parts = cleaned.split("huggingface.co/", 1)[1].strip("/").split("/")
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+        return cleaned
+
 
 class GenerateRequest(BaseModel):
-    """Payload sent from Tauri/React UI to trigger distributed P2P pipeline inference."""
+    """Payload to trigger internal P2P pipeline SSE generation."""
 
-    prompt: str = Field(
-        ...,
-        min_length=1,
-        max_length=16384,
-        description="User prompt text to run through the distributed LLM pipeline",
-    )
-    max_tokens: int = Field(
-        default=16,
-        ge=1,
-        le=2048,
-        description="Maximum number of tokens to generate and stream via SSE",
-    )
-    compress_activations: bool = Field(
-        default=True,
-        description="Enable adaptive LZ4/Zlib compression on intermediate hidden-state tensors",
-    )
+    prompt: str = Field(..., min_length=1, max_length=16384)
+    max_tokens: int = Field(default=16, ge=1, le=2048)
+    compress_activations: bool = Field(default=True)
+
+
+class SystemMemoryResponse(BaseModel):
+    """Host system physical memory snapshot for safe RAM slider bounds."""
+
+    total_ram_gb: float
+    available_ram_gb: float
+    max_shareable_ram_gb: int
+
+
+class RoomLobbyItem(BaseModel):
+    """Public or Private (locked) room summary displayed in the Network Rooms Lobby."""
+
+    room_id: str
+    model: str
+    nodes_online: int = Field(..., ge=1)
+    total_shared_ram_gb: float = Field(..., ge=0.0)
+    is_private: bool = False
+    network_scope: Literal["internet", "lan", "hybrid"] = "internet"
 
 
 class NodeStatusResponse(BaseModel):
@@ -117,10 +184,58 @@ class NodeStatusResponse(BaseModel):
     node_id: str | None = None
     model_id: str | None = None
     model_path: str | None = None
+    network_mode: NetworkMode | None = None
+    room_id: str | None = None
+    is_private: bool = False
+    is_unlisted: bool = False
     backend: ComputeBackend | None = None
+    n_layers: int = 0
+    total_layers: int = 32
+    shard_layer_start: int | None = None
+    shard_layer_end: int | None = None
     allocated_ram_mb: int = 0
     allocated_vram_mb: int = 0
     p2p_listen_port: int | None = None
     connected_peers_count: int = 0
     peers: list[PeerNodeInfo] = Field(default_factory=list)
+    session_token: str | None = None
+    api_base_url: str | None = None
     message: str = ""
+
+
+# ==============================================================================
+# OpenAI-Compatible API Schemas (/v1/models & /v1/chat/completions)
+# ==============================================================================
+
+
+class ChatMessage(BaseModel):
+    """Single message entry in an OpenAI chat completions request."""
+
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | list[dict[str, Any]]
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    """OpenAI-compatible request payload for POST /v1/chat/completions."""
+
+    model: str = Field(..., min_length=1, description="Model identifier")
+    messages: list[ChatMessage] = Field(..., min_length=1)
+    stream: bool = Field(default=False, description="Enable OpenAI SSE token streaming")
+    max_tokens: int | None = Field(default=32, ge=1, le=4096)
+    temperature: float | None = Field(default=0.7, ge=0.0, le=2.0)
+
+
+class OpenAIModelObject(BaseModel):
+    """OpenAI-compatible model metadata entry."""
+
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "shardai-p2p"
+
+
+class OpenAIModelListResponse(BaseModel):
+    """OpenAI-compatible response for GET /v1/models."""
+
+    object: Literal["list"] = "list"
+    data: list[OpenAIModelObject]

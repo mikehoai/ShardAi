@@ -181,12 +181,94 @@ fn stop_python_core(state: State<'_, PythonCoreState>) -> Result<String, String>
     terminate_child_process(&state)
 }
 
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+}
+
+/// Returns the host OS's currently free physical RAM in gigabytes (GB).
+#[tauri::command]
+fn get_available_ram_gb() -> Result<f64, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status as *mut MemoryStatusEx) };
+        if ok == 0 {
+            return Err("GlobalMemoryStatusEx failed to read Windows physical memory.".to_string());
+        }
+        let gb = (status.ull_avail_phys as f64) / (1024.0 * 1024.0 * 1024.0);
+        return Ok((gb * 100.0).round() / 100.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|e| format!("Failed to read /proc/meminfo: {e}"))?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb_str = rest.split_whitespace().next().unwrap_or("0");
+                let kb: f64 = kb_str
+                    .parse()
+                    .map_err(|e| format!("Failed to parse MemAvailable: {e}"))?;
+                let gb = (kb * 1024.0) / (1024.0 * 1024.0 * 1024.0);
+                return Ok((gb * 100.0).round() / 100.0);
+            }
+        }
+        return Err("MemAvailable not found in /proc/meminfo.".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("vm_stat")
+            .output()
+            .map_err(|e| format!("Failed to execute vm_stat: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut free_pages: u64 = 0;
+        for line in text.lines() {
+            if line.contains("Pages free:") || line.contains("Pages inactive:") {
+                if let Some(val_part) = line.split(':').nth(1) {
+                    let num_str = val_part.trim().trim_end_matches('.');
+                    free_pages += num_str.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+        let avail_bytes = (free_pages as f64) * 4096.0;
+        let gb = avail_bytes / (1024.0 * 1024.0 * 1024.0);
+        return Ok((gb * 100.0).round() / 100.0);
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(PythonCoreState::default())
         .invoke_handler(tauri::generate_handler![
             start_python_core,
-            stop_python_core
+            stop_python_core,
+            get_available_ram_gb
         ])
         .on_window_event(|window, event| {
             if matches!(

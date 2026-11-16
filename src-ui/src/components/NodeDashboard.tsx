@@ -24,6 +24,8 @@ export const NodeDashboard: React.FC = () => {
     const request: StartNodeRequest = {
       node_id: "shardai-client-01",
       model_id: "meta-llama/Llama-3.1-8B-Instruct",
+      network_mode: "internet",
+      room_id: "public",
       backend: "llama_cpp",
       ram_gb: 4,
       shared_ram_gb: 4,
