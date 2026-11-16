@@ -115,23 +115,127 @@ class _HfTqdmProgressBridge:
     ) -> None:
         self.total: int = int(kwargs.get("total") or 0)
         self.n: int = int(kwargs.get("initial") or 0)
+        self.transfer_n: int = self.n
+        self._reported_n: int = self.n
+        self.desc: str = str(kwargs.get("desc") or "")
+        self.postfix: str = str(kwargs.get("postfix") or "")
+        self.disable: bool = bool(kwargs.get("disable", False))
+        self.pos: int = int(kwargs.get("position") or 0)
+        self._failed: bool = False
         self._on_progress: Callable[[int, int], None] | None = on_progress
         if self._on_progress is not None and self.total > 0:
-            self._on_progress(self.n, self.total)
+            self._emit_progress()
 
-    def update(self, n: int = 1) -> None:
-        self.n += int(n)
-        if self._on_progress is not None:
-            self._on_progress(self.n, self.total)
+    @classmethod
+    def with_callback(
+        cls,
+        on_progress: Callable[[int, int], None],
+    ) -> type["_HfTqdmProgressBridge"]:
+        """Return a `tqdm_class` subclass with `on_progress` bound at class level."""
+
+        class _BoundHfTqdmProgressBridge(_HfTqdmProgressBridge):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                kwargs.setdefault("on_progress", on_progress)
+                super().__init__(*args, **kwargs)
+
+        return _BoundHfTqdmProgressBridge
+
+    def _emit_progress(self) -> None:
+        if self._on_progress is None:
+            return
+        total = int(self.total or 0)
+        best_n = max(self.n, self.transfer_n)
+        if total > 0:
+            best_n = min(best_n, total)
+        self._reported_n = max(self._reported_n, best_n)
+        self._on_progress(self._reported_n, total)
+
+    def update(self, n: int | float | None = 1) -> None:
+        delta = int(n or 0)
+        self.n = max(0, self.n + delta)
+        if delta < 0:
+            self._reported_n = min(self._reported_n, self.n)
+        self._emit_progress()
+
+    def update_transfer(self, n: int | float | None = 1) -> None:
+        delta = int(n or 0)
+        self.transfer_n = max(0, self.transfer_n + delta)
+        if delta < 0:
+            self._reported_n = min(self._reported_n, max(self.n, self.transfer_n))
+        self._emit_progress()
+
+    def refresh(self, *args: Any, **kwargs: Any) -> None:
+        self._emit_progress()
+
+    def set_postfix_str(self, s: str = "", refresh: bool = True) -> None:
+        self.postfix = s
+        if refresh:
+            self.refresh()
+
+    def set_transfer_postfix_str(self, s: str = "", refresh: bool = True) -> None:
+        self.postfix = s
+        if refresh:
+            self.refresh()
+
+    def set_postfix(
+        self,
+        ordered_dict: Any = None,
+        refresh: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        if ordered_dict is not None:
+            self.postfix = str(ordered_dict)
+        elif kwargs:
+            self.postfix = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        if refresh:
+            self.refresh()
+
+    def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
+        if desc is not None:
+            self.desc = desc
+        if refresh:
+            self.refresh()
+
+    def set_description_str(self, desc: str | None = None, refresh: bool = True) -> None:
+        if desc is not None:
+            self.desc = desc
+        if refresh:
+            self.refresh()
+
+    def clear(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def display(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def reset(self, total: int | None = None) -> None:
+        self.n = 0
+        self.transfer_n = 0
+        self._reported_n = 0
+        if total is not None:
+            self.total = int(total)
+
+    @property
+    def format_dict(self) -> dict[str, Any]:
+        return {
+            "n": self.n,
+            "total": self.total,
+            "rate": None,
+            "elapsed": 0.0,
+        }
 
     def close(self) -> None:
-        if self._on_progress is not None and self.total > 0:
-            self._on_progress(self.total, self.total)
+        total = int(self.total or 0)
+        if not self._failed and self._on_progress is not None and total > 0:
+            self._reported_n = total
+            self._on_progress(total, total)
 
     def __enter__(self) -> "_HfTqdmProgressBridge":
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if exc_type is not None:
+            self._failed = True
         self.close()
 
 
@@ -382,8 +486,7 @@ class ModelDownloader:
                 )
                 loop.call_soon_threadsafe(_emit, evt)
 
-            def _tqdm_factory(*args: Any, **kwargs: Any) -> _HfTqdmProgressBridge:
-                return _HfTqdmProgressBridge(*args, on_progress=_progress_hook, **kwargs)
+            tqdm_bridge_cls = _HfTqdmProgressBridge.with_callback(_progress_hook)
 
             logger.info("Downloading %s/%s into %s", repo_id, filename, model_dir)
             downloaded_str: str = await asyncio.to_thread(
@@ -391,7 +494,7 @@ class ModelDownloader:
                 repo_id=repo_id,
                 filename=filename,
                 local_dir=str(model_dir),
-                tqdm_class=_tqdm_factory,
+                tqdm_class=tqdm_bridge_cls,
             )
             return Path(downloaded_str).resolve()
 
