@@ -9,9 +9,11 @@
 *.onnx
 *.ckpt
 *.h5
-models/
+/models/
 shards/
 cache_models/
+!core-engine/models/
+!core-engine/models/**/*.py
 
 # ==============================================================================
 # 2. Python & Virtual Environments (core-engine)
