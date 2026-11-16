@@ -15,7 +15,9 @@ from contextlib import asynccontextmanager
 import json
 import logging
 import os
+from pathlib import Path
 import secrets
+import socket
 import time
 from typing import Any
 import uuid
@@ -30,6 +32,8 @@ from models.downloader import (
     SUPPORTED_MODELS,
     DownloadProgressEvent,
     ModelDownloader,
+    is_offline_mode,
+    read_hf_config_summary,
 )
 from models.shard_runner import ShardModelRunner
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
@@ -73,9 +77,9 @@ logging.basicConfig(
 logger = logging.getLogger("shardai.main")
 
 
-def _extract_prompt_from_messages(messages: list[ChatMessage]) -> str:
-    """Flatten OpenAI chat messages into a single prompt string for the Head Node tokenizer."""
-    parts: list[str] = []
+def _extract_chat_messages_dicts(messages: list[ChatMessage]) -> list[dict[str, str]]:
+    """Convert OpenAI `ChatMessage` models into simple `{role, content}` dicts."""
+    normalized: list[dict[str, str]] = []
     for msg in messages:
         if isinstance(msg.content, str):
             text = msg.content.strip()
@@ -86,8 +90,34 @@ def _extract_prompt_from_messages(messages: list[ChatMessage]) -> str:
                 if isinstance(block, dict)
             ).strip()
         if text:
-            parts.append(f"[{msg.role}] {text}")
+            normalized.append({"role": msg.role, "content": text})
+    return normalized or [{"role": "user", "content": "Hello"}]
+
+
+def _extract_prompt_from_messages(messages: list[ChatMessage]) -> str:
+    """Flatten OpenAI chat messages into a single prompt string for fallback tokenizers."""
+    parts: list[str] = [
+        f"[{item['role']}] {item['content']}"
+        for item in _extract_chat_messages_dicts(messages)
+    ]
     return "\n".join(parts) if parts else "Hello"
+
+
+def _resolve_advertise_ip(target_peer_ip: str, target_peer_port: int) -> str:
+    """Resolve the local IPv4 address reachable by `target_peer_ip` for return token frames."""
+    explicit_ip = os.getenv("SHARDAI_ADVERTISE_IP", "").strip()
+    if explicit_ip:
+        return explicit_ip
+    if target_peer_ip.startswith("127.") or target_peer_ip == "localhost":
+        return "127.0.0.1"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((target_peer_ip, target_peer_port))
+        return str(sock.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
 
 
 class LocalNodeRuntime:
@@ -115,6 +145,7 @@ class LocalNodeRuntime:
         self.model_runner: ShardModelRunner | None = None
         self.p2p_server: asyncio.AbstractServer | None = None
         self.pending_token_queues: dict[str, asyncio.Queue[DecodedTokenFrame]] = {}
+        self._compute_lock: asyncio.Lock = asyncio.Lock()
         self.tracker_client: SignalingTrackerClient = SignalingTrackerClient(
             base_url=os.getenv(
                 "SHARDAI_TRACKER_URL", "https://tracker.shardai.network/api/v1"
@@ -147,23 +178,30 @@ class LocalNodeRuntime:
             logger.warning("Ignoring incoming activation frame because node is not RUNNING.")
             return
 
-        output_tensor_bytes, output_shape = self.model_runner.forward_pass(
-            frame.raw_tensor_bytes,
-            shape=frame.shape,
-        )
-        completed_layer: int = self.shard_layer_end
+        async with self._compute_lock:
+            output_tensor_bytes, output_shape = await asyncio.to_thread(
+                self.model_runner.forward_pass,
+                frame.raw_tensor_bytes,
+                shape=frame.shape,
+                request_id=frame.request_id,
+                step_index=frame.step_index,
+            )
 
+        completed_layer: int = self.shard_layer_end
         is_final_layer: bool = completed_layer >= (frame.total_layers - 1)
         next_peer: PeerNodeInfo | None = (
             None if is_final_layer else self.find_next_hop_peer(completed_layer)
         )
 
-        if is_final_layer or next_peer is None:
-            token_id, token_text, is_eos = self.model_runner.decode_final_layer_to_token(
-                output_tensor_bytes,
-                step_index=frame.step_index,
-                max_tokens=frame.max_tokens,
-            )
+        if is_final_layer or (not self.model_runner.is_real_model and next_peer is None):
+            async with self._compute_lock:
+                token_id, token_text, is_eos = await asyncio.to_thread(
+                    self.model_runner.decode_final_layer_to_token,
+                    output_tensor_bytes,
+                    step_index=frame.step_index,
+                    max_tokens=frame.max_tokens,
+                    request_id=frame.request_id,
+                )
             token_packet: bytes = serialize_decoded_token(
                 request_id=frame.request_id,
                 step_index=frame.step_index,
@@ -176,7 +214,7 @@ class LocalNodeRuntime:
                 byte_stream=token_packet,
                 peer_port=frame.origin_port,
             )
-        else:
+        elif next_peer is not None:
             next_frame_bytes: bytes = serialize_activation_tensor(
                 tensor_data=output_tensor_bytes,
                 shape=output_shape,
@@ -195,6 +233,13 @@ class LocalNodeRuntime:
                 byte_stream=next_frame_bytes,
                 peer_port=next_peer.port,
             )
+        else:
+            logger.error(
+                "Middle node completed layer %d/%d but no downstream peer is registered for layer %d.",
+                completed_layer,
+                frame.total_layers - 1,
+                completed_layer + 1,
+            )
 
     async def handle_incoming_decoded_token(self, token_frame: DecodedTokenFrame) -> None:
         """Callback triggered on the Head Node when the Tail Node returns a decoded token."""
@@ -207,6 +252,8 @@ class LocalNodeRuntime:
         prompt: str,
         max_tokens: int,
         compress_activations: bool = True,
+        messages: list[dict[str, str]] | None = None,
+        temperature: float = 0.7,
     ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
         """Execute distributed P2P pipeline inference and yield `(request_id, step, token_id, text, is_eos)`."""
         if self.state != NodeState.RUNNING or self.model_runner is None:
@@ -223,16 +270,49 @@ class LocalNodeRuntime:
                 ),
             )
 
+        next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
+            self.shard_layer_end
+        )
+        if (
+            self.model_runner.is_real_model
+            and self.shard_layer_end < (self.total_layers - 1)
+            and next_peer_initial is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"This node hosts layers {self.shard_layer_start}..{self.shard_layer_end} of "
+                    f"{self.total_layers}, and no downstream peer is registered for layer "
+                    f"{self.shard_layer_end + 1}. Register peers via POST /peers/register or "
+                    "allocate enough RAM to host all layers."
+                ),
+            )
+
         request_id: str = str(uuid.uuid4())
         token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue()
         self.pending_token_queues[request_id] = token_queue
 
         try:
-            token_ids: list[int] = self.model_runner.tokenize(prompt)
+            if messages and self.model_runner.is_real_model:
+                token_ids: list[int] = self.model_runner.tokenize_chat(messages)
+            else:
+                token_ids = self.model_runner.tokenize(prompt)
             origin_port: int = self.p2p_listen_port or 49152
 
             for step_idx in range(max_tokens):
-                hidden_bytes, tensor_shape = self.model_runner.forward_pass(token_ids)
+                step_input_ids: list[int] = (
+                    token_ids
+                    if (step_idx == 0 or not self.model_runner.is_real_model)
+                    else [token_ids[-1]]
+                )
+                async with self._compute_lock:
+                    hidden_bytes, tensor_shape = await asyncio.to_thread(
+                        self.model_runner.forward_pass,
+                        step_input_ids,
+                        request_id=request_id,
+                        step_index=step_idx,
+                    )
+
                 next_peer: PeerNodeInfo | None = self.find_next_hop_peer(
                     self.shard_layer_end
                 )
@@ -241,11 +321,14 @@ class LocalNodeRuntime:
                     next_peer is not None
                     and self.shard_layer_end < (self.total_layers - 1)
                 ):
+                    advertise_ip: str = _resolve_advertise_ip(
+                        next_peer.ip_address, next_peer.port
+                    )
                     binary_frame: bytes = serialize_activation_tensor(
                         tensor_data=hidden_bytes,
                         shape=tensor_shape,
                         request_id=request_id,
-                        origin_ip="127.0.0.1",
+                        origin_ip=advertise_ip,
                         origin_port=origin_port,
                         current_layer=self.shard_layer_end,
                         total_layers=self.total_layers,
@@ -261,20 +344,23 @@ class LocalNodeRuntime:
                     )
                     decoded_frame: DecodedTokenFrame = await asyncio.wait_for(
                         token_queue.get(),
-                        timeout=10.0,
+                        timeout=60.0,
                     )
                     token_id = decoded_frame.token_id
                     token_text = decoded_frame.token_text
                     is_eos = decoded_frame.is_eos
                 else:
-                    token_id, token_text, is_eos = (
-                        self.model_runner.decode_final_layer_to_token(
+                    async with self._compute_lock:
+                        token_id, token_text, is_eos = await asyncio.to_thread(
+                            self.model_runner.decode_final_layer_to_token,
                             hidden_bytes,
                             step_index=step_idx,
                             max_tokens=max_tokens,
+                            request_id=request_id,
+                            temperature=temperature,
                         )
-                    )
-                    await asyncio.sleep(0.015)
+                    if not self.model_runner.is_real_model:
+                        await asyncio.sleep(0.015)
 
                 yield request_id, step_idx, token_id, token_text, is_eos
 
@@ -283,6 +369,8 @@ class LocalNodeRuntime:
                     break
         finally:
             self.pending_token_queues.pop(request_id, None)
+            if self.model_runner is not None:
+                self.model_runner.release_request_cache(request_id)
 
     async def start_p2p_listener(
         self,
@@ -441,13 +529,18 @@ async def get_host_system_memory() -> SystemMemoryResponse:
     )
 
 
+def _is_tracker_enabled() -> bool:
+    """Return True when outbound Cloudflare Signaling Tracker calls are enabled."""
+    return os.getenv("SHARDAI_ENABLE_TRACKER", "false").lower() == "true" and not is_offline_mode()
+
+
 @app.get("/available-rooms", response_model=list[RoomLobbyItem])
 async def get_available_rooms() -> list[RoomLobbyItem]:
     """Fetch active rooms from Cloudflare Tracker (GET /rooms) merged with LAN mDNS scan."""
     merged: dict[str, RoomLobbyItem] = {}
 
-    # 1. Query Cloudflare Signaling Tracker when not in strict offline mode
-    if os.getenv("SHARDAI_OFFLINE_MODE", "true").lower() != "true":
+    # 1. Query Cloudflare Signaling Tracker when enabled
+    if _is_tracker_enabled():
         try:
             cloud_rooms = await runtime.tracker_client.fetch_available_rooms()
             for item in cloud_rooms:
@@ -494,15 +587,30 @@ async def list_supported_models() -> list[str]:
 
 
 @app.get("/models/download-stream")
-async def stream_model_download(model_id: str) -> StreamingResponse:
+async def stream_model_download(
+    model_id: str,
+    shard_layer_start: int | None = None,
+    shard_layer_end: int | None = None,
+    ram_gb: int | None = None,
+) -> StreamingResponse:
     """Ensure any requested preset, custom HF repo, or local `.gguf` model is ready."""
     try:
-        runtime.model_downloader.resolve_safe_gguf_path(model_id)
+        if not is_offline_mode() and Path(model_id.strip()).suffix.lower() != ".gguf":
+            runtime.model_downloader.resolve_safe_model_dir(model_id)
+        else:
+            runtime.model_downloader.resolve_safe_gguf_path(model_id)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
+
+    resolved_start = shard_layer_start
+    resolved_end = shard_layer_end
+    if resolved_start is None and resolved_end is None and ram_gb is not None:
+        pre_plan = calculate_max_layers(model_id=model_id, ram_gb=max(2, ram_gb))
+        resolved_start = pre_plan.shard_layer_start
+        resolved_end = pre_plan.shard_layer_end
 
     progress_queue: asyncio.Queue[DownloadProgressEvent | None] = asyncio.Queue()
 
@@ -514,6 +622,8 @@ async def stream_model_download(model_id: str) -> StreamingResponse:
             await runtime.model_downloader.ensure_model_downloaded(
                 model_id=model_id,
                 on_event=_on_progress,
+                shard_layer_start=resolved_start,
+                shard_layer_end=resolved_end,
             )
         except Exception as exc:
             progress_queue.put_nowait(
@@ -588,37 +698,89 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
 
     runtime.state = NodeState.STARTING
     try:
-        # 1. Resolve or download `.gguf` model (preset, custom HF repo, or local path)
-        local_gguf_path = await runtime.model_downloader.ensure_model_downloaded(
-            request.model_id
+        # 1. Pre-plan shard range from `ram_gb` (or respect explicit P2P split range)
+        pre_plan = calculate_max_layers(
+            model_id=request.model_id,
+            ram_gb=effective_ram_gb,
+            requested_start=request.shard_layer_start,
+        )
+        target_start: int = pre_plan.shard_layer_start
+        target_end: int = pre_plan.shard_layer_end
+        if request.exact_shard_range:
+            max_allowed_end = min(
+                pre_plan.total_layers - 1,
+                request.shard_layer_start + pre_plan.n_layers - 1,
+            )
+            target_start = request.shard_layer_start
+            target_end = min(request.shard_layer_end, max_allowed_end)
+
+        # 2. Download/resolve Safetensors shard directory (online HF) or `.gguf` model
+        local_model_path = await runtime.model_downloader.ensure_model_downloaded(
+            request.model_id,
+            shard_layer_start=target_start,
+            shard_layer_end=target_end,
         )
 
-        # 2. Compute safe max n_layers for `ram_gb` to prevent OOM
+        # 3. Recompute exact layer plan from downloaded `config.json` / binary size
         layer_plan = calculate_max_layers(
             model_id=request.model_id,
             ram_gb=effective_ram_gb,
-            model_path=local_gguf_path,
+            model_path=local_model_path,
             requested_start=request.shard_layer_start,
         )
-        request.total_layers = layer_plan.total_layers
-        request.shard_layer_start = layer_plan.shard_layer_start
-        request.shard_layer_end = layer_plan.shard_layer_end
+        if request.exact_shard_range:
+            cfg_total = (
+                read_hf_config_summary(local_model_path)[0]
+                if local_model_path.is_dir()
+                else layer_plan.total_layers
+            )
+            final_start = max(0, min(request.shard_layer_start, cfg_total - 1))
+            max_allowed_end = min(
+                cfg_total - 1,
+                final_start + layer_plan.n_layers - 1,
+            )
+            final_end = max(final_start, min(request.shard_layer_end, max_allowed_end))
+            final_n_layers = final_end - final_start + 1
+            final_total_layers = cfg_total
+            final_est_ram = min(
+                request.max_ram_mb,
+                round(
+                    (0.6 + (final_n_layers * (layer_plan.per_layer_mb / 1024.0))) * 1024.0
+                ),
+            )
+        else:
+            final_start = layer_plan.shard_layer_start
+            final_end = layer_plan.shard_layer_end
+            final_n_layers = layer_plan.n_layers
+            final_total_layers = layer_plan.total_layers
+            final_est_ram = layer_plan.estimated_ram_mb
 
-        # 3. Allocate local RAM/VRAM & initialize `llama_cpp` with computed `n_layers`
+        request.total_layers = final_total_layers
+        request.shard_layer_start = final_start
+        request.shard_layer_end = final_end
+
+        # 4. Allocate local RAM/VRAM & load ONLY the assigned layers into ShardModelRunner
         runtime.memory_manager.allocate_shard(
             request,
-            estimated_ram_mb=layer_plan.estimated_ram_mb,
+            estimated_ram_mb=final_est_ram,
         )
-        runtime.model_runner = ShardModelRunner(
+        runtime.model_runner = await asyncio.to_thread(
+            ShardModelRunner,
             model_id=request.model_id,
-            model_path=str(local_gguf_path),
-            shard_layer_start=layer_plan.shard_layer_start,
-            shard_layer_end=layer_plan.shard_layer_end,
-            total_layers=layer_plan.total_layers,
-            n_layers=layer_plan.n_layers,
+            model_path=str(local_model_path),
+            shard_layer_start=final_start,
+            shard_layer_end=final_end,
+            total_layers=final_total_layers,
+            n_layers=final_n_layers,
+            max_ram_mb=request.max_ram_mb,
+        )
+        effective_backend = (
+            ComputeBackend.PYTORCH
+            if runtime.model_runner.is_real_model
+            else request.backend
         )
 
-        # 4. Start P2P binary activation listener & LAN mDNS advertiser
+        # 5. Start P2P binary activation listener & LAN mDNS advertiser
         await runtime.start_p2p_listener(
             request.p2p_listen_port,
             network_mode=request.network_mode,
@@ -638,9 +800,9 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
             )
         )
 
-        # 5. Announce to Cloudflare Tracker (with SHA-256 hashed room_key & is_unlisted)
+        # 6. Announce to Cloudflare Tracker when enabled
         discovered_peers: list[PeerNodeInfo] = []
-        if os.getenv("SHARDAI_OFFLINE_MODE", "true").lower() != "true":
+        if _is_tracker_enabled():
             try:
                 discovered_peers = await runtime.tracker_client.register_node_and_fetch_peers(
                     request
@@ -651,30 +813,33 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail=f"Invalid room key for private room '{request.room_id}'.",
                     ) from http_exc
-                raise
+                logger.warning("Tracker registration HTTP error: %s", http_exc)
+            except Exception as tracker_exc:
+                logger.warning("Tracker unreachable; continuing in local/LAN P2P mode: %s", tracker_exc)
 
-        # 6. Issue cryptographic Session Token stored strictly in process RAM
+        # 7. Issue cryptographic Session Token stored strictly in process RAM
         runtime.session_token = f"sk-shard-{secrets.token_urlsafe(24)}"
         runtime.node_id = request.node_id
         runtime.model_id = request.model_id
-        runtime.model_path = str(local_gguf_path)
+        runtime.model_path = str(local_model_path)
         runtime.network_mode = request.network_mode
         runtime.room_id = request.room_id
         runtime.is_private = is_private_room
         runtime.is_unlisted = request.is_unlisted
-        runtime.backend = request.backend
+        runtime.backend = effective_backend
         runtime.p2p_listen_port = request.p2p_listen_port
-        runtime.n_layers = layer_plan.n_layers
-        runtime.shard_layer_start = layer_plan.shard_layer_start
-        runtime.shard_layer_end = layer_plan.shard_layer_end
-        runtime.total_layers = layer_plan.total_layers
+        runtime.n_layers = final_n_layers
+        runtime.shard_layer_start = final_start
+        runtime.shard_layer_end = final_end
+        runtime.total_layers = final_total_layers
         runtime.peers = discovered_peers
         runtime.state = NodeState.RUNNING
 
         return runtime.to_status_response(
             message=(
                 f"Gateway Active ({request.network_mode.value.upper()} / Room: '{request.room_id}') — "
-                f"{layer_plan.n_layers}/{layer_plan.total_layers} layers loaded."
+                f"layers {final_start}..{final_end} ({final_n_layers}/{final_total_layers}) loaded "
+                f"[{effective_backend.value}]."
             )
         )
     except HTTPException:
@@ -720,7 +885,7 @@ async def stop_node() -> NodeStatusResponse:
     try:
         if (
             active_node_id is not None
-            and os.getenv("SHARDAI_OFFLINE_MODE", "true").lower() != "true"
+            and _is_tracker_enabled()
         ):
             await runtime.tracker_client.unregister_node(
                 active_node_id,
@@ -803,7 +968,9 @@ async def openai_chat_completions(
     and `stream: false` (single JSON completion payload) for IDE / curl integration.
     """
     prompt_text: str = _extract_prompt_from_messages(request.messages)
-    max_tokens: int = request.max_tokens or 32
+    chat_messages: list[dict[str, str]] = _extract_chat_messages_dicts(request.messages)
+    max_tokens: int = request.max_tokens or 256
+    temperature: float = request.temperature if request.temperature is not None else 0.7
     completion_id: str = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created_ts: int = int(time.time())
     served_model: str = request.model or runtime.model_id or "shardai-p2p-model"
@@ -833,8 +1000,12 @@ async def openai_chat_completions(
                     prompt=prompt_text,
                     max_tokens=max_tokens,
                     compress_activations=True,
+                    messages=chat_messages,
+                    temperature=temperature,
                 )
             ):
+                if not token_text:
+                    continue
                 content_chunk = json.dumps(
                     {
                         "id": completion_id,
@@ -887,6 +1058,8 @@ async def openai_chat_completions(
             prompt=prompt_text,
             max_tokens=max_tokens,
             compress_activations=True,
+            messages=chat_messages,
+            temperature=temperature,
         )
     ):
         collected_tokens.append(token_text)

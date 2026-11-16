@@ -1,19 +1,27 @@
 """Pytest suite for `core-engine` local API, P2P binary serialization, and pipeline inference."""
 
 from array import array
+import asyncio
 import json
+import os
+from pathlib import Path
 import uuid
+
+os.environ.setdefault("SHARDAI_OFFLINE_MODE", "true")
 
 from fastapi.testclient import TestClient
 import httpx
 import pytest
 
 from main import app, runtime
+from models.downloader import filter_required_safetensors_files
 from models.shard_runner import ShardModelRunner
 from p2p.serializer import (
     CompressionCodec,
+    DecodedTokenFrame,
     deserialize_activation_tensor,
     serialize_activation_tensor,
+    serialize_decoded_token,
 )
 from p2p.transport import receive_activations, send_activations
 from shard_engine.memory_manager import calculate_max_layers
@@ -431,3 +439,171 @@ async def test_tracker_fetch_available_rooms() -> None:
     assert rooms[0].is_private is False
     assert rooms[1].room_id == "vault-99"
     assert rooms[1].is_private is True
+
+
+def test_filter_required_safetensors_files_selects_only_assigned_shard() -> None:
+    """Verify each node downloads only the `.safetensors` files for its layer range."""
+    weight_map: dict[str, str] = {
+        "model.embed_tokens.weight": "model-00001-of-00004.safetensors",
+        "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00004.safetensors",
+        "model.layers.15.mlp.gate_proj.weight": "model-00002-of-00004.safetensors",
+        "model.layers.16.self_attn.q_proj.weight": "model-00003-of-00004.safetensors",
+        "model.layers.31.mlp.down_proj.weight": "model-00004-of-00004.safetensors",
+        "model.norm.weight": "model-00004-of-00004.safetensors",
+        "lm_head.weight": "model-00004-of-00004.safetensors",
+    }
+
+    head_files = filter_required_safetensors_files(
+        weight_map=weight_map,
+        shard_layer_start=0,
+        shard_layer_end=15,
+        total_layers=32,
+    )
+    assert head_files == [
+        "model-00001-of-00004.safetensors",
+        "model-00002-of-00004.safetensors",
+    ]
+
+    tail_files = filter_required_safetensors_files(
+        weight_map=weight_map,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        total_layers=32,
+    )
+    assert tail_files == [
+        "model-00003-of-00004.safetensors",
+        "model-00004-of-00004.safetensors",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_two_node_pytorch_p2p_pipeline_inference_over_tcp(tmp_path: Path) -> None:
+    """Verify 2-node PyTorch layer-sharded pipeline over TCP matches unsharded greedy decoding."""
+    import torch
+    from safetensors.torch import save_model
+    from transformers import AutoModelForCausalLM, Qwen2Config
+
+    cfg = Qwen2Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        tie_word_embeddings=True,
+    )
+    torch.manual_seed(42)
+    full_model = AutoModelForCausalLM.from_config(cfg).eval()
+    cfg.save_pretrained(str(tmp_path))
+    save_model(full_model, str(tmp_path / "model.safetensors"))
+
+    prompt_ids = [3, 11, 27, 42]
+    expected_tokens: list[int] = []
+    with torch.inference_mode():
+        cur_ids = torch.tensor([prompt_ids], dtype=torch.long)
+        for _ in range(4):
+            logits = full_model(cur_ids).logits[:, -1, :]
+            next_id = int(torch.argmax(logits, dim=-1).item())
+            expected_tokens.append(next_id)
+            cur_ids = torch.cat([cur_ids, torch.tensor([[next_id]])], dim=1)
+
+    head_runner = ShardModelRunner(
+        model_id="test/tiny-qwen2",
+        model_path=str(tmp_path),
+        shard_layer_start=0,
+        shard_layer_end=1,
+        total_layers=4,
+        max_ram_mb=2048,
+    )
+    tail_runner = ShardModelRunner(
+        model_id="test/tiny-qwen2",
+        model_path=str(tmp_path),
+        shard_layer_start=2,
+        shard_layer_end=3,
+        total_layers=4,
+        max_ram_mb=2048,
+    )
+
+    assert head_runner.is_real_model is True
+    assert tail_runner.is_real_model is True
+    assert head_runner.is_head_node and not head_runner.is_tail_node
+    assert tail_runner.is_tail_node and not tail_runner.is_head_node
+
+    token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue()
+
+    async def _on_head_token(tok_frame: DecodedTokenFrame) -> None:
+        await token_queue.put(tok_frame)
+
+    async def _on_tail_activation(frame) -> None:
+        out_bytes, _shape = tail_runner.forward_pass(
+            frame.raw_tensor_bytes,
+            shape=frame.shape,
+            request_id=frame.request_id,
+            step_index=frame.step_index,
+        )
+        tok_id, tok_text, is_eos = tail_runner.decode_final_layer_to_token(
+            out_bytes,
+            step_index=frame.step_index,
+            max_tokens=frame.max_tokens,
+            request_id=frame.request_id,
+            temperature=0.0,
+        )
+        packet = serialize_decoded_token(
+            request_id=frame.request_id,
+            step_index=frame.step_index,
+            token_id=tok_id,
+            token_text=tok_text,
+            is_eos=is_eos,
+        )
+        await send_activations("127.0.0.1", packet, peer_port=frame.origin_port)
+
+    head_server = await receive_activations(
+        host="127.0.0.1",
+        port=49331,
+        on_activation_frame=lambda _f: asyncio.sleep(0),
+        on_token_frame=_on_head_token,
+    )
+    tail_server = await receive_activations(
+        host="127.0.0.1",
+        port=49332,
+        on_activation_frame=_on_tail_activation,
+    )
+
+    try:
+        req_id = str(uuid.uuid4())
+        generated_tokens: list[int] = []
+        current_input = list(prompt_ids)
+        for step_idx in range(4):
+            step_tokens = current_input if step_idx == 0 else [current_input[-1]]
+            hidden_bytes, shape = head_runner.forward_pass(
+                step_tokens,
+                request_id=req_id,
+                step_index=step_idx,
+            )
+            wire_frame = serialize_activation_tensor(
+                tensor_data=hidden_bytes,
+                shape=shape,
+                request_id=req_id,
+                origin_ip="127.0.0.1",
+                origin_port=49331,
+                current_layer=1,
+                total_layers=4,
+                step_index=step_idx,
+                max_tokens=4,
+                force_compression=True,
+            )
+            await send_activations("127.0.0.1", wire_frame, peer_port=49332)
+            decoded = await asyncio.wait_for(token_queue.get(), timeout=5.0)
+            generated_tokens.append(decoded.token_id)
+            current_input.append(decoded.token_id)
+
+        assert generated_tokens == expected_tokens
+    finally:
+        head_server.close()
+        tail_server.close()
+        await head_server.wait_closed()
+        await tail_server.wait_closed()
+        head_runner.release()
+        tail_runner.release()
+        assert head_runner.is_real_model is False
+        assert tail_runner.is_real_model is False

@@ -15,6 +15,14 @@ const DEFAULT_MAX_RAM_GB = 16;
 
 const SUGGESTED_MODELS = [
   {
+    id: "Qwen/Qwen2.5-0.5B-Instruct",
+    label: "Qwen 2.5 0.5B (Fast CPU / Test)",
+  },
+  {
+    id: "HuggingFaceTB/SmolLM2-360M-Instruct",
+    label: "SmolLM2 360M (Ultra-Light Test)",
+  },
+  {
     id: "meta-llama/Llama-3.1-8B-Instruct",
     label: "Llama 3.1 8B",
   },
@@ -210,7 +218,7 @@ export const Dashboard: React.FC = () => {
     }
 
     const response = await fetch(
-      `${LOCAL_ENGINE_ROOT}/models/download-stream?model_id=${encodeURIComponent(modelId)}`
+      `${LOCAL_ENGINE_ROOT}/models/download-stream?model_id=${encodeURIComponent(modelId)}&ram_gb=${sharedRamGb}`
     );
     if (!response.ok || !response.body) {
       throw new Error(`Failed to stream model download: HTTP ${response.status}`);

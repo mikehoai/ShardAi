@@ -119,6 +119,10 @@ class StartNodeRequest(BaseModel):
         le=512,
         description="Total transformer layers across the distributed model pipeline",
     )
+    exact_shard_range: bool = Field(
+        default=False,
+        description="If true, load exact [shard_layer_start..shard_layer_end] capped by RAM limit",
+    )
 
     @field_validator("room_id", mode="before")
     @classmethod
@@ -221,7 +225,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     model: str = Field(..., min_length=1, description="Model identifier")
     messages: list[ChatMessage] = Field(..., min_length=1)
     stream: bool = Field(default=False, description="Enable OpenAI SSE token streaming")
-    max_tokens: int | None = Field(default=32, ge=1, le=4096)
+    max_tokens: int | None = Field(default=256, ge=1, le=4096)
     temperature: float | None = Field(default=0.7, ge=0.0, le=2.0)
 
 

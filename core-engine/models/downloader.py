@@ -1,14 +1,17 @@
-"""Hugging Face Hub GGUF Model Downloader with Real-Time SSE Progress Broadcasting.
+"""Hugging Face Hub Model & Shard Downloader with Real-Time SSE Progress Broadcasting.
 
 Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
-- Uses `huggingface_hub.hf_hub_download` to fetch `.gguf` model shards.
+- Uses `huggingface_hub.hf_hub_download` to fetch `.safetensors` layer shards (or `.gguf` files).
+- Supports selective shard downloading via `model.safetensors.index.json` so each peer only
+  downloads the `.safetensors` files containing its assigned transformer layers.
 - Verifies canonical paths (`Path.resolve()`) inside `cache_models/` to prevent Path Traversal.
-- Broadcasts live percentage updates (`0%` .. `100%`) over Server-Sent Events (SSE) for the React UI Progress Bar.
+- Broadcasts live percentage updates (`0%` .. `100%`) over Server-Sent Events (SSE) for the UI.
 """
 
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+import json
 import logging
 import os
 from pathlib import Path
@@ -23,10 +26,26 @@ except ImportError:
 
 logger = logging.getLogger("shardai.models.downloader")
 
+_HF_ESSENTIAL_FILES: tuple[str, ...] = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer.model",
+)
+
+
+def is_offline_mode() -> bool:
+    """Return True when strict offline simulation mode is enabled via `SHARDAI_OFFLINE_MODE`."""
+    return os.getenv("SHARDAI_OFFLINE_MODE", "false").lower() == "true"
+
 
 @dataclass(frozen=True, slots=True)
 class GgufModelSpec:
-    """Mapping from logical `model_id` to its Hugging Face GGUF repository and hardware specs."""
+    """Mapping from logical `model_id` to its Hugging Face repository and hardware specs."""
 
     model_id: str
     hf_repo_id: str
@@ -37,6 +56,22 @@ class GgufModelSpec:
 
 
 SUPPORTED_MODELS: dict[str, GgufModelSpec] = {
+    "Qwen/Qwen2.5-0.5B-Instruct": GgufModelSpec(
+        model_id="Qwen/Qwen2.5-0.5B-Instruct",
+        hf_repo_id="Qwen/Qwen2.5-0.5B-Instruct",
+        gguf_filename="qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        total_layers=24,
+        estimated_total_size_gb=1.0,
+        base_overhead_gb=0.35,
+    ),
+    "HuggingFaceTB/SmolLM2-360M-Instruct": GgufModelSpec(
+        model_id="HuggingFaceTB/SmolLM2-360M-Instruct",
+        hf_repo_id="HuggingFaceTB/SmolLM2-360M-Instruct",
+        gguf_filename="smollm2-360m-instruct-q4_k_m.gguf",
+        total_layers=32,
+        estimated_total_size_gb=0.75,
+        base_overhead_gb=0.30,
+    ),
     "meta-llama/Llama-3.1-8B-Instruct": GgufModelSpec(
         model_id="meta-llama/Llama-3.1-8B-Instruct",
         hf_repo_id="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
@@ -74,9 +109,9 @@ class _HfTqdmProgressBridge:
 
     def __init__(
         self,
-        *args: Any,
+        *args: Any,  # Untyped args forwarded by huggingface_hub tqdm callback
         on_progress: Callable[[int, int], None] | None = None,
-        **kwargs: Any,
+        **kwargs: Any,  # Untyped kwargs forwarded by huggingface_hub tqdm callback
     ) -> None:
         self.total: int = int(kwargs.get("total") or 0)
         self.n: int = int(kwargs.get("initial") or 0)
@@ -100,13 +135,74 @@ class _HfTqdmProgressBridge:
         self.close()
 
 
+def normalize_hf_repo_id(model_id: str) -> str:
+    """Normalize a Hugging Face repo ID or full URL into `owner/repo` format."""
+    cleaned: str = model_id.strip()
+    if cleaned.startswith("https://huggingface.co/") or cleaned.startswith(
+        "http://huggingface.co/"
+    ):
+        parts = cleaned.split("huggingface.co/", 1)[1].strip("/").split("/")
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+    return cleaned
+
+
+def filter_required_safetensors_files(
+    weight_map: dict[str, str],
+    shard_layer_start: int,
+    shard_layer_end: int,
+    total_layers: int,
+    tie_word_embeddings: bool = False,
+) -> list[str]:
+    """Select only the `.safetensors` filenames required for `[shard_layer_start..shard_layer_end]`."""
+    is_head: bool = shard_layer_start == 0
+    is_tail: bool = shard_layer_end >= (total_layers - 1)
+    layer_prefixes: tuple[str, ...] = tuple(
+        f"model.layers.{idx}."
+        for idx in range(shard_layer_start, shard_layer_end + 1)
+    )
+
+    selected_files: set[str] = set()
+    for tensor_name, shard_file in weight_map.items():
+        if tensor_name.startswith(layer_prefixes):
+            selected_files.add(shard_file)
+        elif tensor_name.startswith("model.rotary_emb."):
+            selected_files.add(shard_file)
+        elif is_head and (
+            tensor_name.startswith("model.embed_tokens.")
+            or (tie_word_embeddings and tensor_name.startswith("lm_head."))
+        ):
+            selected_files.add(shard_file)
+        elif is_tail and (
+            tensor_name.startswith("model.norm.")
+            or tensor_name.startswith("lm_head.")
+            or (tie_word_embeddings and tensor_name.startswith("model.embed_tokens."))
+        ):
+            selected_files.add(shard_file)
+
+    return sorted(selected_files)
+
+
+def read_hf_config_summary(model_dir: Path) -> tuple[int, bool]:
+    """Read `(num_hidden_layers, tie_word_embeddings)` from a cached `config.json`."""
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return 32, False
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    num_layers = int(data.get("num_hidden_layers") or 32)
+    tie_embeddings = bool(data.get("tie_word_embeddings", False))
+    return num_layers, tie_embeddings
+
+
 class ModelDownloader:
-    """Manages local `.gguf` cache resolution, `hf_hub_download`, and SSE progress queues."""
+    """Manages local `.safetensors` / `.gguf` cache resolution, `hf_hub_download`, and SSE progress."""
 
     def __init__(self, cache_dir: Path | str | None = None) -> None:
         default_dir = Path(__file__).resolve().parent.parent / "cache_models"
         self.cache_dir: Path = Path(cache_dir).resolve() if cache_dir else default_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.hf_shards_dir: Path = (self.cache_dir / "hf_shards").resolve()
+        self.hf_shards_dir.mkdir(parents=True, exist_ok=True)
         self._subscribers: list[asyncio.Queue[DownloadProgressEvent]] = []
         self._latest_event: dict[str, DownloadProgressEvent] = {}
 
@@ -130,6 +226,36 @@ class ModelDownloader:
             except asyncio.QueueFull:
                 pass
 
+    def resolve_safe_model_dir(self, model_id: str) -> tuple[str, Path]:
+        """Validate and resolve a canonical directory for Hugging Face Safetensors shards."""
+        cleaned_id: str = model_id.strip()
+        if not cleaned_id:
+            raise ValueError("model_id cannot be empty.")
+
+        local_candidate = Path(cleaned_id)
+        if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
+            resolved_local = local_candidate.resolve()
+            return cleaned_id, resolved_local
+
+        repo_id: str = normalize_hf_repo_id(cleaned_id)
+        safe_slug: str = re.sub(r"[^A-Za-z0-9._-]+", "_", repo_id).strip("_")
+        if not safe_slug:
+            raise ValueError(f"Invalid model identifier: '{model_id}'")
+
+        target_dir: Path = (self.hf_shards_dir / safe_slug).resolve()
+        if not target_dir.is_relative_to(self.cache_dir):
+            raise PermissionError("Rejected model directory outside designated cache directory.")
+        return repo_id, target_dir
+
+    def is_pytorch_model_cached(self, model_id: str) -> tuple[bool, Path]:
+        """Check whether `config.json` and at least one `.safetensors` file exist locally."""
+        _, model_dir = self.resolve_safe_model_dir(model_id)
+        if not (model_dir / "config.json").is_file():
+            return False, model_dir
+        safetensor_files = list(model_dir.glob("*.safetensors"))
+        has_weights = any(p.is_file() and p.stat().st_size > 1_048_576 for p in safetensor_files)
+        return has_weights, model_dir
+
     def resolve_safe_gguf_path(self, model_id: str) -> tuple[GgufModelSpec, Path]:
         """Validate `model_id` (preset, custom HF repo/URL, or local `.gguf` path).
 
@@ -139,7 +265,7 @@ class ModelDownloader:
         if not cleaned_id:
             raise ValueError("model_id cannot be empty.")
 
-        # 1. Preset MVP models
+        # 1. Preset models
         spec = SUPPORTED_MODELS.get(cleaned_id)
         if spec is not None:
             candidate_path: Path = (self.cache_dir / spec.gguf_filename).resolve()
@@ -165,15 +291,8 @@ class ModelDownloader:
             )
             return custom_spec, resolved_local
 
-        # 3. Custom HuggingFace Repo ID or URL (e.g., "mistralai/Mistral-7B-Instruct-v0.3")
-        repo_id = cleaned_id
-        if repo_id.startswith("https://huggingface.co/") or repo_id.startswith(
-            "http://huggingface.co/"
-        ):
-            parts = repo_id.split("huggingface.co/", 1)[1].strip("/").split("/")
-            if len(parts) >= 2:
-                repo_id = f"{parts[0]}/{parts[1]}"
-
+        # 3. Custom HuggingFace Repo ID or URL
+        repo_id = normalize_hf_repo_id(cleaned_id)
         safe_slug: str = re.sub(r"[^A-Za-z0-9._-]+", "_", repo_id).strip("_")
         if not safe_slug:
             raise ValueError(f"Invalid model identifier: '{model_id}'")
@@ -194,17 +313,179 @@ class ModelDownloader:
         return custom_spec, candidate_path
 
     def is_model_cached(self, model_id: str) -> tuple[bool, Path]:
-        """Check whether the target `.gguf` file already exists in the local cache."""
+        """Check whether a real `.gguf` (>1 MB or offline stub) exists in local cache."""
         _, target_path = self.resolve_safe_gguf_path(model_id)
-        exists = target_path.is_file() and target_path.stat().st_size > 0
+        if not target_path.is_file():
+            return False, target_path
+        min_bytes = 1 if is_offline_mode() else 1_048_576
+        exists = target_path.stat().st_size >= min_bytes
         return exists, target_path
+
+    async def ensure_pytorch_shard_downloaded(
+        self,
+        model_id: str,
+        shard_layer_start: int | None = None,
+        shard_layer_end: int | None = None,
+        on_event: Callable[[DownloadProgressEvent], None] | None = None,
+    ) -> Path:
+        """Download only the config, tokenizer, and `.safetensors` files needed for this shard."""
+        repo_id, model_dir = self.resolve_safe_model_dir(model_id)
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        def _emit(evt: DownloadProgressEvent) -> None:
+            self._broadcast(evt)
+            if on_event is not None:
+                on_event(evt)
+
+        _emit(
+            DownloadProgressEvent(
+                model_id=model_id,
+                status="checking",
+                progress_percent=0.0,
+                message=f"Inspecting Hugging Face repository '{repo_id}'...",
+            )
+        )
+
+        if is_offline_mode() or hf_hub_download is None or list_repo_files is None:
+            raise RuntimeError(
+                "Online Hugging Face download is disabled (`SHARDAI_OFFLINE_MODE=true`) "
+                "or `huggingface_hub` is not installed."
+            )
+
+        repo_files: list[str] = await asyncio.to_thread(list_repo_files, repo_id=repo_id)
+        repo_file_set: set[str] = set(repo_files)
+
+        if "config.json" not in repo_file_set:
+            raise FileNotFoundError(
+                f"Hugging Face repo '{repo_id}' does not contain config.json for PyTorch sharding."
+            )
+
+        loop = asyncio.get_running_loop()
+
+        async def _download_file(filename: str, base_pct: float, span_pct: float) -> Path:
+            local_file = (model_dir / filename).resolve()
+            if not local_file.is_relative_to(model_dir):
+                raise PermissionError(f"Rejected unsafe filename '{filename}'.")
+            if local_file.is_file() and local_file.stat().st_size > 0:
+                return local_file
+
+            def _progress_hook(downloaded: int, total: int) -> None:
+                ratio = (downloaded / total) if total > 0 else 0.0
+                pct = min(99.9, round(base_pct + (ratio * span_pct), 1))
+                evt = DownloadProgressEvent(
+                    model_id=model_id,
+                    status="downloading",
+                    progress_percent=pct,
+                    downloaded_bytes=downloaded,
+                    total_bytes=total,
+                    message=f"Downloading {filename} ({pct:.1f}%)...",
+                )
+                loop.call_soon_threadsafe(_emit, evt)
+
+            def _tqdm_factory(*args: Any, **kwargs: Any) -> _HfTqdmProgressBridge:
+                return _HfTqdmProgressBridge(*args, on_progress=_progress_hook, **kwargs)
+
+            logger.info("Downloading %s/%s into %s", repo_id, filename, model_dir)
+            downloaded_str: str = await asyncio.to_thread(
+                hf_hub_download,
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(model_dir),
+                tqdm_class=_tqdm_factory,
+            )
+            return Path(downloaded_str).resolve()
+
+        # 1. Download config + tokenizer metadata
+        for meta_file in _HF_ESSENTIAL_FILES:
+            if meta_file in repo_file_set:
+                await _download_file(meta_file, base_pct=2.0, span_pct=8.0)
+
+        total_layers, tie_embeddings = read_hf_config_summary(model_dir)
+        start_layer: int = max(0, shard_layer_start if shard_layer_start is not None else 0)
+        end_layer: int = min(
+            total_layers - 1,
+            shard_layer_end if shard_layer_end is not None else (total_layers - 1),
+        )
+
+        # 2. Select either sharded `.safetensors` files for this layer range or single `model.safetensors`
+        weight_files: list[str]
+        if "model.safetensors.index.json" in repo_file_set:
+            index_path = await _download_file(
+                "model.safetensors.index.json", base_pct=10.0, span_pct=5.0
+            )
+            index_data = json.loads(index_path.read_text(encoding="utf-8"))
+            weight_map: dict[str, str] = index_data.get("weight_map", {})
+            weight_files = filter_required_safetensors_files(
+                weight_map=weight_map,
+                shard_layer_start=start_layer,
+                shard_layer_end=end_layer,
+                total_layers=total_layers,
+                tie_word_embeddings=tie_embeddings,
+            )
+            if not weight_files:
+                weight_files = sorted(set(weight_map.values()))
+        elif "model.safetensors" in repo_file_set:
+            weight_files = ["model.safetensors"]
+        else:
+            safetensors_candidates = sorted(
+                f for f in repo_files if f.lower().endswith(".safetensors")
+            )
+            if not safetensors_candidates:
+                raise FileNotFoundError(
+                    f"No .safetensors weights found in Hugging Face repo '{repo_id}'."
+                )
+            weight_files = safetensors_candidates
+
+        # 3. Download required weight files
+        per_file_span = 80.0 / float(max(1, len(weight_files)))
+        total_bytes = 0
+        for idx, wf in enumerate(weight_files):
+            downloaded_path = await _download_file(
+                wf,
+                base_pct=15.0 + (idx * per_file_span),
+                span_pct=per_file_span,
+            )
+            if downloaded_path.is_file():
+                total_bytes += downloaded_path.stat().st_size
+
+        _emit(
+            DownloadProgressEvent(
+                model_id=model_id,
+                status="completed",
+                progress_percent=100.0,
+                downloaded_bytes=total_bytes,
+                total_bytes=total_bytes,
+                local_path=str(model_dir),
+                message=(
+                    f"Shard ready for '{repo_id}' (layers {start_layer}..{end_layer}, "
+                    f"{len(weight_files)} weight file(s))."
+                ),
+            )
+        )
+        return model_dir
 
     async def ensure_model_downloaded(
         self,
         model_id: str,
         on_event: Callable[[DownloadProgressEvent], None] | None = None,
+        shard_layer_start: int | None = None,
+        shard_layer_end: int | None = None,
     ) -> Path:
-        """Check local cache for the `.gguf` model; if missing, download via `hf_hub_download`."""
+        """Prepare either PyTorch Safetensors shard directory or GGUF model path."""
+        cleaned_id: str = model_id.strip()
+        local_candidate = Path(cleaned_id)
+        is_explicit_gguf: bool = local_candidate.suffix.lower() == ".gguf"
+
+        # When online and given a Hugging Face repo ID (not an explicit local .gguf file),
+        # prefer PyTorch Safetensors sharding so multi-node P2P layer splitting works natively.
+        if not is_explicit_gguf and not is_offline_mode():
+            return await self.ensure_pytorch_shard_downloaded(
+                model_id=cleaned_id,
+                shard_layer_start=shard_layer_start,
+                shard_layer_end=shard_layer_end,
+                on_event=on_event,
+            )
+
         spec, target_path = self.resolve_safe_gguf_path(model_id)
 
         def _emit(evt: DownloadProgressEvent) -> None:
@@ -237,80 +518,22 @@ class ModelDownloader:
             )
             return existing_path
 
-        # Check if running in offline / simulated mode or if huggingface_hub should be invoked
-        simulate_mode: bool = (
-            os.getenv("SHARDAI_OFFLINE_MODE", "true").lower() == "true"
-            or hf_hub_download is None
-        )
-
-        if not simulate_mode and hf_hub_download is not None:
-            loop = asyncio.get_running_loop()
-            remote_filename: str = spec.gguf_filename
-
-            # For custom HF repos not in SUPPORTED_MODELS, auto-discover the best .gguf artifact
-            if model_id not in SUPPORTED_MODELS and list_repo_files is not None:
-                repo_files: list[str] = await asyncio.to_thread(
-                    list_repo_files, repo_id=spec.hf_repo_id
-                )
-                gguf_candidates = [f for f in repo_files if f.lower().endswith(".gguf")]
-                if not gguf_candidates:
-                    raise FileNotFoundError(
-                        f"No .gguf file found in HuggingFace repo '{spec.hf_repo_id}'."
-                    )
-                q4_candidates = [f for f in gguf_candidates if "q4_k_m" in f.lower()]
-                remote_filename = q4_candidates[0] if q4_candidates else gguf_candidates[0]
-
-            def _progress_hook(downloaded: int, total: int) -> None:
-                pct = round((downloaded / total) * 100.0, 1) if total > 0 else 0.0
-                evt = DownloadProgressEvent(
+        # Progressive download stream when in offline/test simulation mode
+        simulated_total = 4_680_000_000
+        for step_pct in (15.0, 40.0, 70.0, 95.0):
+            await asyncio.sleep(0.05)
+            _emit(
+                DownloadProgressEvent(
                     model_id=model_id,
                     status="downloading",
-                    progress_percent=min(99.9, pct),
-                    downloaded_bytes=downloaded,
-                    total_bytes=total,
-                    message=f"Downloading {remote_filename} from Hugging Face ({pct:.1f}%)...",
+                    progress_percent=step_pct,
+                    downloaded_bytes=int(simulated_total * (step_pct / 100.0)),
+                    total_bytes=simulated_total,
+                    message=f"Downloading {spec.gguf_filename} ({step_pct:.0f}%)...",
                 )
-                loop.call_soon_threadsafe(_emit, evt)
-
-            def _tqdm_factory(*args: Any, **kwargs: Any) -> _HfTqdmProgressBridge:
-                return _HfTqdmProgressBridge(
-                    *args, on_progress=_progress_hook, **kwargs
-                )
-
-            logger.info(
-                "Downloading %s/%s via hf_hub_download into %s...",
-                spec.hf_repo_id,
-                remote_filename,
-                self.cache_dir,
             )
-            downloaded_path_str: str = await asyncio.to_thread(
-                hf_hub_download,
-                repo_id=spec.hf_repo_id,
-                filename=remote_filename,
-                local_dir=str(self.cache_dir),
-                tqdm_class=_tqdm_factory,
-            )
-            final_path = Path(downloaded_path_str).resolve()
-            if not final_path.is_relative_to(self.cache_dir):
-                raise PermissionError("Downloaded file resolved outside cache_dir.")
-        else:
-            # Progressive download stream when in local dev / offline mode
-            simulated_total = 4_680_000_000
-            for step_pct in (15.0, 40.0, 70.0, 95.0):
-                await asyncio.sleep(0.08)
-                _emit(
-                    DownloadProgressEvent(
-                        model_id=model_id,
-                        status="downloading",
-                        progress_percent=step_pct,
-                        downloaded_bytes=int(simulated_total * (step_pct / 100.0)),
-                        total_bytes=simulated_total,
-                        message=f"Downloading {spec.gguf_filename} ({step_pct:.0f}%)...",
-                    )
-                )
-            # Write GGUF magic header stub inside local cache_models directory
-            target_path.write_bytes(b"GGUF\x03\x00\x00\x00" + model_id.encode("utf-8"))
-            final_path = target_path
+        target_path.write_bytes(b"GGUF\x03\x00\x00\x00" + model_id.encode("utf-8"))
+        final_path = target_path
 
         final_size = final_path.stat().st_size if final_path.exists() else 0
         _emit(

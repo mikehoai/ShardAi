@@ -18,7 +18,7 @@ import platform
 import subprocess
 from typing import Any
 
-from models.downloader import SUPPORTED_MODELS
+from models.downloader import SUPPORTED_MODELS, read_hf_config_summary
 from shard_engine.schemas import ComputeBackend, StartNodeRequest
 
 logger = logging.getLogger("shardai.memory")
@@ -64,8 +64,18 @@ def calculate_max_layers(
         model_size_gb = 5.0
         base_overhead_gb = 0.6
 
-    # Use actual GGUF file size if a real downloaded model binary (> 1 MB) exists on disk
-    if model_path is not None and model_path.is_file():
+    # Use actual GGUF file size or HF Safetensors directory config when present
+    if model_path is not None and model_path.is_dir():
+        cfg_layers, _tie = read_hf_config_summary(model_path)
+        if cfg_layers > 0:
+            total_layers = cfg_layers
+        safetensor_bytes = sum(
+            p.stat().st_size for p in model_path.glob("*.safetensors") if p.is_file()
+        )
+        if safetensor_bytes > 1_048_576 and spec is None:
+            # Estimate float32/bf16 memory footprint from safetensors disk size
+            model_size_gb = max(0.5, (safetensor_bytes / float(1024**3)) * 1.5)
+    elif model_path is not None and model_path.is_file():
         actual_bytes: int = model_path.stat().st_size
         if actual_bytes > 1_048_576:
             model_size_gb = actual_bytes / float(1024**3)
@@ -245,7 +255,13 @@ class ShardMemoryManager:
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            if (
+                hasattr(torch, "backends")
+                and hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available()
+                and hasattr(torch, "mps")
+                and hasattr(torch.mps, "empty_cache")
+            ):
                 torch.mps.empty_cache()
         except ImportError:
             pass
