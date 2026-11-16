@@ -1,0 +1,76 @@
+# ==============================================================================
+# 1. AI Models, Weights & Shards (CRITICAL - Never commit model binaries)
+# ==============================================================================
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.h5
+models/
+shards/
+cache_models/
+
+# ==============================================================================
+# 2. Python & Virtual Environments (core-engine)
+# ==============================================================================
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+*/test/
+# ==============================================================================
+# 3. Node.js & Frontend UI (src-ui)
+# ==============================================================================
+node_modules/
+src-ui/node_modules/
+src-ui/dist/
+src-ui/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==============================================================================
+# 4. Rust & Tauri Desktop Packaging (src-tauri)
+# ==============================================================================
+target/
+src-tauri/target/
+src-tauri/WixTools/
+Cargo.lock
+
+# ==============================================================================
+# 5. Environment Variables, Secrets & OS Artifacts
+# ==============================================================================
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# ==============================================================================
+# 6. Promt
+# ==============================================================================
+.antigravity
+README.md

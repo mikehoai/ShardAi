@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ShardAi",
+  "version": "0.1.0",
+  "identifier": "network.shardai.node",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../src-ui run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm --prefix ../src-ui run build",
+    "frontendDist": "../src-ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ShardAi — Distributed LLM P2P Node",
+        "width": 1024,
+        "height": 720,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:8000"
+    }
+  }
+}
