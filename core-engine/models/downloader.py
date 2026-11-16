@@ -476,6 +476,21 @@ class ModelDownloader:
         local_candidate = Path(cleaned_id)
         is_explicit_gguf: bool = local_candidate.suffix.lower() == ".gguf"
 
+        # Support already-downloaded local HuggingFace Safetensors directories even offline
+        if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
+            resolved_dir = local_candidate.resolve()
+            if on_event is not None:
+                on_event(
+                    DownloadProgressEvent(
+                        model_id=model_id,
+                        status="cached",
+                        progress_percent=100.0,
+                        local_path=str(resolved_dir),
+                        message=f"Local model directory ready ({resolved_dir.name}).",
+                    )
+                )
+            return resolved_dir
+
         # When online and given a Hugging Face repo ID (not an explicit local .gguf file),
         # prefer PyTorch Safetensors sharding so multi-node P2P layer splitting works natively.
         if not is_explicit_gguf and not is_offline_mode():

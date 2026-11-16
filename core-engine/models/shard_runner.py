@@ -629,21 +629,20 @@ class ShardModelRunner:
                 if session is None:
                     session = self._get_or_create_session(request_id, step_index)
 
-                # Mild repetition penalty to prevent small models from looping
-                if session.generated_ids:
-                    recent_ids = torch.tensor(
-                        list(set(session.generated_ids[-32:])), dtype=torch.long
-                    )
-                    logits_at_recent = logits[recent_ids]
-                    logits[recent_ids] = torch.where(
-                        logits_at_recent > 0,
-                        logits_at_recent / 1.12,
-                        logits_at_recent * 1.12,
-                    )
-
                 if temperature <= 0.05:
                     token_id = int(torch.argmax(logits).item())
                 else:
+                    # Mild repetition penalty during sampling to prevent small models from looping
+                    if session.generated_ids:
+                        recent_ids = torch.tensor(
+                            list(set(session.generated_ids[-32:])), dtype=torch.long
+                        )
+                        logits_at_recent = logits[recent_ids]
+                        logits[recent_ids] = torch.where(
+                            logits_at_recent > 0,
+                            logits_at_recent / 1.12,
+                            logits_at_recent * 1.12,
+                        )
                     scaled = logits / float(temperature)
                     top_k = min(40, int(scaled.shape[-1]))
                     top_vals, top_idx = torch.topk(scaled, k=top_k)
