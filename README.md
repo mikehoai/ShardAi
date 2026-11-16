@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.png" alt="ShardAi Logo" width="140" />
   <h1>ShardAi</h1>
-  <p><strong>Peer-to-Peer Distributed LLM Inference Engine — BitTorrent for AI</strong></p>
+  <p><strong>Peer-to-Peer Distributed LLM Inference Engine</strong></p>
 
   <p>
     <a href="https://github.com/mikehoai/ShardAi/stargazers"><img src="https://img.shields.io/github/stars/mikehoai/ShardAi?style=flat-square&color=2563eb" alt="Stars" /></a>
