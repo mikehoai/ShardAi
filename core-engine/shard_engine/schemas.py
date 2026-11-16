@@ -43,17 +43,23 @@ class StartNodeRequest(BaseModel):
     )
     model_id: str = Field(
         default="meta-llama/Llama-3.1-8B-Instruct",
-        description="Target distributed LLM identifier",
+        description="Target distributed LLM identifier (e.g., meta-llama/Llama-3.1-8B-Instruct, Qwen/Qwen2.5-7B-Instruct)",
     )
     backend: ComputeBackend = Field(
         default=ComputeBackend.LLAMA_CPP,
         description="Inference runtime used to load the assigned shard",
     )
+    ram_gb: int = Field(
+        default=4,
+        ge=2,
+        le=16,
+        description="Shared system RAM in GB selected on the UI slider (2GB - 16GB)",
+    )
     shared_ram_gb: int = Field(
         default=4,
         ge=2,
         le=16,
-        description="Shared system RAM in GB selected on the Tauri UI slider (2GB - 16GB)",
+        description="Alias for ram_gb selected on the Tauri UI slider (2GB - 16GB)",
     )
     max_ram_mb: int = Field(
         default=4096,
@@ -75,6 +81,33 @@ class StartNodeRequest(BaseModel):
     )
     shard_layer_start: int = Field(default=0, ge=0, description="First layer hosted locally")
     shard_layer_end: int = Field(default=15, ge=0, description="Last layer hosted locally")
+    total_layers: int = Field(
+        default=32,
+        ge=1,
+        le=512,
+        description="Total transformer layers across the distributed model pipeline",
+    )
+
+
+class GenerateRequest(BaseModel):
+    """Payload sent from Tauri/React UI to trigger distributed P2P pipeline inference."""
+
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=16384,
+        description="User prompt text to run through the distributed LLM pipeline",
+    )
+    max_tokens: int = Field(
+        default=16,
+        ge=1,
+        le=2048,
+        description="Maximum number of tokens to generate and stream via SSE",
+    )
+    compress_activations: bool = Field(
+        default=True,
+        description="Enable adaptive LZ4/Zlib compression on intermediate hidden-state tensors",
+    )
 
 
 class NodeStatusResponse(BaseModel):
@@ -83,6 +116,7 @@ class NodeStatusResponse(BaseModel):
     state: NodeState
     node_id: str | None = None
     model_id: str | None = None
+    model_path: str | None = None
     backend: ComputeBackend | None = None
     allocated_ram_mb: int = 0
     allocated_vram_mb: int = 0

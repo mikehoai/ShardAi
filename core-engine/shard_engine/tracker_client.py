@@ -110,10 +110,12 @@ class SignalingTrackerClient:
     async def register_node_and_fetch_peers(
         self, config: StartNodeRequest
     ) -> list[PeerNodeInfo]:
-        """Announce this node via HTTP POST and retrieve active peer IPs for the model."""
+        """Announce this node via HTTP POST /announce and retrieve active peer IPs for the model."""
         payload: dict[str, Any] = {
             "node_id": config.node_id,
+            "model": config.model_id,
             "model_id": config.model_id,
+            "ram_gb": config.ram_gb,
             "p2p_port": config.p2p_listen_port,
             "shard_layer_start": config.shard_layer_start,
             "shard_layer_end": config.shard_layer_end,
@@ -121,7 +123,7 @@ class SignalingTrackerClient:
         }
         response_data: dict[str, Any] = await self._request_with_retry(
             method="POST",
-            endpoint="/nodes/announce",
+            endpoint="/announce",
             json_payload=payload,
         )
         raw_peers: list[dict[str, Any]] = response_data.get("peers", [])

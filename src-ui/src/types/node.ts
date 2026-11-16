@@ -20,6 +20,7 @@ export interface StartNodeRequest {
   node_id: string;
   model_id: string;
   backend: ComputeBackend;
+  ram_gb: number;
   shared_ram_gb: number;
   max_ram_mb: number;
   max_vram_mb: number;
@@ -32,6 +33,7 @@ export interface NodeStatusResponse {
   state: NodeState;
   node_id: string | null;
   model_id: string | null;
+  model_path?: string | null;
   backend: ComputeBackend | null;
   allocated_ram_mb: number;
   allocated_vram_mb: number;

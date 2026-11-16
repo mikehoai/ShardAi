@@ -25,6 +25,7 @@ export const NodeDashboard: React.FC = () => {
       node_id: "shardai-client-01",
       model_id: "meta-llama/Llama-3.1-8B-Instruct",
       backend: "llama_cpp",
+      ram_gb: 4,
       shared_ram_gb: 4,
       max_ram_mb: 4096,
       max_vram_mb: 2048,
