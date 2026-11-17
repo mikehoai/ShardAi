@@ -36,6 +36,52 @@ class PeerRole(StrEnum):
     BACKUP = "backup"
 
 
+class NetworkStatus(StrEnum):
+    """Effective connectivity tier of the node (auto-fallback chain Cloud -> LAN -> Solo)."""
+
+    ONLINE = "online"  # Cloudflare Tracker reachable
+    LAN_ONLY = "lan_only"  # Tracker unreachable, but LAN peers discovered via mDNS/zeroconf
+    OFFLINE_SOLO = "offline_solo"  # No Tracker, no LAN peers: node hosts 100% of layers
+
+
+class ModelSourceType(StrEnum):
+    """Origin type of the selected LLM artifact."""
+
+    CATALOG = "catalog"
+    HUGGINGFACE = "huggingface"
+    DIRECT_URL = "direct_url"
+    LOCAL_FILE = "local_file"
+
+
+class CatalogModelItem(BaseModel):
+    """Single model entry synchronized from Cloud `GET /config/models` or local cache."""
+
+    id: str
+    name: str
+    repo_id: str
+    filename: str | None = None
+    estimated_ram_gb: float = Field(default=5.0, gt=0.0)
+    enabled: bool = True
+
+
+class ModelCatalogResponse(BaseModel):
+    """Catalog payload returned by `GET /models/catalog`."""
+
+    source: Literal["cloud", "cache", "default"]
+    count: int = Field(..., ge=0)
+    models: list[CatalogModelItem]
+
+
+class NetworkStatusResponse(BaseModel):
+    """Connectivity probe result for the UI Network Status Indicator."""
+
+    network_status: NetworkStatus
+    tracker_reachable: bool
+    tracker_url: str
+    lan_peers_count: int = Field(default=0, ge=0)
+    zeroconf_available: bool = False
+
+
 class PeerNodeInfo(BaseModel):
     """Peer metadata returned by the central Signaling Server (Cloudflare Tracker)."""
 
@@ -67,8 +113,17 @@ class StartNodeRequest(BaseModel):
     model_id: str = Field(
         default="meta-llama/Llama-3.1-8B-Instruct",
         min_length=1,
+        max_length=1024,
+        description="Catalog repo_id, custom HF repo/URL, direct .gguf URL, or local .gguf path",
+    )
+    source_type: ModelSourceType = Field(
+        default=ModelSourceType.CATALOG,
+        description="Model source origin: 'catalog', 'huggingface', 'direct_url', or 'local_file'",
+    )
+    filename: str | None = Field(
+        default=None,
         max_length=512,
-        description="HuggingFace Repo ID, HuggingFace URL, or local .gguf file path",
+        description="Optional specific .gguf filename in a Hugging Face repo",
     )
     network_mode: NetworkMode = Field(
         default=NetworkMode.INTERNET,
@@ -134,6 +189,13 @@ class StartNodeRequest(BaseModel):
         default=False,
         description="If true, load exact [shard_layer_start..shard_layer_end] capped by RAM limit",
     )
+    allow_ssd_offload: bool = Field(
+        default=False,
+        description=(
+            "If true and ram_gb is smaller than the model, load all layers with llama_cpp "
+            "use_mmap=True so missing weights are paged from SSD (slow, but Solo Mode always runs)"
+        ),
+    )
 
     @field_validator("room_id", mode="before")
     @classmethod
@@ -155,14 +217,26 @@ class StartNodeRequest(BaseModel):
     @classmethod
     def _normalize_model_id(cls, value: str) -> str:
         cleaned = value.strip()
-        # Normalize full HuggingFace URLs into owner/repo format
-        if cleaned.startswith("https://huggingface.co/") or cleaned.startswith(
-            "http://huggingface.co/"
+        # Normalize HuggingFace repository URLs into `owner/repo`, while preserving direct file URLs
+        lowered = cleaned.lower()
+        if (
+            (lowered.startswith("https://huggingface.co/") or lowered.startswith("http://huggingface.co/"))
+            and "/resolve/" not in lowered
+            and "/blob/" not in lowered
+            and not lowered.endswith(".gguf")
         ):
             parts = cleaned.split("huggingface.co/", 1)[1].strip("/").split("/")
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
         return cleaned
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def _normalize_filename(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned if cleaned else None
 
 
 class GenerateRequest(BaseModel):
@@ -229,6 +303,12 @@ class NodeStatusResponse(BaseModel):
     api_base_url: str | None = None
     coverage_percent: float = Field(default=0.0, ge=0.0, le=100.0)
     is_swarm_ready: bool = False
+    network_status: NetworkStatus | None = None
+    is_solo_mode: bool = False
+    use_mmap: bool = False
+    ssd_offload_active: bool = False
+    source_type: ModelSourceType | None = None
+    model_fingerprint: str | None = None
     message: str = ""
 
 

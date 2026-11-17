@@ -20,7 +20,7 @@ import re
 import secrets
 import socket
 import time
-from typing import Any
+from typing import Any, Literal
 import uuid
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -30,13 +30,16 @@ import httpx
 import uvicorn
 
 from models.downloader import (
+    DEFAULT_CATALOG_MODELS,
     SUPPORTED_MODELS,
     DownloadProgressEvent,
     ModelDownloader,
+    compute_model_fingerprint,
     is_offline_mode,
     read_hf_config_summary,
 )
 from models.shard_runner import ShardModelRunner
+from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
 from p2p.serializer import (
     ActivationFrame,
@@ -55,10 +58,15 @@ from shard_engine.memory_manager import (
     get_system_memory_info,
 )
 from shard_engine.schemas import (
+    CatalogModelItem,
     ChatMessage,
     ComputeBackend,
     GenerateRequest,
+    ModelCatalogResponse,
+    ModelSourceType,
     NetworkMode,
+    NetworkStatus,
+    NetworkStatusResponse,
     NodeState,
     NodeStatusResponse,
     OpenAIChatCompletionRequest,
@@ -73,6 +81,7 @@ from shard_engine.schemas import (
 from shard_engine.tracker_client import (
     AnnounceAssignment,
     SignalingTrackerClient,
+    TrackerUnreachableError,
     hash_room_key,
 )
 
@@ -126,6 +135,95 @@ def _resolve_advertise_ip(target_peer_ip: str, target_peer_port: int) -> str:
         sock.close()
 
 
+async def _scan_all_lan_beacons(
+    udp_timeout_seconds: float = 0.2,
+    zeroconf_wait_seconds: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Merge LAN peers from the legacy UDP multicast probe and zeroconf DNS-SD browser.
+
+    Deduplicated by `node_id`; zeroconf entries win because they carry the routable interface IP.
+    """
+    udp_task = asyncio.create_task(
+        lan_mdns_service.scan_lan_rooms(timeout_seconds=udp_timeout_seconds)
+    )
+    zc_beacons: list[dict[str, Any]] = []
+    try:
+        zc_beacons = await zeroconf_discovery.discover_peers(wait_seconds=zeroconf_wait_seconds)
+    except Exception as exc:
+        logger.debug("Zeroconf discovery error: %s", exc)
+    udp_beacons: list[dict[str, Any]] = []
+    try:
+        udp_beacons = await udp_task
+    except Exception as exc:
+        logger.debug("UDP LAN scan error: %s", exc)
+
+    merged: dict[str, dict[str, Any]] = {}
+    for beacon in [*udp_beacons, *zc_beacons]:
+        node_key = str(beacon.get("node_id") or "")
+        if node_key:
+            merged[node_key] = beacon
+    return list(merged.values())
+
+
+def _beacon_to_peer(beacon: dict[str, Any], room_id: str, total_layers: int) -> PeerNodeInfo:
+    """Convert a LAN beacon dict (UDP or zeroconf) into a routable `PeerNodeInfo`."""
+    raw_role = str(beacon.get("role") or PeerRole.PRIMARY.value).lower()
+    return PeerNodeInfo(
+        peer_id=str(beacon.get("node_id")),
+        ip_address=str(beacon.get("ip_address") or "127.0.0.1"),
+        port=int(beacon.get("p2p_port") or 49152),
+        shard_layer_start=int(beacon.get("shard_layer_start") or 0),
+        shard_layer_end=int(beacon.get("shard_layer_end") or (total_layers - 1)),
+        role=PeerRole.BACKUP if raw_role == PeerRole.BACKUP.value else PeerRole.PRIMARY,
+        available_vram_mb=0,
+        room_id=room_id,
+    )
+
+
+def _lan_peers_for_room(
+    beacons: list[dict[str, Any]],
+    room_id: str,
+    self_node_id: str | None,
+    total_layers: int,
+) -> list[PeerNodeInfo]:
+    """Filter LAN beacons to peers in `room_id` (excluding this node)."""
+    peers: list[PeerNodeInfo] = []
+    seen: set[str] = set()
+    for beacon in beacons:
+        peer_id = str(beacon.get("node_id") or "")
+        if (
+            not peer_id
+            or peer_id == self_node_id
+            or peer_id in seen
+            or str(beacon.get("room_id") or "public") != room_id
+        ):
+            continue
+        seen.add(peer_id)
+        peers.append(_beacon_to_peer(beacon, room_id, total_layers))
+    return peers
+
+
+def _first_uncovered_layer(peers: list[PeerNodeInfo], total_layers: int) -> int | None:
+    """Return the first model layer not hosted by any LAN peer (None if fully covered)."""
+    covered: set[int] = set()
+    for peer in peers:
+        covered.update(
+            range(max(0, peer.shard_layer_start), min(total_layers, peer.shard_layer_end + 1))
+        )
+    for layer_idx in range(total_layers):
+        if layer_idx not in covered:
+            return layer_idx
+    return None
+
+
+def _lan_discovery_wait_seconds() -> float:
+    """How long to listen for zeroconf answers before deciding LAN vs Solo on startup."""
+    try:
+        return max(0.0, float(os.getenv("SHARDAI_LAN_DISCOVERY_WAIT_SECONDS", "1.5")))
+    except ValueError:
+        return 1.5
+
+
 class LocalNodeRuntime:
     """Encapsulates runtime state, session auth, P2P listener, and model shard pipeline."""
 
@@ -136,6 +234,7 @@ class LocalNodeRuntime:
         self.model_path: str | None = None
         self.network_mode: NetworkMode | None = None
         self.room_id: str | None = None
+        self.room_key_hash: str | None = None
         self.is_private: bool = False
         self.is_unlisted: bool = False
         self.role: PeerRole = PeerRole.PRIMARY
@@ -149,6 +248,13 @@ class LocalNodeRuntime:
         self.session_token: str | None = None
         self.coverage_percent: float = 0.0
         self.is_swarm_ready: bool = False
+        # Offline / Solo Mode state (auto-fallback chain: Cloud -> LAN -> Solo)
+        self.network_status: NetworkStatus | None = None
+        self.last_tracker_reachable: bool | None = None
+        self.use_mmap: bool = False
+        self.ssd_offload_active: bool = False
+        self.source_type: ModelSourceType | None = None
+        self.model_fingerprint: str | None = None
         self._coverage_poll_task: asyncio.Task[None] | None = None
         self.memory_manager: ShardMemoryManager = ShardMemoryManager()
         self.model_downloader: ModelDownloader = ModelDownloader()
@@ -158,7 +264,7 @@ class LocalNodeRuntime:
         self._compute_lock: asyncio.Lock = asyncio.Lock()
         self.tracker_client: SignalingTrackerClient = SignalingTrackerClient(
             base_url=os.getenv(
-                "SHARDAI_TRACKER_URL", "https://tracker.shardai.network/api/v1"
+                "SHARDAI_TRACKER_URL", "https://network.shardai.online"
             ),
             timeout_seconds=8.0,
             connect_timeout_seconds=4.0,
@@ -568,8 +674,9 @@ class LocalNodeRuntime:
         if self.state != NodeState.RUNNING:
             return
 
+        is_online: bool = self.network_status == NetworkStatus.ONLINE
         cloud_coverage: float | None = None
-        if _is_tracker_enabled() and self.room_id is not None:
+        if is_online and _is_tracker_enabled() and self.room_id is not None:
             try:
                 rooms = await self.tracker_client.fetch_available_rooms()
                 for room in rooms:
@@ -581,47 +688,40 @@ class LocalNodeRuntime:
                     refreshed_peers = await self.tracker_client.fetch_peers(
                         model_id=self.model_id,
                         room_id=self.room_id,
+                        room_key_hash=self.room_key_hash,
                     )
                     if refreshed_peers:
                         self.peers = [
                             p for p in refreshed_peers if p.peer_id != self.node_id
                         ]
+                self.last_tracker_reachable = True
             except Exception as exc:
                 logger.debug("Background coverage poll skipped Cloud Tracker: %s", exc)
 
-        # Merge any newly discovered LAN peers for this room
+        # LAN peers (UDP beacon + zeroconf). Offline nodes rebuild the routing table from the
+        # LAN on every tick so peers that left the Wi-Fi are dropped automatically.
         try:
-            lan_beacons = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.15)
-            known_ids = {p.peer_id for p in self.peers}
-            for beacon in lan_beacons:
-                p_id = str(beacon.get("node_id") or "")
-                if (
-                    not p_id
-                    or p_id == self.node_id
-                    or p_id in known_ids
-                    or str(beacon.get("room_id") or "public") != self.room_id
-                ):
-                    continue
-                known_ids.add(p_id)
-                raw_role = str(beacon.get("role") or PeerRole.PRIMARY.value).lower()
-                self.peers.append(
-                    PeerNodeInfo(
-                        peer_id=p_id,
-                        ip_address=str(beacon.get("ip_address") or "127.0.0.1"),
-                        port=int(beacon.get("p2p_port") or 49152),
-                        shard_layer_start=int(beacon.get("shard_layer_start") or 0),
-                        shard_layer_end=int(
-                            beacon.get("shard_layer_end") or (self.total_layers - 1)
-                        ),
-                        role=(
-                            PeerRole.BACKUP
-                            if raw_role == PeerRole.BACKUP.value
-                            else PeerRole.PRIMARY
-                        ),
-                        available_vram_mb=0,
-                        room_id=self.room_id or "public",
+            lan_beacons = await _scan_all_lan_beacons(udp_timeout_seconds=0.15)
+            lan_peers = _lan_peers_for_room(
+                lan_beacons,
+                room_id=self.room_id or "public",
+                self_node_id=self.node_id,
+                total_layers=self.total_layers,
+            )
+            if is_online:
+                known_ids = {p.peer_id for p in self.peers}
+                self.peers.extend(p for p in lan_peers if p.peer_id not in known_ids)
+            else:
+                self.peers = lan_peers
+                new_status = NetworkStatus.LAN_ONLY if lan_peers else NetworkStatus.OFFLINE_SOLO
+                if new_status != self.network_status:
+                    logger.info(
+                        "Network status changed: %s -> %s (%d LAN peers)",
+                        self.network_status,
+                        new_status,
+                        len(lan_peers),
                     )
-                )
+                    self.network_status = new_status
         except Exception as exc:
             logger.debug("Background LAN scan error: %s", exc)
 
@@ -691,6 +791,12 @@ class LocalNodeRuntime:
             api_base_url=self.api_base_url if is_running else None,
             coverage_percent=self.coverage_percent if is_running else 0.0,
             is_swarm_ready=self.is_swarm_ready if is_running else False,
+            network_status=self.network_status if is_running else None,
+            is_solo_mode=is_running and self.network_status == NetworkStatus.OFFLINE_SOLO,
+            use_mmap=self.use_mmap if is_running else False,
+            ssd_offload_active=self.ssd_offload_active if is_running else False,
+            source_type=self.source_type if is_running else None,
+            model_fingerprint=self.model_fingerprint if is_running else None,
             message=message,
         )
 
@@ -739,6 +845,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     runtime.coverage_percent = 0.0
     await runtime.stop_coverage_monitor()
     await lan_mdns_service.stop_advertising()
+    await zeroconf_discovery.close()
     await runtime.stop_p2p_listener()
     if runtime.model_runner is not None:
         runtime.model_runner.release()
@@ -802,7 +909,43 @@ async def get_host_system_memory() -> SystemMemoryResponse:
 
 def _is_tracker_enabled() -> bool:
     """Return True when outbound Cloudflare Signaling Tracker calls are enabled."""
-    return os.getenv("SHARDAI_ENABLE_TRACKER", "false").lower() == "true" and not is_offline_mode()
+    return os.getenv("SHARDAI_ENABLE_TRACKER", "true").lower() == "true" and not is_offline_mode()
+
+
+@app.get("/network-status", response_model=NetworkStatusResponse)
+async def get_network_status() -> NetworkStatusResponse:
+    """Probe connectivity for the UI indicator: Online (Cloud) / LAN Only / Offline (Solo).
+
+    While the node is running the authoritative `runtime.network_status` decided at start-up
+    (and refreshed by the 5s monitor) is returned; when stopped, a fresh probe is performed.
+    """
+    lan_beacons = await _scan_all_lan_beacons(udp_timeout_seconds=0.15)
+    lan_count = len(
+        [b for b in lan_beacons if str(b.get("node_id") or "") != (runtime.node_id or "")]
+    )
+
+    if runtime.state == NodeState.RUNNING and runtime.network_status is not None:
+        tracker_ok = runtime.network_status == NetworkStatus.ONLINE
+        effective = runtime.network_status
+    else:
+        tracker_ok = _is_tracker_enabled() and await runtime.tracker_client.ping(
+            timeout_seconds=3.0
+        )
+        runtime.last_tracker_reachable = tracker_ok
+        if tracker_ok:
+            effective = NetworkStatus.ONLINE
+        elif lan_count > 0:
+            effective = NetworkStatus.LAN_ONLY
+        else:
+            effective = NetworkStatus.OFFLINE_SOLO
+
+    return NetworkStatusResponse(
+        network_status=effective,
+        tracker_reachable=tracker_ok,
+        tracker_url=runtime.tracker_client.base_url,
+        lan_peers_count=lan_count,
+        zeroconf_available=ZEROCONF_AVAILABLE and is_zeroconf_enabled(),
+    )
 
 
 @app.get("/available-rooms", response_model=list[RoomLobbyItem])
@@ -810,17 +953,23 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
     """Fetch active rooms from Cloudflare Tracker (GET /rooms) merged with LAN mDNS scan."""
     merged: dict[str, RoomLobbyItem] = {}
 
-    # 1. Query Cloudflare Signaling Tracker when enabled
-    if _is_tracker_enabled():
+    # 1. Query Cloudflare Signaling Tracker when enabled (skipped while running offline)
+    node_is_offline = (
+        runtime.state == NodeState.RUNNING
+        and runtime.network_status not in (None, NetworkStatus.ONLINE)
+    )
+    if _is_tracker_enabled() and not node_is_offline:
         try:
             cloud_rooms = await runtime.tracker_client.fetch_available_rooms()
             for item in cloud_rooms:
                 merged[item.room_id] = item
+            runtime.last_tracker_reachable = True
         except Exception as exc:
+            runtime.last_tracker_reachable = False
             logger.warning("Failed to fetch rooms from Cloudflare Tracker: %s", exc)
 
-    # 2. Scan local LAN subnet via mDNS multicast and aggregate layer coverage/redundancy
-    lan_beacons = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.25)
+    # 2. Scan local LAN subnet via UDP beacon + zeroconf and aggregate layer coverage/redundancy
+    lan_beacons = await _scan_all_lan_beacons(udp_timeout_seconds=0.25)
     lan_groups: dict[str, list[dict[str, Any]]] = {}
     for beacon in lan_beacons:
         r_id = str(beacon.get("room_id") or "public")
@@ -872,6 +1021,47 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
     return rooms_list
 
 
+@app.get("/models/catalog", response_model=ModelCatalogResponse)
+async def get_model_catalog() -> ModelCatalogResponse:
+    """Sync enabled models from Cloud `GET /config/models` and cache to `~/.shardai/models_cache.json`."""
+    raw_models: list[dict[str, Any]] = []
+    source: Literal["cloud", "cache", "default"] = "default"
+
+    if _is_tracker_enabled():
+        try:
+            cloud_models = await runtime.tracker_client.fetch_model_catalog()
+            if cloud_models:
+                runtime.model_downloader.save_catalog_cache(cloud_models)
+                raw_models = cloud_models
+                source = "cloud"
+                runtime.last_tracker_reachable = True
+        except Exception as exc:
+            logger.warning("Failed to fetch /config/models from Cloud (%s); using local cache.", exc)
+
+    if not raw_models:
+        cached = runtime.model_downloader.load_catalog_cache()
+        if cached:
+            raw_models = cached
+            source = "cache"
+        else:
+            raw_models = list(DEFAULT_CATALOG_MODELS)
+            source = "default"
+
+    items = [
+        CatalogModelItem(
+            id=str(m.get("id") or m.get("repo_id") or "custom-model"),
+            name=str(m.get("name") or m.get("repo_id") or m.get("id") or "Unnamed Model"),
+            repo_id=str(m.get("repo_id") or m.get("id") or ""),
+            filename=str(m["filename"]) if m.get("filename") else None,
+            estimated_ram_gb=max(0.1, float(m.get("estimated_ram_gb") or 5.0)),
+            enabled=bool(m.get("enabled", True)),
+        )
+        for m in raw_models
+        if m.get("repo_id") and m.get("enabled", True) is True
+    ]
+    return ModelCatalogResponse(source=source, count=len(items), models=items)
+
+
 @app.get("/models/supported", response_model=list[str])
 async def list_supported_models() -> list[str]:
     """Return suggested model IDs available in the UI dropdown."""
@@ -884,13 +1074,28 @@ async def stream_model_download(
     shard_layer_start: int | None = None,
     shard_layer_end: int | None = None,
     ram_gb: int | None = None,
+    source_type: ModelSourceType = ModelSourceType.CATALOG,
+    filename: str | None = None,
 ) -> StreamingResponse:
-    """Ensure any requested preset, custom HF repo, or local `.gguf` model is ready."""
+    """Ensure any requested catalog, HF repo, direct URL, or local `.gguf` model is ready."""
     try:
-        if not is_offline_mode() and Path(model_id.strip()).suffix.lower() != ".gguf":
-            runtime.model_downloader.resolve_safe_model_dir(model_id)
+        cleaned_id = model_id.strip()
+        if not cleaned_id:
+            raise ValueError("model_id cannot be empty.")
+        if source_type == ModelSourceType.DIRECT_URL or (
+            source_type in (ModelSourceType.CATALOG, ModelSourceType.HUGGINGFACE)
+            and (cleaned_id.lower().startswith("http://") or cleaned_id.lower().startswith("https://"))
+            and ("huggingface.co/" not in cleaned_id.lower() or "/resolve/" in cleaned_id.lower() or cleaned_id.lower().endswith(".gguf"))
+        ):
+            runtime.model_downloader.resolve_direct_url_path(cleaned_id, filename=filename)
+        elif source_type == ModelSourceType.LOCAL_FILE:
+            local_path = Path(cleaned_id).expanduser().resolve()
+            if not local_path.is_file() and not (local_path.is_dir() and (local_path / "config.json").is_file()):
+                raise FileNotFoundError(f"Local .gguf model file not found: {local_path}")
+        elif not is_offline_mode() and Path(cleaned_id).suffix.lower() != ".gguf":
+            runtime.model_downloader.resolve_safe_model_dir(cleaned_id)
         else:
-            runtime.model_downloader.resolve_safe_gguf_path(model_id)
+            runtime.model_downloader.resolve_safe_gguf_path(cleaned_id)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -916,6 +1121,8 @@ async def stream_model_download(
                 on_event=_on_progress,
                 shard_layer_start=resolved_start,
                 shard_layer_end=resolved_end,
+                source_type=source_type.value,
+                filename=filename,
             )
         except Exception as exc:
             progress_queue.put_nowait(
@@ -987,23 +1194,60 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
 
     runtime.state = NodeState.STARTING
     try:
-        # 1. Inspect existing local model metadata (GGUF header / config.json) to compute
-        #    `total_model_layers` and `max_layers_can_hold` from `ram_gb`.
+        # 1. Inspect existing local model metadata (GGUF header / config.json) & compute
+        #    initial `model_fingerprint` (SHA-256 of first 10MB + total size) when cached/local.
         probe_path: Path | None = None
-        try:
-            _, candidate_gguf = runtime.model_downloader.resolve_safe_gguf_path(
-                request.model_id
-            )
-            if candidate_gguf.is_file():
-                probe_path = candidate_gguf
+        initial_fingerprint: str | None = None
+        if request.source_type == ModelSourceType.LOCAL_FILE:
+            local_candidate = Path(request.model_id.strip()).expanduser().resolve()
+            if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
+                probe_path = local_candidate
+            elif local_candidate.is_file():
+                if local_candidate.suffix.lower() != ".gguf":
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Expected a .gguf model file, got: {local_candidate.name}",
+                    )
+                probe_path = local_candidate
             else:
-                candidate_dir = runtime.model_downloader.resolve_safe_model_dir(
-                    request.model_id
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Local .gguf model file not found: {local_candidate}",
                 )
-                if (candidate_dir / "config.json").is_file():
-                    probe_path = candidate_dir
-        except Exception:
-            probe_path = None
+        else:
+            try:
+                if request.source_type == ModelSourceType.DIRECT_URL:
+                    direct_target = runtime.model_downloader.resolve_direct_url_path(
+                        request.model_id, filename=request.filename
+                    )
+                    if direct_target.is_file():
+                        probe_path = direct_target
+                else:
+                    in_models = runtime.model_downloader.resolve_gguf_in_models_dir(
+                        request.model_id, request.filename
+                    )
+                    if in_models.is_file():
+                        probe_path = in_models
+                    else:
+                        _, candidate_gguf = runtime.model_downloader.resolve_safe_gguf_path(
+                            request.model_id
+                        )
+                        if candidate_gguf.is_file():
+                            probe_path = candidate_gguf
+                        else:
+                            _, candidate_dir = runtime.model_downloader.resolve_safe_model_dir(
+                                request.model_id
+                            )
+                            if (candidate_dir / "config.json").is_file():
+                                probe_path = candidate_dir
+            except Exception:
+                probe_path = None
+
+        if probe_path is not None and probe_path.exists():
+            try:
+                initial_fingerprint = compute_model_fingerprint(probe_path)
+            except Exception:
+                initial_fingerprint = None
 
         pre_plan = calculate_max_layers(
             model_id=request.model_id,
@@ -1039,17 +1283,21 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
 
         # 3. Announce to Cloudflare Tracker with `total_model_layers` + `max_layers_can_hold`
         #    and receive Cloud-orchestrated `assigned_start_layer`, `assigned_end_layer`, `role`.
+        #    AUTO-FALLBACK: timeout / DNS / no route -> OFFLINE_MODE (LAN zeroconf or Solo).
         assigned_role: PeerRole = PeerRole.PRIMARY
         discovered_peers: list[PeerNodeInfo] = []
-        if _is_tracker_enabled():
+        cloud_online: bool = False
+        if _is_tracker_enabled() and request.network_mode == NetworkMode.INTERNET:
             try:
                 assignment: AnnounceAssignment = (
                     await runtime.tracker_client.register_node_with_assignment(
                         request,
                         total_model_layers=total_model_layers,
                         max_layers_can_hold=max_layers_can_hold,
+                        model_fingerprint=initial_fingerprint,
                     )
                 )
+                cloud_online = True
                 discovered_peers = assignment.peers
                 assigned_role = assignment.role
                 if not request.exact_shard_range:
@@ -1064,10 +1312,90 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail=f"Invalid room key for private room '{request.room_id}'.",
                     ) from http_exc
-                logger.warning("Tracker registration HTTP error: %s", http_exc)
-            except Exception as tracker_exc:
                 logger.warning(
-                    "Tracker unreachable; continuing in local/LAN P2P mode: %s", tracker_exc
+                    "Tracker rejected announce (HTTP %d); falling back to OFFLINE_MODE.",
+                    http_exc.response.status_code,
+                )
+            except (TrackerUnreachableError, httpx.HTTPError, OSError) as tracker_exc:
+                logger.warning(
+                    "Cloudflare Tracker unreachable (%s); switching to OFFLINE_MODE "
+                    "(LAN zeroconf discovery -> Solo fallback).",
+                    tracker_exc,
+                )
+            except Exception as tracker_exc:  # malformed response etc. — never block the node
+                logger.warning(
+                    "Unexpected Tracker error (%s); falling back to OFFLINE_MODE.", tracker_exc
+                )
+        runtime.last_tracker_reachable = cloud_online
+
+        # 3b. OFFLINE_MODE: discover LAN peers via zeroconf (+ UDP beacon) before choosing
+        #     which layers to load. No peers -> SOLO MODE (this node hosts 100% of layers).
+        network_status: NetworkStatus = NetworkStatus.ONLINE
+        use_mmap: bool = False
+        ssd_offload_active: bool = False
+        if not cloud_online:
+            if request.network_mode != NetworkMode.LAN:
+                # Re-bind P2P listener on 0.0.0.0 so LAN peers can reach this node.
+                bound_port = await runtime.start_p2p_listener(
+                    bound_port, network_mode=NetworkMode.LAN
+                )
+                request.p2p_listen_port = bound_port
+
+            lan_beacons = await _scan_all_lan_beacons(
+                udp_timeout_seconds=0.25,
+                zeroconf_wait_seconds=_lan_discovery_wait_seconds(),
+            )
+            discovered_peers = _lan_peers_for_room(
+                lan_beacons,
+                room_id=request.room_id,
+                self_node_id=request.node_id,
+                total_layers=total_model_layers,
+            )
+
+            if discovered_peers:
+                network_status = NetworkStatus.LAN_ONLY
+                if not request.exact_shard_range:
+                    # Fill the first layer gap left by LAN peers; if fully covered, be a Backup.
+                    gap_start = _first_uncovered_layer(discovered_peers, total_model_layers)
+                    if gap_start is None:
+                        assigned_role = PeerRole.BACKUP
+                        gap_start = 0
+                    target_start = gap_start
+                    target_end = min(
+                        total_model_layers - 1, target_start + max_layers_can_hold - 1
+                    )
+                logger.info(
+                    "LAN Room '%s': %d peer(s) found; hosting layers %d..%d as %s.",
+                    request.room_id,
+                    len(discovered_peers),
+                    target_start,
+                    target_end,
+                    assigned_role.value,
+                )
+            else:
+                network_status = NetworkStatus.OFFLINE_SOLO
+                fits_in_ram = max_layers_can_hold >= total_model_layers
+                if not request.exact_shard_range:
+                    if fits_in_ram or request.allow_ssd_offload:
+                        target_start = 0
+                        target_end = total_model_layers - 1
+                    else:
+                        target_start = 0
+                        target_end = max_layers_can_hold - 1
+                if not fits_in_ram and request.allow_ssd_offload:
+                    # RAM < model size: memory-map the GGUF so llama_cpp pages the missing
+                    # weights from SSD on demand instead of crashing with OOM.
+                    use_mmap = True
+                    ssd_offload_active = True
+                logger.info(
+                    "SOLO MODE: no Cloud, no LAN peers. Layers %d..%d/%d (ram_gb=%d, "
+                    "fits_in_ram=%s, use_mmap=%s).",
+                    target_start,
+                    target_end,
+                    total_model_layers,
+                    effective_ram_gb,
+                    fits_in_ram,
+                    use_mmap,
                 )
 
         # 4. Download/resolve ONLY the Cloud-assigned shard layers [target_start..target_end]
@@ -1075,7 +1403,20 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
             request.model_id,
             shard_layer_start=target_start,
             shard_layer_end=target_end,
+            source_type=request.source_type.value,
+            filename=request.filename,
         )
+        model_fingerprint: str = compute_model_fingerprint(local_model_path)
+        if cloud_online and model_fingerprint != initial_fingerprint:
+            try:
+                await runtime.tracker_client.register_node_with_assignment(
+                    request,
+                    total_model_layers=total_model_layers,
+                    max_layers_can_hold=max_layers_can_hold,
+                    model_fingerprint=model_fingerprint,
+                )
+            except Exception as fp_exc:
+                logger.debug("Optional model_fingerprint sync skipped: %s", fp_exc)
 
         # 5. Recompute final layer bounds from actual downloaded config.json / GGUF metadata
         layer_plan = calculate_max_layers(
@@ -1091,10 +1432,21 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                 final_total_layers = cfg_total
 
         final_start = max(0, min(target_start, final_total_layers - 1))
-        max_allowed_end = min(
+        ram_capped_end = min(
             final_total_layers - 1,
             final_start + layer_plan.n_layers - 1,
         )
+        # Re-check with the REAL on-disk model size: Solo + SSD offload consent -> mmap all layers.
+        if (
+            network_status == NetworkStatus.OFFLINE_SOLO
+            and request.allow_ssd_offload
+            and ram_capped_end < final_total_layers - 1
+        ):
+            use_mmap = True
+            ssd_offload_active = True
+            if not request.exact_shard_range:
+                target_end = final_total_layers - 1
+        max_allowed_end = final_total_layers - 1 if ssd_offload_active else ram_capped_end
         final_end = max(final_start, min(target_end, max_allowed_end))
         final_n_layers = final_end - final_start + 1
         final_est_ram = min(
@@ -1120,6 +1472,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
             total_layers=final_total_layers,
             n_layers=final_n_layers,
             max_ram_mb=request.max_ram_mb,
+            use_mmap=use_mmap,
         )
         effective_backend = (
             ComputeBackend.PYTORCH
@@ -1130,59 +1483,49 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         room_key_hash: str | None = hash_room_key(request.room_key)
         is_private_room: bool = room_key_hash is not None
 
-        # 7. Advertise on LAN mDNS & merge LAN-discovered peers (preserving primary/backup roles)
-        await lan_mdns_service.start_advertising(
-            LanRoomBeacon(
-                node_id=request.node_id,
-                room_id=request.room_id,
-                model=request.model_id,
-                ram_gb=float(effective_ram_gb),
-                is_private=is_private_room,
-                is_unlisted=request.is_unlisted,
-                p2p_port=bound_port,
-                shard_layer_start=final_start,
-                shard_layer_end=final_end,
-                total_layers=final_total_layers,
-                role=assigned_role.value,
-            )
+        # 7. Advertise on LAN (UDP beacon always; zeroconf DNS-SD broadcast in OFFLINE_MODE or
+        #    explicit LAN mode) & merge LAN-discovered peers (preserving primary/backup roles).
+        lan_beacon = LanRoomBeacon(
+            node_id=request.node_id,
+            room_id=request.room_id,
+            model=request.model_id,
+            ram_gb=float(effective_ram_gb),
+            is_private=is_private_room,
+            is_unlisted=request.is_unlisted,
+            p2p_port=bound_port,
+            shard_layer_start=final_start,
+            shard_layer_end=final_end,
+            total_layers=final_total_layers,
+            role=assigned_role.value,
         )
+        await lan_mdns_service.start_advertising(lan_beacon)
+        if network_status != NetworkStatus.ONLINE or request.network_mode == NetworkMode.LAN:
+            await zeroconf_discovery.start_advertising(lan_beacon)
 
-        known_peer_ids: set[str] = {peer.peer_id for peer in discovered_peers}
-        lan_peers_raw = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.2)
-        for beacon in lan_peers_raw:
-            peer_id = str(beacon.get("node_id") or "")
-            if (
-                not peer_id
-                or peer_id == request.node_id
-                or peer_id in known_peer_ids
-                or str(beacon.get("room_id") or "public") != request.room_id
-            ):
-                continue
-            known_peer_ids.add(peer_id)
-            raw_peer_role = str(beacon.get("role") or PeerRole.PRIMARY.value).lower()
-            peer_role = (
-                PeerRole.BACKUP if raw_peer_role == PeerRole.BACKUP.value else PeerRole.PRIMARY
+        if network_status == NetworkStatus.ONLINE:
+            known_peer_ids: set[str] = {peer.peer_id for peer in discovered_peers}
+            lan_peers = _lan_peers_for_room(
+                await _scan_all_lan_beacons(udp_timeout_seconds=0.2),
+                room_id=request.room_id,
+                self_node_id=request.node_id,
+                total_layers=final_total_layers,
             )
-            discovered_peers.append(
-                PeerNodeInfo(
-                    peer_id=peer_id,
-                    ip_address=str(beacon.get("ip_address") or "127.0.0.1"),
-                    port=int(beacon.get("p2p_port") or 49152),
-                    shard_layer_start=int(beacon.get("shard_layer_start") or 0),
-                    shard_layer_end=int(beacon.get("shard_layer_end") or (final_total_layers - 1)),
-                    role=peer_role,
-                    available_vram_mb=0,
-                    room_id=request.room_id,
-                )
-            )
+            discovered_peers.extend(p for p in lan_peers if p.peer_id not in known_peer_ids)
 
         # 8. Issue cryptographic Session Token stored strictly in process RAM
+        #    (issued in every mode — Online, LAN Only and Offline Solo).
         runtime.session_token = f"sk-shard-{secrets.token_urlsafe(24)}"
+        runtime.network_status = network_status
+        runtime.use_mmap = use_mmap
+        runtime.ssd_offload_active = ssd_offload_active
+        runtime.source_type = request.source_type
+        runtime.model_fingerprint = model_fingerprint
         runtime.node_id = request.node_id
         runtime.model_id = request.model_id
         runtime.model_path = str(local_model_path)
         runtime.network_mode = request.network_mode
         runtime.room_id = request.room_id
+        runtime.room_key_hash = room_key_hash
         runtime.is_private = is_private_room
         runtime.is_unlisted = request.is_unlisted
         runtime.role = assigned_role
@@ -1202,11 +1545,17 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         role_display = (
             "Primary Seeder" if assigned_role == PeerRole.PRIMARY else "Backup Node"
         )
+        status_label = {
+            NetworkStatus.ONLINE: "Online (Cloud)",
+            NetworkStatus.LAN_ONLY: "LAN Only",
+            NetworkStatus.OFFLINE_SOLO: "Offline (Solo)",
+        }[network_status]
+        offload_note = " + SSD Offload (use_mmap)" if ssd_offload_active else ""
         return runtime.to_status_response(
             message=(
-                f"Gateway Active ({request.network_mode.value.upper()} / Room: '{request.room_id}') — "
+                f"Gateway Active [{status_label}] (Room: '{request.room_id}') — "
                 f"Role: {role_display} (Layers {final_start}..{final_end}/{final_total_layers}) "
-                f"[{effective_backend.value}]."
+                f"[{effective_backend.value}{offload_note}]."
             )
         )
     except HTTPException:
@@ -1215,6 +1564,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.coverage_percent = 0.0
         await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
+        await zeroconf_discovery.stop_advertising()
         await runtime.stop_p2p_listener()
         if runtime.model_runner is not None:
             runtime.model_runner.release()
@@ -1228,6 +1578,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.coverage_percent = 0.0
         await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
+        await zeroconf_discovery.stop_advertising()
         await runtime.stop_p2p_listener()
         if runtime.model_runner is not None:
             runtime.model_runner.release()
@@ -1272,6 +1623,7 @@ async def stop_node() -> NodeStatusResponse:
         runtime.coverage_percent = 0.0
         await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
+        await zeroconf_discovery.stop_advertising()
         await runtime.stop_p2p_listener()
         if runtime.model_runner is not None:
             runtime.model_runner.release()
@@ -1284,6 +1636,12 @@ async def stop_node() -> NodeStatusResponse:
         runtime.model_path = None
         runtime.network_mode = None
         runtime.room_id = None
+        runtime.room_key_hash = None
+        runtime.network_status = None
+        runtime.use_mmap = False
+        runtime.ssd_offload_active = False
+        runtime.source_type = None
+        runtime.model_fingerprint = None
         runtime.is_private = False
         runtime.is_unlisted = False
         runtime.role = PeerRole.PRIMARY
@@ -1354,6 +1712,12 @@ async def openai_chat_completions(
                         f"Swarm is not ready (current layer coverage: {runtime.coverage_percent:.0f}%). "
                         f"Room '{runtime.room_id or 'public'}' needs additional RAM/nodes to cover all "
                         f"{runtime.total_layers} layers of '{runtime.model_id}'. Invite more nodes to join."
+                        + (
+                            " Running Offline (Solo): restart with 'allow_ssd_offload' enabled to "
+                            "page the remaining layers from SSD (use_mmap)."
+                            if runtime.network_status == NetworkStatus.OFFLINE_SOLO
+                            else ""
+                        )
                     ),
                     "type": "service_unavailable_error",
                     "param": None,

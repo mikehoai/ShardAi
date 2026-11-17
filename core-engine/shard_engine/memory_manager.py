@@ -18,7 +18,7 @@ import platform
 import subprocess
 from typing import Any
 
-from models.downloader import SUPPORTED_MODELS, read_hf_config_summary
+from models.downloader import DEFAULT_CATALOG_MODELS, SUPPORTED_MODELS, read_hf_config_summary
 from models.gguf_reader import read_gguf_total_layers
 from shard_engine.schemas import ComputeBackend, StartNodeRequest
 
@@ -60,9 +60,12 @@ def calculate_max_layers(
         model_size_gb = spec.estimated_total_size_gb
         base_overhead_gb = spec.base_overhead_gb
     else:
-        # Sensible defaults for custom HuggingFace repos or local .gguf files
-        total_layers = 32
-        model_size_gb = 5.0
+        catalog_match = next(
+            (m for m in DEFAULT_CATALOG_MODELS if m.get("repo_id") == model_id or m.get("id") == model_id),
+            None,
+        )
+        total_layers = 40 if catalog_match and float(catalog_match.get("estimated_ram_gb", 0)) >= 9.0 else 32
+        model_size_gb = float(catalog_match["estimated_ram_gb"]) if catalog_match else 5.0
         base_overhead_gb = 0.6
 
     # Use actual GGUF file size or HF Safetensors directory config when present

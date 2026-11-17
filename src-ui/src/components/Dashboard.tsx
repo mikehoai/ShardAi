@@ -1,7 +1,13 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import type {
+  CatalogModelItem,
+  ModelCatalogResponse,
+  ModelSourceType,
   NetworkMode,
+  NetworkStatus,
+  NetworkStatusResponse,
   NodeStatusResponse,
   PeerRole,
   RoomLobbyItem,
@@ -13,29 +19,49 @@ const LOCAL_ENGINE_ROOT = "http://127.0.0.1:8000";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000/v1";
 const MIN_RAM_GB = 2;
 const DEFAULT_MAX_RAM_GB = 16;
+const NETWORK_STATUS_POLL_MS = 10000;
 
-const SUGGESTED_MODELS = [
-  {
-    id: "Qwen/Qwen2.5-0.5B-Instruct",
-    label: "Qwen 2.5 0.5B (Fast CPU / Test)",
+const NETWORK_STATUS_META: Record<
+  NetworkStatus,
+  { icon: string; label: string; color: string; background: string; border: string }
+> = {
+  online: {
+    icon: "🟢",
+    label: "Online (Cloud)",
+    color: "#166534",
+    background: "#f0fdf4",
+    border: "#86efac",
   },
-  {
-    id: "HuggingFaceTB/SmolLM2-360M-Instruct",
-    label: "SmolLM2 360M (Ultra-Light Test)",
+  lan_only: {
+    icon: "🟡",
+    label: "LAN Only",
+    color: "#854d0e",
+    background: "#fefce8",
+    border: "#fde047",
   },
-  {
-    id: "meta-llama/Llama-3.1-8B-Instruct",
-    label: "Llama 3.1 8B",
+  offline_solo: {
+    icon: "🔴",
+    label: "Offline (Solo)",
+    color: "#991b1b",
+    background: "#fef2f2",
+    border: "#fca5a5",
   },
-  {
-    id: "Qwen/Qwen2.5-7B-Instruct",
-    label: "Qwen 2.5 7B",
-  },
-  {
-    id: "mistralai/Mistral-7B-Instruct-v0.3",
-    label: "Mistral 7B v0.3",
-  },
-] as const;
+};
+
+type ModelTab = "catalog" | "custom" | "local";
+
+function inferCustomSourceType(rawInput: string): ModelSourceType {
+  const lowered = rawInput.trim().toLowerCase();
+  if (
+    (lowered.startsWith("http://") || lowered.startsWith("https://")) &&
+    (!lowered.includes("huggingface.co/") ||
+      lowered.includes("/resolve/") ||
+      lowered.endsWith(".gguf"))
+  ) {
+    return "direct_url";
+  }
+  return "huggingface";
+}
 
 interface SseDownloadEvent {
   model_id: string;
@@ -49,6 +75,8 @@ interface SseDownloadEvent {
 
 interface StartConfigOverride {
   model: string;
+  sourceType?: ModelSourceType;
+  filename?: string | null;
   room: string;
   key: string;
   unlisted: boolean;
@@ -95,10 +123,20 @@ export const Dashboard: React.FC = () => {
   const [modalUnlisted, setModalUnlisted] = useState<boolean>(false);
   const [invitePasteInput, setInvitePasteInput] = useState<string>("");
 
-  // Configuration Form State
+  // 3-Tab Model Selection State (Online Catalog / Custom HF or URL / Local File)
+  const [modelTab, setModelTab] = useState<ModelTab>("catalog");
+  const [catalogModels, setCatalogModels] = useState<CatalogModelItem[]>([]);
+  const [catalogSource, setCatalogSource] = useState<"cloud" | "cache" | "default" | null>(
+    null
+  );
+  const [isLoadingCatalog, setIsLoadingCatalog] = useState<boolean>(false);
+  const [selectedCatalogId, setSelectedCatalogId] = useState<string>("");
   const [modelInput, setModelInput] = useState<string>(
     "meta-llama/Llama-3.1-8B-Instruct"
   );
+  const [customFilename, setCustomFilename] = useState<string>("");
+  const [localFilePath, setLocalFilePath] = useState<string>("");
+  const localFileInputRef = useRef<HTMLInputElement | null>(null);
   const [networkMode, setNetworkMode] = useState<NetworkMode>("internet");
   const [roomId, setRoomId] = useState<string>("public");
   const [roomKey, setRoomKey] = useState<string>("");
@@ -106,6 +144,13 @@ export const Dashboard: React.FC = () => {
   const [availableRamGb, setAvailableRamGb] = useState<number | null>(null);
   const [maxRamGb, setMaxRamGb] = useState<number>(DEFAULT_MAX_RAM_GB);
   const [sharedRamGb, setSharedRamGb] = useState<number>(4);
+  const [allowSsdOffload, setAllowSsdOffload] = useState<boolean>(false);
+
+  // Offline / Solo Mode connectivity (null = engine not reachable yet)
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatus | null>(null);
+  const [lanPeersCount, setLanPeersCount] = useState<number>(0);
+  const [ssdOffloadActive, setSsdOffloadActive] = useState<boolean>(false);
+  const [modelFingerprint, setModelFingerprint] = useState<string | null>(null);
 
   // Node Lifecycle & Gateway Credentials State
   const [isSharing, setIsSharing] = useState<boolean>(false);
@@ -138,8 +183,10 @@ export const Dashboard: React.FC = () => {
     try {
       const res = await fetch(`${LOCAL_ENGINE_ROOT}/available-rooms`);
       if (res.ok) {
-        const rooms = (await res.json()) as RoomLobbyItem[];
-        setAvailableRooms(rooms);
+        const rooms = (await res.json()) as unknown;
+        if (Array.isArray(rooms)) {
+          setAvailableRooms(rooms as RoomLobbyItem[]);
+        }
       }
     } catch {
       // Keep existing lobby state if local core engine is not yet running
@@ -147,6 +194,84 @@ export const Dashboard: React.FC = () => {
       setIsLoadingRooms(false);
     }
   }, []);
+
+  const fetchNetworkStatus = useCallback(async (): Promise<void> => {
+    try {
+      const res = await fetch(`${LOCAL_ENGINE_ROOT}/network-status`);
+      if (res.ok) {
+        const data = (await res.json()) as Partial<NetworkStatusResponse>;
+        if (
+          data.network_status === "online" ||
+          data.network_status === "lan_only" ||
+          data.network_status === "offline_solo"
+        ) {
+          setNetworkStatus(data.network_status);
+          setLanPeersCount(
+            typeof data.lan_peers_count === "number" ? data.lan_peers_count : 0
+          );
+        }
+      }
+    } catch {
+      // Engine not reachable yet; keep the last known indicator
+    }
+  }, []);
+
+  // Network Status Indicator: probe on mount and every 10s (Cloud -> LAN -> Solo)
+  useEffect(() => {
+    void fetchNetworkStatus();
+    const timerId = window.setInterval(() => {
+      void fetchNetworkStatus();
+    }, NETWORK_STATUS_POLL_MS);
+    return () => {
+      window.clearInterval(timerId);
+    };
+  }, [fetchNetworkStatus]);
+
+  const fetchModelCatalog = useCallback(async (): Promise<void> => {
+    setIsLoadingCatalog(true);
+    try {
+      const res = await fetch(`${LOCAL_ENGINE_ROOT}/models/catalog`);
+      if (res.ok) {
+        const data = (await res.json()) as Partial<ModelCatalogResponse>;
+        if (Array.isArray(data.models) && data.models.length > 0) {
+          setCatalogModels(data.models);
+          if (
+            data.source === "cloud" ||
+            data.source === "cache" ||
+            data.source === "default"
+          ) {
+            setCatalogSource(data.source);
+          }
+          setSelectedCatalogId((prev) => {
+            if (prev && data.models?.some((m) => m.id === prev)) {
+              return prev;
+            }
+            const first = data.models?.[0];
+            if (first) {
+              setModelInput(first.repo_id);
+              return first.id;
+            }
+            return prev;
+          });
+        }
+      }
+    } catch {
+      // Engine may not be reachable yet
+    } finally {
+      setIsLoadingCatalog(false);
+    }
+  }, []);
+
+  const applyNodeNetworkFields = (statusData: NodeStatusResponse): void => {
+    if (statusData.network_status) {
+      setNetworkStatus(statusData.network_status);
+    }
+    setSsdOffloadActive(Boolean(statusData.ssd_offload_active));
+    setModelFingerprint(statusData.model_fingerprint ?? null);
+  };
+
+  // Public/Cloud rooms cannot be fetched while offline: hide the Lobby list in LAN/Solo mode
+  const isCloudOffline = networkStatus === "lan_only" || networkStatus === "offline_solo";
 
   // Inspect host RAM and fetch initial Room Lobby on mount
   useEffect(() => {
@@ -205,12 +330,13 @@ export const Dashboard: React.FC = () => {
               setCoveragePercent(pct);
               setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
               setStatusMessage(statusData.message || "Active & Connected");
+              applyNodeNetworkFields(statusData);
             }
           }
         } catch {
           // Core engine may not be started yet
         }
-        await fetchAvailableRooms();
+        await Promise.all([fetchAvailableRooms(), fetchModelCatalog()]);
       }
     };
 
@@ -218,7 +344,7 @@ export const Dashboard: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [fetchAvailableRooms]);
+  }, [fetchAvailableRooms, fetchModelCatalog]);
 
   // Poll local /status every 5s while sharing so API Standby -> API Ready flips live
   useEffect(() => {
@@ -235,6 +361,7 @@ export const Dashboard: React.FC = () => {
           setCoveragePercent(pct);
           setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
           setAssignedRole(statusData.role === "backup" ? "backup" : "primary");
+          applyNodeNetworkFields(statusData);
           if (
             typeof statusData.shard_layer_start === "number" &&
             typeof statusData.shard_layer_end === "number"
@@ -272,7 +399,11 @@ export const Dashboard: React.FC = () => {
     }
   };
 
-  const streamModelDownload = async (modelId: string): Promise<void> => {
+  const streamModelDownload = async (
+    modelId: string,
+    sourceType: ModelSourceType = "catalog",
+    filename?: string | null
+  ): Promise<void> => {
     setDownloadProgress(0);
     setDownloadStatusMsg(`Checking cache / preparing ${modelId}...`);
 
@@ -293,8 +424,17 @@ export const Dashboard: React.FC = () => {
       return;
     }
 
+    const params = new URLSearchParams({
+      model_id: modelId,
+      ram_gb: String(sharedRamGb),
+      source_type: sourceType,
+    });
+    if (filename) {
+      params.set("filename", filename);
+    }
+
     const response = await fetch(
-      `${LOCAL_ENGINE_ROOT}/models/download-stream?model_id=${encodeURIComponent(modelId)}&ram_gb=${sharedRamGb}`
+      `${LOCAL_ENGINE_ROOT}/models/download-stream?${params.toString()}`
     );
     if (!response.ok || !response.body) {
       throw new Error(`Failed to stream model download: HTTP ${response.status}`);
@@ -335,17 +475,92 @@ export const Dashboard: React.FC = () => {
     }
   };
 
+  const resolveActiveModelSelection = (): {
+    model: string;
+    sourceType: ModelSourceType;
+    filename: string | null;
+  } => {
+    if (modelTab === "catalog") {
+      const selected = catalogModels.find((m) => m.id === selectedCatalogId) ?? catalogModels[0];
+      if (selected) {
+        return {
+          model: selected.repo_id,
+          sourceType: "catalog",
+          filename: selected.filename ?? null,
+        };
+      }
+      return {
+        model: modelInput.trim(),
+        sourceType: "catalog",
+        filename: null,
+      };
+    }
+    if (modelTab === "local") {
+      return {
+        model: localFilePath.trim(),
+        sourceType: "local_file",
+        filename: null,
+      };
+    }
+    const customModel = modelInput.trim();
+    const detectedType = inferCustomSourceType(customModel);
+    return {
+      model: customModel,
+      sourceType: detectedType,
+      filename: detectedType === "huggingface" ? customFilename.trim() || null : null,
+    };
+  };
+
+  const handleBrowseGgufFile = async (): Promise<void> => {
+    setErrorMessage(null);
+    if (isTauriEnvironment()) {
+      try {
+        const picked = await openFileDialog({
+          multiple: false,
+          directory: false,
+          filters: [{ name: "GGUF Model", extensions: ["gguf"] }],
+        });
+        if (typeof picked === "string" && picked.trim()) {
+          setLocalFilePath(picked.trim());
+          setDownloadProgress(null);
+          setDownloadStatusMsg("");
+          return;
+        }
+        if (picked === null) {
+          return;
+        }
+      } catch {
+        // Fallback to native HTML file picker if dialog plugin is unavailable
+      }
+    }
+    localFileInputRef.current?.click();
+  };
+
   const startSharingWithConfig = async (
     override?: StartConfigOverride
   ): Promise<void> => {
-    const targetModel = (override?.model ?? modelInput).trim();
+    const activeSelection = resolveActiveModelSelection();
+    const targetModel = (override?.model ?? activeSelection.model).trim();
+    const targetSourceType: ModelSourceType =
+      override?.sourceType ??
+      (override?.model ? inferCustomSourceType(override.model) : activeSelection.sourceType);
+    const targetFilename: string | null =
+      override?.filename !== undefined
+        ? override.filename
+        : override?.model
+          ? null
+          : activeSelection.filename;
     const targetRoom = (override?.room ?? roomId).trim() || "public";
     const targetKey = (override?.key ?? roomKey).trim();
     const targetUnlisted = override?.unlisted ?? isUnlisted;
     const targetMode = override?.mode ?? networkMode;
 
     if (!targetModel) {
-      setErrorMessage("Please enter or select a valid HuggingFace Repo ID or local .gguf path.");
+      setErrorMessage(
+        modelTab === "local"
+          ? "Please browse or enter a valid local .gguf file path."
+          : "Please select a catalog model or enter a HuggingFace Repo ID / Direct URL."
+      );
       return;
     }
 
@@ -357,7 +572,7 @@ export const Dashboard: React.FC = () => {
       await invokeTauriCommand<string>("start_python_core");
 
       setStatusMessage("Checking and preparing model weights...");
-      await streamModelDownload(targetModel);
+      await streamModelDownload(targetModel, targetSourceType, targetFilename);
 
       setStatusMessage(
         `Joining ${targetMode.toUpperCase()} room '${targetRoom}' & allocating ${sharedRamGb} GB RAM...`
@@ -366,6 +581,8 @@ export const Dashboard: React.FC = () => {
       const payload: StartNodeRequest = {
         node_id: "shardai-client-01",
         model_id: targetModel,
+        source_type: targetSourceType,
+        filename: targetFilename,
         network_mode: targetMode,
         room_id: targetRoom,
         room_key: targetKey || null,
@@ -378,6 +595,7 @@ export const Dashboard: React.FC = () => {
         p2p_listen_port: 49152,
         shard_layer_start: 0,
         shard_layer_end: 15,
+        allow_ssd_offload: allowSsdOffload,
       };
 
       let response: Response | null = null;
@@ -450,8 +668,13 @@ export const Dashboard: React.FC = () => {
         data.n_layers && data.total_layers
           ? `${data.n_layers}/${data.total_layers} layers`
           : `${sharedRamGb} GB RAM`;
+      applyNodeNetworkFields(data);
+      const statusLabel = data.network_status
+        ? NETWORK_STATUS_META[data.network_status].label
+        : (data.network_mode ?? targetMode).toUpperCase();
+      const offloadLabel = data.ssd_offload_active ? " | 💾 SSD Offload (mmap)" : "";
       setStatusMessage(
-        `Active & Connected (${(data.network_mode ?? targetMode).toUpperCase()} / Room: ${data.room_id ?? targetRoom}) — ${layersLabel} | Peers: ${data.connected_peers_count}`
+        `Active & Connected (${statusLabel} / Room: ${data.room_id ?? targetRoom}) — ${layersLabel} | Peers: ${data.connected_peers_count}${offloadLabel}`
       );
       await fetchAvailableRooms();
     } catch (err: unknown) {
@@ -489,10 +712,12 @@ export const Dashboard: React.FC = () => {
       setAssignedLayerRange(null);
       setCoveragePercent(0);
       setIsSwarmReady(false);
+      setSsdOffloadActive(false);
+      setModelFingerprint(null);
       setDownloadProgress(null);
       setDownloadStatusMsg("");
       setStatusMessage(`Stopped — ${stopMsg}`);
-      await fetchAvailableRooms();
+      await Promise.all([fetchAvailableRooms(), fetchNetworkStatus()]);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setErrorMessage(message);
@@ -618,23 +843,69 @@ export const Dashboard: React.FC = () => {
       }}
     >
       <header style={{ marginBottom: "22px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "8px",
+          }}
+        >
           <h1 style={{ fontSize: "1.4rem", margin: 0, fontWeight: 700 }}>
             ShardAi Gateway
           </h1>
-          <span
-            data-testid="gateway-badge"
-            style={{
-              fontSize: "0.75rem",
-              fontWeight: 600,
-              padding: "4px 10px",
-              borderRadius: "999px",
-              backgroundColor: isSharing ? "#dcfce7" : "#f1f5f9",
-              color: isSharing ? "#15803d" : "#475569",
-            }}
-          >
-            {isSharing ? "ACTIVE" : "OFFLINE"}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            {(() => {
+              const meta = networkStatus
+                ? NETWORK_STATUS_META[networkStatus]
+                : {
+                    icon: "⚪",
+                    label: "Checking Network...",
+                    color: "#475569",
+                    background: "#f8fafc",
+                    border: "#cbd5e1",
+                  };
+              return (
+                <span
+                  data-testid="network-status-indicator"
+                  title={
+                    networkStatus === "lan_only"
+                      ? `${lanPeersCount} LAN peer(s) discovered via mDNS/zeroconf`
+                      : meta.label
+                  }
+                  style={{
+                    fontSize: "0.75rem",
+                    fontWeight: 600,
+                    padding: "4px 10px",
+                    borderRadius: "999px",
+                    backgroundColor: meta.background,
+                    color: meta.color,
+                    border: `1px solid ${meta.border}`,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {meta.icon} {meta.label}
+                  {networkStatus === "lan_only" && lanPeersCount > 0
+                    ? ` (${lanPeersCount})`
+                    : ""}
+                </span>
+              );
+            })()}
+            <span
+              data-testid="gateway-badge"
+              style={{
+                fontSize: "0.75rem",
+                fontWeight: 600,
+                padding: "4px 10px",
+                borderRadius: "999px",
+                backgroundColor: isSharing ? "#dcfce7" : "#f1f5f9",
+                color: isSharing ? "#15803d" : "#475569",
+              }}
+            >
+              {isSharing ? "ACTIVE" : "OFFLINE"}
+            </span>
+          </div>
         </div>
         <p style={{ margin: "6px 0 0 0", fontSize: "0.85rem", color: "#64748b" }}>
           Discover active compute rooms or launch your own P2P OpenAI-compatible gateway.
@@ -671,7 +942,10 @@ export const Dashboard: React.FC = () => {
             <button
               type="button"
               data-testid="refresh-rooms-btn"
-              onClick={() => void fetchAvailableRooms()}
+              onClick={() => {
+                void fetchAvailableRooms();
+                void fetchNetworkStatus();
+              }}
               disabled={isLoadingRooms}
               style={{
                 padding: "6px 12px",
@@ -707,6 +981,76 @@ export const Dashboard: React.FC = () => {
           </div>
         </div>
 
+        {isCloudOffline ? (
+          <div
+            data-testid="offline-rooms-hidden-notice"
+            style={{
+              padding: "14px",
+              borderRadius: "8px",
+              backgroundColor: "#ffffff",
+              border: "1px dashed #cbd5e1",
+              fontSize: "0.82rem",
+              color: "#475569",
+            }}
+          >
+            {networkStatus === "lan_only" ? (
+              <>
+                <div style={{ fontWeight: 600, color: "#854d0e", marginBottom: "6px" }}>
+                  🟡 Public Cloud Rooms hidden in LAN Only mode (Cloudflare Tracker unreachable).
+                </div>
+                {availableRooms.filter((r) => r.network_scope === "lan").length > 0 ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "8px" }}>
+                    {availableRooms
+                      .filter((r) => r.network_scope === "lan")
+                      .map((room) => (
+                        <div
+                          key={room.room_id}
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            padding: "8px 10px",
+                            borderRadius: "6px",
+                            backgroundColor: "#fefce8",
+                            border: "1px solid #fde047",
+                          }}
+                        >
+                          <span>
+                            <strong>{room.room_id}</strong> ({room.model}) — {room.nodes_online} LAN node(s), {room.total_shared_ram_gb} GB
+                          </span>
+                          <button
+                            type="button"
+                            data-testid={`join-room-${room.room_id}`}
+                            disabled={isSharing || isBusy}
+                            onClick={() => handleJoinLobbyRoom(room)}
+                            style={{
+                              padding: "4px 10px",
+                              fontSize: "0.75rem",
+                              fontWeight: 600,
+                              borderRadius: "6px",
+                              border: "none",
+                              backgroundColor: "#2563eb",
+                              color: "#ffffff",
+                              cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Join LAN
+                          </button>
+                        </div>
+                      ))}
+                  </div>
+                ) : (
+                  <span>Configure a room below or wait for mDNS/Zeroconf LAN peers.</span>
+                )}
+              </>
+            ) : (
+              <span>
+                🔴 <strong>Offline (Solo Mode)</strong> — Public Rooms list is hidden while offline. Click{" "}
+                <strong>Start Sharing &amp; Join Room</strong> below to run standalone (with optional SSD Offloading).
+              </span>
+            )}
+          </div>
+        ) : (
         <div style={{ overflowX: "auto" }}>
           <table
             data-testid="rooms-lobby-table"
@@ -822,6 +1166,7 @@ export const Dashboard: React.FC = () => {
             </tbody>
           </table>
         </div>
+        )}
       </div>
 
       {/* ===================================================================== */}
@@ -1113,74 +1458,265 @@ export const Dashboard: React.FC = () => {
       )}
 
       {/* ===================================================================== */}
-      {/* 2. Node Configuration Form                                            */}
+      {/* 2. Node Configuration Form (3-Tab Model Selector)                     */}
       {/* ===================================================================== */}
       <div style={{ marginBottom: "18px" }}>
-        <label
-          htmlFor="model-input"
+        <div
           style={{
-            display: "block",
-            fontSize: "0.875rem",
-            fontWeight: 600,
-            marginBottom: "6px",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "8px",
+            marginBottom: "8px",
           }}
         >
-          Model (HuggingFace Repo / URL / Local .gguf Path)
-        </label>
-        <input
-          id="model-input"
-          data-testid="model-input"
-          type="text"
-          list="suggested-models"
-          value={modelInput}
-          disabled={isSharing || isBusy}
-          onChange={(e) => {
-            setModelInput(e.target.value);
-            setDownloadProgress(null);
-            setDownloadStatusMsg("");
-          }}
-          placeholder="e.g. meta-llama/Llama-3.1-8B-Instruct or D:\models\model.gguf"
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            padding: "10px 12px",
-            borderRadius: "8px",
-            border: "1px solid #cbd5e1",
-            fontSize: "0.875rem",
-            backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-            color: "#0f172a",
-          }}
-        />
-        <datalist id="suggested-models">
-          {SUGGESTED_MODELS.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.label}
-            </option>
-          ))}
-        </datalist>
-
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "8px" }}>
-          {SUGGESTED_MODELS.map((preset) => (
-            <button
-              key={preset.id}
-              type="button"
-              disabled={isSharing || isBusy}
-              onClick={() => setModelInput(preset.id)}
+          <span style={{ fontSize: "0.875rem", fontWeight: 600 }}>Model Source</span>
+          {catalogSource !== null && modelTab === "catalog" && (
+            <span
+              data-testid="catalog-source-badge"
               style={{
-                padding: "4px 10px",
-                fontSize: "0.75rem",
-                borderRadius: "6px",
+                fontSize: "0.72rem",
+                fontWeight: 600,
+                padding: "2px 8px",
+                borderRadius: "999px",
+                backgroundColor: catalogSource === "cloud" ? "#dcfce7" : "#fefce8",
+                color: catalogSource === "cloud" ? "#166534" : "#854d0e",
                 border:
-                  modelInput === preset.id ? "1px solid #2563eb" : "1px solid #e2e8f0",
-                backgroundColor: modelInput === preset.id ? "#eff6ff" : "#f8fafc",
-                color: modelInput === preset.id ? "#1d4ed8" : "#475569",
-                cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+                  catalogSource === "cloud" ? "1px solid #86efac" : "1px solid #fde047",
               }}
             >
-              {preset.label}
-            </button>
-          ))}
+              {catalogSource === "cloud"
+                ? "Synced from Cloud"
+                : catalogSource === "cache"
+                  ? "Loaded from ~/.shardai/models_cache.json"
+                  : "Default Offline Catalog"}
+            </span>
+          )}
         </div>
+
+        {/* 3 Model Selection Tabs */}
+        <div
+          role="tablist"
+          aria-label="Model Source Tabs"
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr 1fr",
+            gap: "6px",
+            marginBottom: "10px",
+          }}
+        >
+          {(
+            [
+              { id: "catalog", label: "Online Catalog" },
+              { id: "custom", label: "Custom HF / URL" },
+              { id: "local", label: "Local File" },
+            ] as const
+          ).map((tab) => {
+            const active = modelTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                data-testid={`tab-${tab.id}`}
+                disabled={isSharing || isBusy}
+                onClick={() => {
+                  setModelTab(tab.id);
+                  setDownloadProgress(null);
+                  setDownloadStatusMsg("");
+                }}
+                style={{
+                  padding: "8px 10px",
+                  fontSize: "0.8rem",
+                  fontWeight: 600,
+                  borderRadius: "8px",
+                  border: active ? "1px solid #2563eb" : "1px solid #cbd5e1",
+                  backgroundColor: active ? "#eff6ff" : "#f8fafc",
+                  color: active ? "#1d4ed8" : "#475569",
+                  cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+                }}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Tab 1: Online Catalog */}
+        {modelTab === "catalog" && (
+          <div data-testid="panel-catalog" style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <select
+              aria-label="Online Model Catalog"
+              data-testid="catalog-model-select"
+              value={selectedCatalogId}
+              disabled={isSharing || isBusy || catalogModels.length === 0}
+              onChange={(e) => {
+                const chosenId = e.target.value;
+                setSelectedCatalogId(chosenId);
+                const found = catalogModels.find((m) => m.id === chosenId);
+                if (found) {
+                  setModelInput(found.repo_id);
+                }
+                setDownloadProgress(null);
+                setDownloadStatusMsg("");
+              }}
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: "8px",
+                border: "1px solid #cbd5e1",
+                fontSize: "0.875rem",
+                backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
+                color: "#0f172a",
+              }}
+            >
+              {catalogModels.length === 0 ? (
+                <option value="">
+                  {isLoadingCatalog ? "Loading model catalog..." : "No catalog models loaded yet — click Refresh"}
+                </option>
+              ) : (
+                catalogModels.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name} (~{item.estimated_ram_gb} GB)
+                  </option>
+                ))
+              )}
+            </select>
+            <button
+              type="button"
+              data-testid="refresh-catalog-btn"
+              onClick={() => void fetchModelCatalog()}
+              disabled={isLoadingCatalog || isSharing || isBusy}
+              style={{
+                padding: "10px 14px",
+                fontSize: "0.8rem",
+                fontWeight: 600,
+                borderRadius: "8px",
+                border: "1px solid #cbd5e1",
+                backgroundColor: "#ffffff",
+                color: "#334155",
+                cursor: isLoadingCatalog || isSharing || isBusy ? "wait" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {isLoadingCatalog ? "Syncing..." : "Refresh"}
+            </button>
+          </div>
+        )}
+
+        {/* Tab 2: Custom HF Repo / External Direct URL */}
+        {modelTab === "custom" && (
+          <div data-testid="panel-custom" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <input
+              id="model-input"
+              data-testid="model-input"
+              type="text"
+              value={modelInput}
+              disabled={isSharing || isBusy}
+              onChange={(e) => {
+                setModelInput(e.target.value);
+                setDownloadProgress(null);
+                setDownloadStatusMsg("");
+              }}
+              placeholder="HuggingFace Repo (e.g. bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) or Direct .gguf URL"
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "10px 12px",
+                borderRadius: "8px",
+                border: "1px solid #cbd5e1",
+                fontSize: "0.875rem",
+                backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
+                color: "#0f172a",
+              }}
+            />
+            {inferCustomSourceType(modelInput) === "huggingface" && (
+              <input
+                type="text"
+                data-testid="custom-filename-input"
+                value={customFilename}
+                disabled={isSharing || isBusy}
+                onChange={(e) => setCustomFilename(e.target.value)}
+                placeholder="Optional .gguf filename (leave blank to auto-pick Q4_K_M)"
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  padding: "8px 12px",
+                  borderRadius: "8px",
+                  border: "1px solid #e2e8f0",
+                  fontSize: "0.8rem",
+                  backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
+                  color: "#334155",
+                }}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Tab 3: Local File (.gguf via Tauri File Dialog) */}
+        {modelTab === "local" && (
+          <div data-testid="panel-local" style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <input
+              type="text"
+              data-testid="local-file-input"
+              value={localFilePath}
+              disabled={isSharing || isBusy}
+              onChange={(e) => {
+                setLocalFilePath(e.target.value);
+                setDownloadProgress(null);
+                setDownloadStatusMsg("");
+              }}
+              placeholder="Select or paste absolute path to local .gguf file..."
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: "8px",
+                border: "1px solid #cbd5e1",
+                fontSize: "0.85rem",
+                backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
+                color: "#0f172a",
+              }}
+            />
+            <input
+              ref={localFileInputRef}
+              type="file"
+              accept=".gguf"
+              aria-hidden="true"
+              tabIndex={-1}
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  const fileWithPath = file as File & { path?: string };
+                  setLocalFilePath(fileWithPath.path ?? file.name);
+                  setDownloadProgress(null);
+                  setDownloadStatusMsg("");
+                }
+              }}
+            />
+            <button
+              type="button"
+              data-testid="browse-gguf-btn"
+              disabled={isSharing || isBusy}
+              onClick={() => void handleBrowseGgufFile()}
+              style={{
+                padding: "10px 14px",
+                fontSize: "0.8rem",
+                fontWeight: 600,
+                borderRadius: "8px",
+                border: "none",
+                backgroundColor: "#0f172a",
+                color: "#ffffff",
+                cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Browse (.gguf)
+            </button>
+          </div>
+        )}
       </div>
 
       {/* RAM Slider */}
@@ -1236,6 +1772,35 @@ export const Dashboard: React.FC = () => {
           )}
           <span>{maxRamGb} GB</span>
         </div>
+
+        <label
+          htmlFor="ssd-offload-checkbox"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            marginTop: "10px",
+            padding: "8px 10px",
+            borderRadius: "8px",
+            backgroundColor: allowSsdOffload ? "#eff6ff" : "#f8fafc",
+            border: allowSsdOffload ? "1px solid #93c5fd" : "1px solid #e2e8f0",
+            fontSize: "0.8rem",
+            color: "#334155",
+            cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+          }}
+        >
+          <input
+            id="ssd-offload-checkbox"
+            data-testid="ssd-offload-checkbox"
+            type="checkbox"
+            checked={allowSsdOffload}
+            disabled={isSharing || isBusy}
+            onChange={(e) => setAllowSsdOffload(e.target.checked)}
+          />
+          <span>
+            Allow SSD Offloading (Slow but guarantees 100% run in Solo Mode)
+          </span>
+        </label>
       </div>
 
       {/* Network Mode (LAN / Internet), Room ID & Optional Room Key */}
@@ -1467,18 +2032,54 @@ export const Dashboard: React.FC = () => {
                 ? `Role: Primary Seeder (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`
                 : `Role: Backup Node (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`}
             </span>
-            <span
-              style={{
-                fontSize: "0.72rem",
-                fontWeight: 600,
-                padding: "2px 8px",
-                borderRadius: "999px",
-                backgroundColor: assignedRole === "primary" ? "#dbeafe" : "#fef3c7",
-                color: assignedRole === "primary" ? "#1e40af" : "#78350f",
-              }}
-            >
-              {assignedRole === "primary" ? "PRIMARY" : "BACKUP"}
-            </span>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+              {modelFingerprint && (
+                <span
+                  data-testid="model-fingerprint-badge"
+                  title={`SHA-256 (10MB + size): ${modelFingerprint}`}
+                  style={{
+                    fontSize: "0.7rem",
+                    fontWeight: 600,
+                    padding: "2px 8px",
+                    borderRadius: "999px",
+                    backgroundColor: "#f1f5f9",
+                    color: "#334155",
+                    border: "1px solid #cbd5e1",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  FP: {modelFingerprint.slice(0, 10)}
+                </span>
+              )}
+              {ssdOffloadActive && (
+                <span
+                  data-testid="ssd-offload-active-badge"
+                  style={{
+                    fontSize: "0.72rem",
+                    fontWeight: 600,
+                    padding: "2px 8px",
+                    borderRadius: "999px",
+                    backgroundColor: "#f3e8ff",
+                    color: "#6b21a8",
+                    border: "1px solid #d8b4fe",
+                  }}
+                >
+                  💾 SSD Offload (mmap)
+                </span>
+              )}
+              <span
+                style={{
+                  fontSize: "0.72rem",
+                  fontWeight: 600,
+                  padding: "2px 8px",
+                  borderRadius: "999px",
+                  backgroundColor: assignedRole === "primary" ? "#dbeafe" : "#fef3c7",
+                  color: assignedRole === "primary" ? "#1e40af" : "#78350f",
+                }}
+              >
+                {assignedRole === "primary" ? "PRIMARY" : "BACKUP"}
+              </span>
+            </div>
           </div>
 
           <h2 style={{ fontSize: "0.95rem", margin: "0 0 12px 0", fontWeight: 700, color: "#0f172a" }}>

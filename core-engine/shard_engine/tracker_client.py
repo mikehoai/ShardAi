@@ -12,6 +12,7 @@ import hashlib
 import logging
 import random
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -20,6 +21,10 @@ from shard_engine.schemas import PeerNodeInfo, PeerRole, RoomLobbyItem, StartNod
 logger = logging.getLogger("shardai.tracker")
 
 RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class TrackerUnreachableError(RuntimeError):
+    """Raised when the Cloudflare Tracker cannot be reached (timeout / DNS / no route / 5xx)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +79,7 @@ class SignalingTrackerClient:
 
     def __init__(
         self,
-        base_url: str = "https://tracker.shardai.network/api/v1",
+        base_url: str = "https://network.shardai.online",
         timeout_seconds: float = 8.0,
         connect_timeout_seconds: float = 4.0,
         max_retries: int = 3,
@@ -152,15 +157,52 @@ class SignalingTrackerClient:
                         )
                         await asyncio.sleep(sleep_duration)
 
-        raise RuntimeError(
+        raise TrackerUnreachableError(
             f"Signaling tracker request failed after {self.max_retries} attempts: {last_error}"
         ) from last_error
+
+    async def ping(self, timeout_seconds: float = 3.0) -> bool:
+        """Single-shot (no retry) reachability probe of the Tracker root `GET /`.
+
+        Used by the UI Network Status Indicator; never raises.
+        """
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout=timeout_seconds, connect=timeout_seconds),
+                transport=self._transport,
+            ) as client:
+                response = await client.get(f"{self.base_url}/")
+                return response.status_code < 500
+        except (httpx.HTTPError, OSError) as exc:
+            logger.debug("Tracker ping failed: %s", exc)
+            return False
+
+    async def fetch_model_catalog(self) -> list[dict[str, Any]]:
+        """Fetch enabled models from Cloudflare Worker `GET /config/models`."""
+        response_data: dict[str, Any] = await self._request_with_retry(
+            method="GET",
+            endpoint="/config/models",
+        )
+        inner_data: dict[str, Any] = (
+            response_data["data"]
+            if isinstance(response_data.get("data"), dict)
+            else response_data
+        )
+        raw_models: Any = inner_data.get("models", response_data.get("models", []))
+        if not isinstance(raw_models, list):
+            return []
+        return [
+            dict(item)
+            for item in raw_models
+            if isinstance(item, dict) and item.get("enabled", True) is True
+        ]
 
     async def register_node_with_assignment(
         self,
         config: StartNodeRequest,
         total_model_layers: int | None = None,
         max_layers_can_hold: int | None = None,
+        model_fingerprint: str | None = None,
     ) -> AnnounceAssignment:
         """Announce node capacity to `POST /announce` and receive Cloud layer assignment & role."""
         resolved_total_layers: int = total_model_layers or config.total_layers
@@ -190,6 +232,8 @@ class SignalingTrackerClient:
             "shard_layer_start": config.shard_layer_start,
             "shard_layer_end": config.shard_layer_end,
             "max_vram_mb": config.max_vram_mb,
+            "source_type": config.source_type.value,
+            **({"model_fingerprint": model_fingerprint} if model_fingerprint else {}),
         }
         response_data: dict[str, Any] = await self._request_with_retry(
             method="POST",
@@ -312,15 +356,18 @@ class SignalingTrackerClient:
         model_id: str,
         room_id: str = "public",
         room_key: str | None = None,
+        room_key_hash: str | None = None,
     ) -> list[PeerNodeInfo]:
         """Query the Signaling Server via HTTP GET for active peers in a room."""
         params: dict[str, Any] = {"room_id": room_id}
-        key_hash = hash_room_key(room_key)
-        if key_hash is not None:
-            params["room_key_hash"] = key_hash
+        effective_hash = room_key_hash or hash_room_key(room_key)
+        if effective_hash is not None:
+            params["room_key_hash"] = effective_hash
+        safe_room = quote(room_id, safe="")
+        safe_model = quote(model_id, safe="")
         response_data: dict[str, Any] = await self._request_with_retry(
             method="GET",
-            endpoint=f"/peers/{room_id}/{model_id}",
+            endpoint=f"/peers/{safe_room}/{safe_model}",
             params=params,
         )
         raw_peers: list[dict[str, Any]] = response_data.get("peers", [])

@@ -11,6 +11,34 @@ export type NetworkMode = "lan" | "internet";
 
 export type PeerRole = "primary" | "backup";
 
+export type ModelSourceType = "catalog" | "huggingface" | "direct_url" | "local_file";
+
+export interface CatalogModelItem {
+  id: string;
+  name: string;
+  repo_id: string;
+  filename?: string | null;
+  estimated_ram_gb: number;
+  enabled: boolean;
+}
+
+export interface ModelCatalogResponse {
+  source: "cloud" | "cache" | "default";
+  count: number;
+  models: CatalogModelItem[];
+}
+
+/** Auto-fallback connectivity tier: Cloud -> LAN -> Solo (matches `NetworkStatus` in schemas.py). */
+export type NetworkStatus = "online" | "lan_only" | "offline_solo";
+
+export interface NetworkStatusResponse {
+  network_status: NetworkStatus;
+  tracker_reachable: boolean;
+  tracker_url: string;
+  lan_peers_count: number;
+  zeroconf_available: boolean;
+}
+
 export interface PeerNodeInfo {
   peer_id: string;
   ip_address: string;
@@ -42,6 +70,8 @@ export interface SystemMemoryResponse {
 export interface StartNodeRequest {
   node_id: string;
   model_id: string;
+  source_type?: ModelSourceType;
+  filename?: string | null;
   network_mode: NetworkMode;
   room_id: string;
   room_key?: string | null;
@@ -54,6 +84,7 @@ export interface StartNodeRequest {
   p2p_listen_port: number;
   shard_layer_start: number;
   shard_layer_end: number;
+  allow_ssd_offload?: boolean;
 }
 
 export interface NodeStatusResponse {
@@ -80,5 +111,11 @@ export interface NodeStatusResponse {
   api_base_url?: string | null;
   coverage_percent?: number;
   is_swarm_ready?: boolean;
+  network_status?: NetworkStatus | null;
+  is_solo_mode?: boolean;
+  use_mmap?: boolean;
+  ssd_offload_active?: boolean;
+  source_type?: ModelSourceType | null;
+  model_fingerprint?: string | null;
   message: string;
 }

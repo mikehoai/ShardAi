@@ -107,6 +107,7 @@ class ShardModelRunner:
         n_layers: int | None = None,
         hidden_dim: int = DEFAULT_HIDDEN_DIM,
         max_ram_mb: int = 4096,
+        use_mmap: bool = False,
         native_handle: Any | None = None,  # Optional external PyTorch/llama_cpp handle
         hf_config: Any | None = None,  # Optional preloaded PretrainedConfig for unit tests
         hf_model: Any | None = None,  # Optional preloaded PreTrainedModel for sharding unit tests
@@ -124,6 +125,9 @@ class ShardModelRunner:
         )
         self.hidden_dim: int = hidden_dim
         self.max_ram_mb: int = max_ram_mb
+        # SSD Disk Offloading: when True, llama_cpp memory-maps the GGUF file so weights that do
+        # not fit in `max_ram_mb` are paged on demand from disk instead of triggering OOM.
+        self.use_mmap: bool = use_mmap
         self._native_handle: Any | None = native_handle
 
         # PyTorch layer-sharded components
@@ -403,9 +407,18 @@ class ShardModelRunner:
                 model_path=gguf_path,
                 n_gpu_layers=n_layers,
                 embeddings=True,
+                # use_mmap=True -> pages missing weights from SSD (Disk Offload, no OOM);
+                # use_mlock must stay False so the OS is free to evict mapped pages.
+                use_mmap=self.use_mmap,
+                use_mlock=False,
                 verbose=False,
             )
-            logger.info("Initialized llama_cpp with %s (n_layers=%d)", gguf_path, n_layers)
+            logger.info(
+                "Initialized llama_cpp with %s (n_layers=%d, use_mmap=%s)",
+                gguf_path,
+                n_layers,
+                self.use_mmap,
+            )
         except Exception as exc:
             logger.info(
                 "Using lightweight float32 shard runner for %s (n_layers=%d): %s",
