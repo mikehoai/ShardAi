@@ -6,6 +6,7 @@ from models.downloader import (
     GgufModelSpec,
     ModelDownloader,
 )
+from models.gguf_reader import read_gguf_total_layers
 from models.shard_runner import ShardModelRunner
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ModelDownloader",
     "SUPPORTED_MODELS",
     "ShardModelRunner",
+    "read_gguf_total_layers",
 ]

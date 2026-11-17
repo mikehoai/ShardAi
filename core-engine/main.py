@@ -25,7 +25,7 @@ import uuid
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 import uvicorn
 
@@ -65,11 +65,16 @@ from shard_engine.schemas import (
     OpenAIModelListResponse,
     OpenAIModelObject,
     PeerNodeInfo,
+    PeerRole,
     RoomLobbyItem,
     StartNodeRequest,
     SystemMemoryResponse,
 )
-from shard_engine.tracker_client import SignalingTrackerClient, hash_room_key
+from shard_engine.tracker_client import (
+    AnnounceAssignment,
+    SignalingTrackerClient,
+    hash_room_key,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +138,7 @@ class LocalNodeRuntime:
         self.room_id: str | None = None
         self.is_private: bool = False
         self.is_unlisted: bool = False
+        self.role: PeerRole = PeerRole.PRIMARY
         self.backend: ComputeBackend | None = None
         self.p2p_listen_port: int | None = None
         self.n_layers: int = 0
@@ -141,6 +147,9 @@ class LocalNodeRuntime:
         self.total_layers: int = 32
         self.peers: list[PeerNodeInfo] = []
         self.session_token: str | None = None
+        self.coverage_percent: float = 0.0
+        self.is_swarm_ready: bool = False
+        self._coverage_poll_task: asyncio.Task[None] | None = None
         self.memory_manager: ShardMemoryManager = ShardMemoryManager()
         self.model_downloader: ModelDownloader = ModelDownloader()
         self.model_runner: ShardModelRunner | None = None
@@ -161,17 +170,81 @@ class LocalNodeRuntime:
         port: int = int(os.getenv("SHARDAI_ENGINE_PORT", "8000"))
         return f"http://127.0.0.1:{port}/v1"
 
-    def find_next_hop_peer(self, completed_layer: int) -> PeerNodeInfo | None:
-        """Locate the downstream P2P peer responsible for layer `completed_layer + 1`."""
+    def find_candidate_peers_for_next_layer(
+        self, completed_layer: int
+    ) -> list[PeerNodeInfo]:
+        """Return ordered P2P peers covering `completed_layer + 1` (Primary first, then Backups)."""
         target_next_layer: int = completed_layer + 1
-        for peer in self.peers:
-            if peer.shard_layer_start <= target_next_layer <= peer.shard_layer_end:
-                return peer
-        candidates = [p for p in self.peers if p.shard_layer_start > completed_layer]
-        if candidates:
-            candidates.sort(key=lambda p: p.shard_layer_start)
-            return candidates[0]
-        return None
+        covering = [
+            peer
+            for peer in self.peers
+            if peer.shard_layer_start <= target_next_layer <= peer.shard_layer_end
+        ]
+        if not covering:
+            covering = [p for p in self.peers if p.shard_layer_start > completed_layer]
+
+        # Prioritize role == "primary" (0) over role == "backup" (1)
+        covering.sort(
+            key=lambda p: (
+                0 if p.role == PeerRole.PRIMARY else 1,
+                p.shard_layer_start,
+                -p.shard_layer_end,
+            )
+        )
+        return covering
+
+    def find_next_hop_peer(self, completed_layer: int) -> PeerNodeInfo | None:
+        """Locate the highest-priority downstream P2P peer for `completed_layer + 1`."""
+        candidates = self.find_candidate_peers_for_next_layer(completed_layer)
+        return candidates[0] if candidates else None
+
+    async def send_with_failover(
+        self,
+        completed_layer: int,
+        frame_bytes: bytes,
+        timeout_seconds: float = 5.0,
+    ) -> PeerNodeInfo:
+        """Push binary activation tensors to the primary peer, failing over to backup peers on error."""
+        candidates = self.find_candidate_peers_for_next_layer(completed_layer)
+        if not candidates:
+            raise RuntimeError(
+                f"No downstream peer available for layer {completed_layer + 1}."
+            )
+
+        last_exc: Exception | None = None
+        for idx, candidate in enumerate(candidates):
+            try:
+                await send_activations(
+                    peer_ip=candidate.ip_address,
+                    byte_stream=frame_bytes,
+                    peer_port=candidate.port,
+                    timeout_seconds=timeout_seconds,
+                )
+                if idx > 0:
+                    logger.info(
+                        "Failover succeeded: routed layer %d..%d activation to %s peer %s (%s:%d)",
+                        candidate.shard_layer_start,
+                        candidate.shard_layer_end,
+                        candidate.role.value,
+                        candidate.peer_id,
+                        candidate.ip_address,
+                        candidate.port,
+                    )
+                return candidate
+            except (TimeoutError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "Downstream %s peer %s (%s:%d) failed (%s); failing over to next backup peer...",
+                    candidate.role.value,
+                    candidate.peer_id,
+                    candidate.ip_address,
+                    candidate.port,
+                    exc,
+                )
+
+        raise RuntimeError(
+            f"All primary and backup peers failed for layer {completed_layer + 1}: {last_exc}"
+        ) from last_exc
 
     async def handle_incoming_activation(self, frame: ActivationFrame) -> None:
         """Callback triggered by `receive_activations` when an upstream peer pushes a tensor."""
@@ -229,10 +302,9 @@ class LocalNodeRuntime:
                 network_congested=congestion_monitor.is_congested,
                 force_compression=True,
             )
-            await send_activations(
-                peer_ip=next_peer.ip_address,
-                byte_stream=next_frame_bytes,
-                peer_port=next_peer.port,
+            await self.send_with_failover(
+                completed_layer=completed_layer,
+                frame_bytes=next_frame_bytes,
             )
         else:
             logger.error(
@@ -322,31 +394,68 @@ class LocalNodeRuntime:
                     next_peer is not None
                     and self.shard_layer_end < (self.total_layers - 1)
                 ):
-                    advertise_ip: str = _resolve_advertise_ip(
-                        next_peer.ip_address, next_peer.port
+                    candidates = self.find_candidate_peers_for_next_layer(
+                        self.shard_layer_end
                     )
-                    binary_frame: bytes = serialize_activation_tensor(
-                        tensor_data=hidden_bytes,
-                        shape=tensor_shape,
-                        request_id=request_id,
-                        origin_ip=advertise_ip,
-                        origin_port=origin_port,
-                        current_layer=self.shard_layer_end,
-                        total_layers=self.total_layers,
-                        step_index=step_idx,
-                        max_tokens=max_tokens,
-                        network_congested=congestion_monitor.is_congested,
-                        force_compression=compress_activations,
-                    )
-                    await send_activations(
-                        peer_ip=next_peer.ip_address,
-                        byte_stream=binary_frame,
-                        peer_port=next_peer.port,
-                    )
-                    decoded_frame: DecodedTokenFrame = await asyncio.wait_for(
-                        token_queue.get(),
-                        timeout=60.0,
-                    )
+                    decoded_frame: DecodedTokenFrame | None = None
+                    last_step_err: Exception | None = None
+
+                    for idx, candidate in enumerate(candidates):
+                        advertise_ip: str = _resolve_advertise_ip(
+                            candidate.ip_address, candidate.port
+                        )
+                        binary_frame: bytes = serialize_activation_tensor(
+                            tensor_data=hidden_bytes,
+                            shape=tensor_shape,
+                            request_id=request_id,
+                            origin_ip=advertise_ip,
+                            origin_port=origin_port,
+                            current_layer=self.shard_layer_end,
+                            total_layers=self.total_layers,
+                            step_index=step_idx,
+                            max_tokens=max_tokens,
+                            network_congested=congestion_monitor.is_congested,
+                            force_compression=compress_activations,
+                        )
+                        try:
+                            await send_activations(
+                                peer_ip=candidate.ip_address,
+                                byte_stream=binary_frame,
+                                peer_port=candidate.port,
+                                timeout_seconds=5.0,
+                            )
+                            decoded_frame = await asyncio.wait_for(
+                                token_queue.get(),
+                                timeout=60.0 if len(candidates) == 1 else 10.0,
+                            )
+                            if idx > 0:
+                                logger.info(
+                                    "Pipeline failover succeeded via %s peer %s (%s:%d)",
+                                    candidate.role.value,
+                                    candidate.peer_id,
+                                    candidate.ip_address,
+                                    candidate.port,
+                                )
+                            break
+                        except (
+                            TimeoutError,
+                            asyncio.TimeoutError,
+                            OSError,
+                            RuntimeError,
+                        ) as step_exc:
+                            last_step_err = step_exc
+                            logger.warning(
+                                "Peer %s (%s) dropped/timed out at step %d (%s); attempting backup failover...",
+                                candidate.peer_id,
+                                candidate.role.value,
+                                step_idx,
+                                step_exc,
+                            )
+
+                    if decoded_frame is None:
+                        raise RuntimeError(
+                            f"All primary and backup peers failed at step {step_idx}: {last_step_err}"
+                        )
                     token_id = decoded_frame.token_id
                     token_text = decoded_frame.token_text
                     is_eos = decoded_frame.is_eos
@@ -431,6 +540,130 @@ class LocalNodeRuntime:
             finally:
                 self.p2p_server = None
 
+    def recompute_local_coverage(self) -> float:
+        """Compute current model layer coverage percentage from this node + known peers."""
+        if self.state != NodeState.RUNNING or self.total_layers <= 0:
+            self.coverage_percent = 0.0
+            self.is_swarm_ready = False
+            return 0.0
+
+        covered: set[int] = set(
+            range(
+                max(0, self.shard_layer_start),
+                min(self.total_layers, self.shard_layer_end + 1),
+            )
+        )
+        for peer in self.peers:
+            p_start = max(0, peer.shard_layer_start)
+            p_end = min(self.total_layers - 1, peer.shard_layer_end)
+            covered.update(range(p_start, p_end + 1))
+
+        pct = round((len(covered) / float(self.total_layers)) * 100.0, 1)
+        self.coverage_percent = min(100.0, max(0.0, pct))
+        self.is_swarm_ready = self.coverage_percent >= 100.0
+        return self.coverage_percent
+
+    async def refresh_room_coverage(self) -> None:
+        """Refresh `coverage_percent` and `is_swarm_ready` from Cloud Tracker and LAN mDNS."""
+        if self.state != NodeState.RUNNING:
+            return
+
+        cloud_coverage: float | None = None
+        if _is_tracker_enabled() and self.room_id is not None:
+            try:
+                rooms = await self.tracker_client.fetch_available_rooms()
+                for room in rooms:
+                    if room.room_id == self.room_id:
+                        cloud_coverage = room.coverage_percent
+                        break
+                # Also refresh peer routing table for this room/model
+                if self.model_id is not None:
+                    refreshed_peers = await self.tracker_client.fetch_peers(
+                        model_id=self.model_id,
+                        room_id=self.room_id,
+                    )
+                    if refreshed_peers:
+                        self.peers = [
+                            p for p in refreshed_peers if p.peer_id != self.node_id
+                        ]
+            except Exception as exc:
+                logger.debug("Background coverage poll skipped Cloud Tracker: %s", exc)
+
+        # Merge any newly discovered LAN peers for this room
+        try:
+            lan_beacons = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.15)
+            known_ids = {p.peer_id for p in self.peers}
+            for beacon in lan_beacons:
+                p_id = str(beacon.get("node_id") or "")
+                if (
+                    not p_id
+                    or p_id == self.node_id
+                    or p_id in known_ids
+                    or str(beacon.get("room_id") or "public") != self.room_id
+                ):
+                    continue
+                known_ids.add(p_id)
+                raw_role = str(beacon.get("role") or PeerRole.PRIMARY.value).lower()
+                self.peers.append(
+                    PeerNodeInfo(
+                        peer_id=p_id,
+                        ip_address=str(beacon.get("ip_address") or "127.0.0.1"),
+                        port=int(beacon.get("p2p_port") or 49152),
+                        shard_layer_start=int(beacon.get("shard_layer_start") or 0),
+                        shard_layer_end=int(
+                            beacon.get("shard_layer_end") or (self.total_layers - 1)
+                        ),
+                        role=(
+                            PeerRole.BACKUP
+                            if raw_role == PeerRole.BACKUP.value
+                            else PeerRole.PRIMARY
+                        ),
+                        available_vram_mb=0,
+                        room_id=self.room_id or "public",
+                    )
+                )
+        except Exception as exc:
+            logger.debug("Background LAN scan error: %s", exc)
+
+        local_pct = self.recompute_local_coverage()
+        if cloud_coverage is not None:
+            self.coverage_percent = round(min(100.0, max(0.0, cloud_coverage)), 1)
+            self.is_swarm_ready = self.coverage_percent >= 100.0
+        else:
+            self.coverage_percent = local_pct
+            self.is_swarm_ready = local_pct >= 100.0
+
+    async def _poll_room_coverage_loop(self, interval_seconds: float = 5.0) -> None:
+        """Background loop polling Cloud room coverage every 5 seconds."""
+        try:
+            while self.state == NodeState.RUNNING:
+                await asyncio.sleep(interval_seconds)
+                if self.state != NodeState.RUNNING:
+                    break
+                await self.refresh_room_coverage()
+        except asyncio.CancelledError:
+            pass
+
+    def start_coverage_monitor(self, interval_seconds: float = 5.0) -> None:
+        """Launch the 5-second background room coverage polling task."""
+        if self._coverage_poll_task is not None and not self._coverage_poll_task.done():
+            self._coverage_poll_task.cancel()
+        self._coverage_poll_task = asyncio.create_task(
+            self._poll_room_coverage_loop(interval_seconds=interval_seconds)
+        )
+
+    async def stop_coverage_monitor(self) -> None:
+        """Cancel the background room coverage polling task cleanly."""
+        if self._coverage_poll_task is not None:
+            self._coverage_poll_task.cancel()
+            try:
+                await self._coverage_poll_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._coverage_poll_task = None
+
     def to_status_response(self, message: str = "") -> NodeStatusResponse:
         """Build a typed status snapshot for the Tauri UI."""
         is_running: bool = self.state == NodeState.RUNNING
@@ -443,6 +676,7 @@ class LocalNodeRuntime:
             room_id=self.room_id,
             is_private=self.is_private,
             is_unlisted=self.is_unlisted,
+            role=self.role,
             backend=self.backend,
             n_layers=self.n_layers,
             total_layers=self.total_layers,
@@ -455,6 +689,8 @@ class LocalNodeRuntime:
             peers=self.peers,
             session_token=self.session_token if is_running else None,
             api_base_url=self.api_base_url if is_running else None,
+            coverage_percent=self.coverage_percent if is_running else 0.0,
+            is_swarm_ready=self.is_swarm_ready if is_running else False,
             message=message,
         )
 
@@ -499,6 +735,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
     logger.info("ShardAi P2P AI Gateway shutting down; releasing RAM/VRAM and session token...")
     runtime.session_token = None
+    runtime.is_swarm_ready = False
+    runtime.coverage_percent = 0.0
+    await runtime.stop_coverage_monitor()
     await lan_mdns_service.stop_advertising()
     await runtime.stop_p2p_listener()
     if runtime.model_runner is not None:
@@ -580,32 +819,53 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
         except Exception as exc:
             logger.warning("Failed to fetch rooms from Cloudflare Tracker: %s", exc)
 
-    # 2. Scan local LAN subnet via mDNS multicast
+    # 2. Scan local LAN subnet via mDNS multicast and aggregate layer coverage/redundancy
     lan_beacons = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.25)
+    lan_groups: dict[str, list[dict[str, Any]]] = {}
     for beacon in lan_beacons:
         r_id = str(beacon.get("room_id") or "public")
-        model = str(beacon.get("model") or "meta-llama/Llama-3.1-8B-Instruct")
-        ram_gb = float(beacon.get("ram_gb") or 0.0)
-        is_private = bool(beacon.get("is_private", False))
+        lan_groups.setdefault(r_id, []).append(beacon)
+
+    for r_id, beacons in lan_groups.items():
+        model = str(beacons[0].get("model") or "meta-llama/Llama-3.1-8B-Instruct")
+        total_ram = round(sum(float(b.get("ram_gb") or 0.0) for b in beacons), 2)
+        is_private = any(bool(b.get("is_private", False)) for b in beacons)
+        total_layers = max(1, int(beacons[0].get("total_layers") or 32))
+
+        layer_replication: dict[int, int] = {idx: 0 for idx in range(total_layers)}
+        for b in beacons:
+            b_start = max(0, int(b.get("shard_layer_start") or 0))
+            b_end = min(total_layers - 1, int(b.get("shard_layer_end") or (total_layers - 1)))
+            for layer_idx in range(b_start, b_end + 1):
+                layer_replication[layer_idx] = layer_replication.get(layer_idx, 0) + 1
+
+        covered_layers = sum(1 for cnt in layer_replication.values() if cnt > 0)
+        coverage_pct = round((covered_layers / float(total_layers)) * 100.0, 1)
+        min_rep = min(layer_replication.values()) if covered_layers == total_layers else 1
+        redundancy = max(1, min_rep)
 
         if r_id in merged:
             existing = merged[r_id]
             merged[r_id] = RoomLobbyItem(
                 room_id=r_id,
                 model=existing.model,
-                nodes_online=existing.nodes_online + 1,
-                total_shared_ram_gb=round(existing.total_shared_ram_gb + ram_gb, 2),
+                nodes_online=existing.nodes_online + len(beacons),
+                total_shared_ram_gb=round(existing.total_shared_ram_gb + total_ram, 2),
                 is_private=existing.is_private or is_private,
                 network_scope="hybrid",
+                coverage_percent=max(existing.coverage_percent, coverage_pct),
+                redundancy_factor=max(existing.redundancy_factor, redundancy),
             )
         else:
             merged[r_id] = RoomLobbyItem(
                 room_id=r_id,
                 model=model,
-                nodes_online=1,
-                total_shared_ram_gb=round(ram_gb, 2),
+                nodes_online=len(beacons),
+                total_shared_ram_gb=total_ram,
                 is_private=is_private,
                 network_scope="lan",
+                coverage_percent=coverage_pct,
+                redundancy_factor=redundancy,
             )
 
     rooms_list = sorted(merged.values(), key=lambda r: r.nodes_online, reverse=True)
@@ -727,68 +987,126 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
 
     runtime.state = NodeState.STARTING
     try:
-        # 1. Pre-plan shard range from `ram_gb` (or respect explicit P2P split range)
+        # 1. Inspect existing local model metadata (GGUF header / config.json) to compute
+        #    `total_model_layers` and `max_layers_can_hold` from `ram_gb`.
+        probe_path: Path | None = None
+        try:
+            _, candidate_gguf = runtime.model_downloader.resolve_safe_gguf_path(
+                request.model_id
+            )
+            if candidate_gguf.is_file():
+                probe_path = candidate_gguf
+            else:
+                candidate_dir = runtime.model_downloader.resolve_safe_model_dir(
+                    request.model_id
+                )
+                if (candidate_dir / "config.json").is_file():
+                    probe_path = candidate_dir
+        except Exception:
+            probe_path = None
+
         pre_plan = calculate_max_layers(
             model_id=request.model_id,
             ram_gb=effective_ram_gb,
+            model_path=probe_path,
             requested_start=request.shard_layer_start,
         )
+        total_model_layers: int = pre_plan.total_layers
+        max_layers_can_hold: int = pre_plan.n_layers
+
         target_start: int = pre_plan.shard_layer_start
         target_end: int = pre_plan.shard_layer_end
         if request.exact_shard_range:
             max_allowed_end = min(
-                pre_plan.total_layers - 1,
-                request.shard_layer_start + pre_plan.n_layers - 1,
+                total_model_layers - 1,
+                request.shard_layer_start + max_layers_can_hold - 1,
             )
             target_start = request.shard_layer_start
             target_end = min(request.shard_layer_end, max_allowed_end)
 
-        # 2. Download/resolve Safetensors shard directory (online HF) or `.gguf` model
+        # 2. Bind P2P listening port before announcing so Tracker gets the active port
+        bound_port = await runtime.start_p2p_listener(
+            request.p2p_listen_port,
+            network_mode=request.network_mode,
+        )
+        request.p2p_listen_port = bound_port
+        if request.node_id in ("shardai-client-01", "local-node-01"):
+            host_slug = (
+                re.sub(r"[^A-Za-z0-9-]+", "-", socket.gethostname().split(".")[0]).strip("-")
+                or "host"
+            )
+            request.node_id = f"{request.node_id}-{host_slug}-{bound_port}"[:64]
+
+        # 3. Announce to Cloudflare Tracker with `total_model_layers` + `max_layers_can_hold`
+        #    and receive Cloud-orchestrated `assigned_start_layer`, `assigned_end_layer`, `role`.
+        assigned_role: PeerRole = PeerRole.PRIMARY
+        discovered_peers: list[PeerNodeInfo] = []
+        if _is_tracker_enabled():
+            try:
+                assignment: AnnounceAssignment = (
+                    await runtime.tracker_client.register_node_with_assignment(
+                        request,
+                        total_model_layers=total_model_layers,
+                        max_layers_can_hold=max_layers_can_hold,
+                    )
+                )
+                discovered_peers = assignment.peers
+                assigned_role = assignment.role
+                if not request.exact_shard_range:
+                    target_start = assignment.assigned_start_layer
+                    target_end = min(
+                        assignment.assigned_end_layer,
+                        min(total_model_layers - 1, target_start + max_layers_can_hold - 1),
+                    )
+            except httpx.HTTPStatusError as http_exc:
+                if http_exc.response.status_code == status.HTTP_403_FORBIDDEN:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Invalid room key for private room '{request.room_id}'.",
+                    ) from http_exc
+                logger.warning("Tracker registration HTTP error: %s", http_exc)
+            except Exception as tracker_exc:
+                logger.warning(
+                    "Tracker unreachable; continuing in local/LAN P2P mode: %s", tracker_exc
+                )
+
+        # 4. Download/resolve ONLY the Cloud-assigned shard layers [target_start..target_end]
         local_model_path = await runtime.model_downloader.ensure_model_downloaded(
             request.model_id,
             shard_layer_start=target_start,
             shard_layer_end=target_end,
         )
 
-        # 3. Recompute exact layer plan from downloaded `config.json` / binary size
+        # 5. Recompute final layer bounds from actual downloaded config.json / GGUF metadata
         layer_plan = calculate_max_layers(
             model_id=request.model_id,
             ram_gb=effective_ram_gb,
             model_path=local_model_path,
-            requested_start=request.shard_layer_start,
+            requested_start=target_start,
         )
-        if request.exact_shard_range:
-            cfg_total = (
-                read_hf_config_summary(local_model_path)[0]
-                if local_model_path.is_dir()
-                else layer_plan.total_layers
-            )
-            final_start = max(0, min(request.shard_layer_start, cfg_total - 1))
-            max_allowed_end = min(
-                cfg_total - 1,
-                final_start + layer_plan.n_layers - 1,
-            )
-            final_end = max(final_start, min(request.shard_layer_end, max_allowed_end))
-            final_n_layers = final_end - final_start + 1
-            final_total_layers = cfg_total
-            final_est_ram = min(
-                request.max_ram_mb,
-                round(
-                    (0.6 + (final_n_layers * (layer_plan.per_layer_mb / 1024.0))) * 1024.0
-                ),
-            )
-        else:
-            final_start = layer_plan.shard_layer_start
-            final_end = layer_plan.shard_layer_end
-            final_n_layers = layer_plan.n_layers
-            final_total_layers = layer_plan.total_layers
-            final_est_ram = layer_plan.estimated_ram_mb
+        final_total_layers = layer_plan.total_layers
+        if local_model_path.is_dir():
+            cfg_total = read_hf_config_summary(local_model_path)[0]
+            if cfg_total > 0:
+                final_total_layers = cfg_total
+
+        final_start = max(0, min(target_start, final_total_layers - 1))
+        max_allowed_end = min(
+            final_total_layers - 1,
+            final_start + layer_plan.n_layers - 1,
+        )
+        final_end = max(final_start, min(target_end, max_allowed_end))
+        final_n_layers = final_end - final_start + 1
+        final_est_ram = min(
+            request.max_ram_mb,
+            round((0.6 + (final_n_layers * (layer_plan.per_layer_mb / 1024.0))) * 1024.0),
+        )
 
         request.total_layers = final_total_layers
         request.shard_layer_start = final_start
         request.shard_layer_end = final_end
 
-        # 4. Allocate local RAM/VRAM & load ONLY the assigned layers into ShardModelRunner
+        # 6. Allocate local RAM/VRAM & load ONLY the assigned layers into llama_cpp / PyTorch
         runtime.memory_manager.allocate_shard(
             request,
             estimated_ram_mb=final_est_ram,
@@ -809,22 +1127,10 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
             else request.backend
         )
 
-        # 5. Start P2P binary activation listener & LAN mDNS advertiser
-        bound_port = await runtime.start_p2p_listener(
-            request.p2p_listen_port,
-            network_mode=request.network_mode,
-        )
-        request.p2p_listen_port = bound_port
-        if request.node_id in ("shardai-client-01", "local-node-01"):
-            host_slug = (
-                re.sub(r"[^A-Za-z0-9-]+", "-", socket.gethostname().split(".")[0]).strip("-")
-                or "host"
-            )
-            request.node_id = f"{request.node_id}-{host_slug}-{bound_port}"[:64]
-
         room_key_hash: str | None = hash_room_key(request.room_key)
         is_private_room: bool = room_key_hash is not None
 
+        # 7. Advertise on LAN mDNS & merge LAN-discovered peers (preserving primary/backup roles)
         await lan_mdns_service.start_advertising(
             LanRoomBeacon(
                 node_id=request.node_id,
@@ -836,25 +1142,10 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                 p2p_port=bound_port,
                 shard_layer_start=final_start,
                 shard_layer_end=final_end,
+                total_layers=final_total_layers,
+                role=assigned_role.value,
             )
         )
-
-        # 6. Announce to Cloudflare Tracker when enabled & merge LAN-discovered peers
-        discovered_peers: list[PeerNodeInfo] = []
-        if _is_tracker_enabled():
-            try:
-                discovered_peers = await runtime.tracker_client.register_node_and_fetch_peers(
-                    request
-                )
-            except httpx.HTTPStatusError as http_exc:
-                if http_exc.response.status_code == status.HTTP_403_FORBIDDEN:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail=f"Invalid room key for private room '{request.room_id}'.",
-                    ) from http_exc
-                logger.warning("Tracker registration HTTP error: %s", http_exc)
-            except Exception as tracker_exc:
-                logger.warning("Tracker unreachable; continuing in local/LAN P2P mode: %s", tracker_exc)
 
         known_peer_ids: set[str] = {peer.peer_id for peer in discovered_peers}
         lan_peers_raw = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.2)
@@ -868,6 +1159,10 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
             ):
                 continue
             known_peer_ids.add(peer_id)
+            raw_peer_role = str(beacon.get("role") or PeerRole.PRIMARY.value).lower()
+            peer_role = (
+                PeerRole.BACKUP if raw_peer_role == PeerRole.BACKUP.value else PeerRole.PRIMARY
+            )
             discovered_peers.append(
                 PeerNodeInfo(
                     peer_id=peer_id,
@@ -875,12 +1170,13 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                     port=int(beacon.get("p2p_port") or 49152),
                     shard_layer_start=int(beacon.get("shard_layer_start") or 0),
                     shard_layer_end=int(beacon.get("shard_layer_end") or (final_total_layers - 1)),
+                    role=peer_role,
                     available_vram_mb=0,
                     room_id=request.room_id,
                 )
             )
 
-        # 7. Issue cryptographic Session Token stored strictly in process RAM
+        # 8. Issue cryptographic Session Token stored strictly in process RAM
         runtime.session_token = f"sk-shard-{secrets.token_urlsafe(24)}"
         runtime.node_id = request.node_id
         runtime.model_id = request.model_id
@@ -889,6 +1185,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.room_id = request.room_id
         runtime.is_private = is_private_room
         runtime.is_unlisted = request.is_unlisted
+        runtime.role = assigned_role
         runtime.backend = effective_backend
         runtime.p2p_listen_port = request.p2p_listen_port
         runtime.n_layers = final_n_layers
@@ -898,15 +1195,25 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.peers = discovered_peers
         runtime.state = NodeState.RUNNING
 
+        # Compute initial coverage_percent & is_swarm_ready, then monitor every 5s
+        await runtime.refresh_room_coverage()
+        runtime.start_coverage_monitor(interval_seconds=5.0)
+
+        role_display = (
+            "Primary Seeder" if assigned_role == PeerRole.PRIMARY else "Backup Node"
+        )
         return runtime.to_status_response(
             message=(
                 f"Gateway Active ({request.network_mode.value.upper()} / Room: '{request.room_id}') — "
-                f"layers {final_start}..{final_end} ({final_n_layers}/{final_total_layers}) loaded "
+                f"Role: {role_display} (Layers {final_start}..{final_end}/{final_total_layers}) "
                 f"[{effective_backend.value}]."
             )
         )
     except HTTPException:
         runtime.session_token = None
+        runtime.is_swarm_ready = False
+        runtime.coverage_percent = 0.0
+        await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
         await runtime.stop_p2p_listener()
         if runtime.model_runner is not None:
@@ -917,6 +1224,9 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         raise
     except Exception as exc:
         runtime.session_token = None
+        runtime.is_swarm_ready = False
+        runtime.coverage_percent = 0.0
+        await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
         await runtime.stop_p2p_listener()
         if runtime.model_runner is not None:
@@ -958,6 +1268,9 @@ async def stop_node() -> NodeStatusResponse:
         logger.warning("Could not unregister node from signaling tracker: %s", exc)
     finally:
         runtime.session_token = None
+        runtime.is_swarm_ready = False
+        runtime.coverage_percent = 0.0
+        await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
         await runtime.stop_p2p_listener()
         if runtime.model_runner is not None:
@@ -973,6 +1286,7 @@ async def stop_node() -> NodeStatusResponse:
         runtime.room_id = None
         runtime.is_private = False
         runtime.is_unlisted = False
+        runtime.role = PeerRole.PRIMARY
         runtime.backend = None
         runtime.p2p_listen_port = None
         runtime.n_layers = 0
@@ -995,6 +1309,7 @@ async def register_peer(peer: PeerNodeInfo) -> list[PeerNodeInfo]:
     runtime.peers = [p for p in runtime.peers if p.peer_id != peer.peer_id]
     runtime.peers.append(peer)
     runtime.peers.sort(key=lambda p: p.shard_layer_start)
+    runtime.recompute_local_coverage()
     return runtime.peers
 
 
@@ -1024,12 +1339,28 @@ async def openai_list_models(
 async def openai_chat_completions(
     request: OpenAIChatCompletionRequest,
     _token: str = Depends(verify_openai_bearer_token),
-) -> StreamingResponse | dict[str, Any]:
+) -> StreamingResponse | JSONResponse | dict[str, Any]:
     """OpenAI-compatible Chat Completions endpoint routed through P2P Pipeline Inference.
 
-    Supports both `stream: true` (standard `choices[0].delta.content` SSE chunks)
-    and `stream: false` (single JSON completion payload) for IDE / curl integration.
+    Rejects inference with standard OpenAI 503 JSON error while `is_swarm_ready == False`
+    (room RAM/layer coverage < 100%).
     """
+    if not runtime.is_swarm_ready:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {
+                    "message": (
+                        f"Swarm is not ready (current layer coverage: {runtime.coverage_percent:.0f}%). "
+                        f"Room '{runtime.room_id or 'public'}' needs additional RAM/nodes to cover all "
+                        f"{runtime.total_layers} layers of '{runtime.model_id}'. Invite more nodes to join."
+                    ),
+                    "type": "service_unavailable_error",
+                    "param": None,
+                    "code": "swarm_insufficient_ram",
+                }
+            },
+        )
     prompt_text: str = _extract_prompt_from_messages(request.messages)
     chat_messages: list[dict[str, str]] = _extract_chat_messages_dicts(request.messages)
     max_tokens: int = request.max_tokens or 256

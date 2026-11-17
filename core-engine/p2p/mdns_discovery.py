@@ -33,6 +33,8 @@ class LanRoomBeacon:
     p2p_port: int
     shard_layer_start: int = 0
     shard_layer_end: int = 15
+    total_layers: int = 32
+    role: str = "primary"
 
 
 class _MdnsResponderProtocol(asyncio.DatagramProtocol):
@@ -59,12 +61,39 @@ class _MdnsResponderProtocol(asyncio.DatagramProtocol):
                 "p2p_port": self.beacon.p2p_port,
                 "shard_layer_start": self.beacon.shard_layer_start,
                 "shard_layer_end": self.beacon.shard_layer_end,
+                "total_layers": self.beacon.total_layers,
+                "role": self.beacon.role,
             }
         ).encode("utf-8")
         try:
             self.transport.sendto(reply_payload, addr)
         except Exception:
             pass
+
+
+def _list_local_ipv4_addresses() -> list[str]:
+    """Return unique non-loopback local IPv4 addresses for multi-NIC LAN multicast/broadcast."""
+    addresses: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = str(info[4][0])
+            if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+                addresses.add(ip)
+    except OSError:
+        pass
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("10.255.255.255", 1))
+        ip = str(probe.getsockname()[0])
+        if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+            addresses.add(ip)
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    return sorted(addresses)
 
 
 class LanMdnsService:
@@ -90,15 +119,21 @@ class LanMdnsService:
                 if hasattr(socket, "SO_REUSEPORT"):
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.bind(("", port))
-                try:
-                    mreq = struct.pack(
-                        "4s4s",
-                        socket.inet_aton(MDNS_MULTICAST_GROUP),
-                        socket.inet_aton("0.0.0.0"),
-                    )
-                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-                except OSError as exc:
-                    logger.debug("Could not join multicast group on port %d: %s", port, exc)
+                for iface_ip in ["0.0.0.0", *_list_local_ipv4_addresses()]:
+                    try:
+                        mreq = struct.pack(
+                            "4s4s",
+                            socket.inet_aton(MDNS_MULTICAST_GROUP),
+                            socket.inet_aton(iface_ip),
+                        )
+                        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    except OSError as exc:
+                        logger.debug(
+                            "Could not join multicast group on port %d (%s): %s",
+                            port,
+                            iface_ip,
+                            exc,
+                        )
                 sock.setblocking(False)
 
                 transport, _ = await loop.create_datagram_endpoint(
@@ -144,10 +179,12 @@ class LanMdnsService:
                 "p2p_port": self._active_beacon.p2p_port,
                 "shard_layer_start": self._active_beacon.shard_layer_start,
                 "shard_layer_end": self._active_beacon.shard_layer_end,
+                "total_layers": self._active_beacon.total_layers,
+                "role": self._active_beacon.role,
                 "ip_address": "127.0.0.1",
             }
 
-        def _blocking_probe() -> list[dict[str, Any]]:
+        def _probe_interface(bind_ip: str | None) -> list[dict[str, Any]]:
             found: list[dict[str, Any]] = []
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             try:
@@ -155,15 +192,27 @@ class LanMdnsService:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+                targets: list[str] = [MDNS_MULTICAST_GROUP, "255.255.255.255"]
+                if bind_ip is not None:
+                    sock.bind((bind_ip, 0))
+                    sock.setsockopt(
+                        socket.IPPROTO_IP,
+                        socket.IP_MULTICAST_IF,
+                        socket.inet_aton(bind_ip),
+                    )
+                    octets = bind_ip.split(".")
+                    if len(octets) == 4:
+                        targets.append(f"{octets[0]}.{octets[1]}.{octets[2]}.255")
+                else:
+                    targets.append("127.0.0.1")
+
                 for target_port in (FALLBACK_LAN_PORT, SHARDAI_MDNS_PORT):
-                    for target_host in (MDNS_MULTICAST_GROUP, "255.255.255.255", "127.0.0.1"):
+                    for target_host in targets:
                         try:
                             sock.sendto(PROBE_MAGIC, (target_host, target_port))
                         except OSError:
                             pass
 
-                loop_deadline = asyncio.get_event_loop().time() + timeout_seconds if False else None
-                _ = loop_deadline
                 while True:
                     try:
                         packet, addr = sock.recvfrom(4096)
@@ -173,8 +222,17 @@ class LanMdnsService:
                             found.append(data)
                     except (TimeoutError, socket.timeout, OSError, ValueError):
                         break
+            except OSError:
+                pass
             finally:
                 sock.close()
+            return found
+
+        def _blocking_probe() -> list[dict[str, Any]]:
+            found: list[dict[str, Any]] = []
+            bind_ips: list[str | None] = [None, *_list_local_ipv4_addresses()]
+            for bip in bind_ips:
+                found.extend(_probe_interface(bip))
             return found
 
         try:

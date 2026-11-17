@@ -7,6 +7,7 @@ Complies with `.antigravity/rules.md`:
 """
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import logging
 import random
@@ -14,11 +15,48 @@ from typing import Any
 
 import httpx
 
-from shard_engine.schemas import PeerNodeInfo, RoomLobbyItem, StartNodeRequest
+from shard_engine.schemas import PeerNodeInfo, PeerRole, RoomLobbyItem, StartNodeRequest
 
 logger = logging.getLogger("shardai.tracker")
 
 RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+
+
+@dataclass(frozen=True, slots=True)
+class AnnounceAssignment:
+    """Cloud-orchestrated shard assignment returned by `POST /announce`."""
+
+    assigned_start_layer: int
+    assigned_end_layer: int
+    role: PeerRole
+    peers: list[PeerNodeInfo]
+
+
+def _normalize_peer(
+    raw: dict[str, Any],
+    default_room_id: str,
+    default_end_layer: int = 31,
+) -> PeerNodeInfo:
+    """Normalize peer payloads across different `shardai-cloud` response shapes."""
+    raw_role = str(raw.get("role") or PeerRole.PRIMARY.value).lower()
+    role = PeerRole.BACKUP if raw_role == PeerRole.BACKUP.value else PeerRole.PRIMARY
+    start_val = raw.get("assigned_start_layer")
+    if start_val is None:
+        start_val = raw.get("shard_layer_start")
+    end_val = raw.get("assigned_end_layer")
+    if end_val is None:
+        end_val = raw.get("shard_layer_end")
+
+    return PeerNodeInfo(
+        peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
+        ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
+        port=int(raw.get("port") or 49152),
+        shard_layer_start=int(start_val if start_val is not None else 0),
+        shard_layer_end=int(end_val if end_val is not None else default_end_layer),
+        role=role,
+        available_vram_mb=int(raw.get("available_vram_mb") or 0),
+        room_id=str(raw.get("room_id") or default_room_id),
+    )
 
 
 def hash_room_key(room_key: str | None) -> str | None:
@@ -118,23 +156,35 @@ class SignalingTrackerClient:
             f"Signaling tracker request failed after {self.max_retries} attempts: {last_error}"
         ) from last_error
 
-    async def register_node_and_fetch_peers(
-        self, config: StartNodeRequest
-    ) -> list[PeerNodeInfo]:
-        """Announce this node via HTTP POST /announce with SHA-256 hashed room_key."""
-        n_layers: int = max(1, config.shard_layer_end - config.shard_layer_start + 1)
+    async def register_node_with_assignment(
+        self,
+        config: StartNodeRequest,
+        total_model_layers: int | None = None,
+        max_layers_can_hold: int | None = None,
+    ) -> AnnounceAssignment:
+        """Announce node capacity to `POST /announce` and receive Cloud layer assignment & role."""
+        resolved_total_layers: int = total_model_layers or config.total_layers
+        resolved_max_layers: int = max_layers_can_hold or max(
+            1, config.shard_layer_end - config.shard_layer_start + 1
+        )
         room_key_hash: str | None = hash_room_key(config.room_key)
+        is_private: bool = room_key_hash is not None
+
         payload: dict[str, Any] = {
             "node_id": config.node_id,
             "model": config.model_id,
             "model_id": config.model_id,
             "network_mode": config.network_mode.value,
             "room_id": config.room_id,
+            "is_private": is_private,
             "room_key_hash": room_key_hash,
+            "unlisted": config.is_unlisted,
             "is_unlisted": config.is_unlisted,
             "available_ram_gb": float(config.ram_gb),
             "ram_gb": config.ram_gb,
-            "n_layers": n_layers,
+            "total_model_layers": resolved_total_layers,
+            "max_layers_can_hold": resolved_max_layers,
+            "n_layers": resolved_max_layers,
             "port": config.p2p_listen_port,
             "p2p_port": config.p2p_listen_port,
             "shard_layer_start": config.shard_layer_start,
@@ -146,21 +196,70 @@ class SignalingTrackerClient:
             endpoint="/announce",
             json_payload=payload,
         )
-        raw_peers: list[dict[str, Any]] = response_data.get("peers", [])
-        normalized: list[PeerNodeInfo] = []
-        for raw in raw_peers:
-            normalized.append(
-                PeerNodeInfo(
-                    peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
-                    ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
-                    port=int(raw.get("port") or 49152),
-                    shard_layer_start=int(raw.get("shard_layer_start") or 0),
-                    shard_layer_end=int(raw.get("shard_layer_end") or 31),
-                    available_vram_mb=int(raw.get("available_vram_mb") or 0),
-                    room_id=str(raw.get("room_id") or config.room_id),
+        inner_data: dict[str, Any] = (
+            response_data["data"]
+            if isinstance(response_data.get("data"), dict)
+            else response_data
+        )
+
+        raw_start = inner_data.get(
+            "assigned_start_layer",
+            response_data.get("assigned_start_layer", config.shard_layer_start),
+        )
+        raw_end = inner_data.get(
+            "assigned_end_layer",
+            response_data.get("assigned_end_layer", config.shard_layer_end),
+        )
+        raw_role = str(
+            inner_data.get("role", response_data.get("role", PeerRole.PRIMARY.value))
+        ).lower()
+        assigned_role = (
+            PeerRole.BACKUP if raw_role == PeerRole.BACKUP.value else PeerRole.PRIMARY
+        )
+        assigned_start = max(0, min(int(raw_start), resolved_total_layers - 1))
+        assigned_end = max(
+            assigned_start, min(int(raw_end), resolved_total_layers - 1)
+        )
+
+        raw_peers: list[dict[str, Any]] = inner_data.get(
+            "peers", response_data.get("peers", [])
+        )
+        normalized: list[PeerNodeInfo] = [
+            _normalize_peer(raw, config.room_id, resolved_total_layers - 1)
+            for raw in raw_peers
+        ]
+
+        # If /announce didn't embed peers, query GET /peers/:room_id/:model
+        if not normalized and "peers" not in inner_data and "peers" not in response_data:
+            try:
+                normalized = await self.fetch_peers(
+                    model_id=config.model_id,
+                    room_id=config.room_id,
+                    room_key=config.room_key,
                 )
-            )
-        return normalized
+            except Exception as exc:
+                logger.debug("Optional follow-up fetch_peers skipped: %s", exc)
+
+        return AnnounceAssignment(
+            assigned_start_layer=assigned_start,
+            assigned_end_layer=assigned_end,
+            role=assigned_role,
+            peers=normalized,
+        )
+
+    async def register_node_and_fetch_peers(
+        self,
+        config: StartNodeRequest,
+        total_model_layers: int | None = None,
+        max_layers_can_hold: int | None = None,
+    ) -> list[PeerNodeInfo]:
+        """Announce this node via HTTP POST /announce and return active peers."""
+        assignment = await self.register_node_with_assignment(
+            config=config,
+            total_model_layers=total_model_layers,
+            max_layers_can_hold=max_layers_can_hold,
+        )
+        return assignment.peers
 
     async def fetch_available_rooms(self) -> list[RoomLobbyItem]:
         """Fetch active public & locked rooms from Cloudflare Tracker GET /rooms."""
@@ -168,8 +267,45 @@ class SignalingTrackerClient:
             method="GET",
             endpoint="/rooms",
         )
-        raw_rooms: list[dict[str, Any]] = response_data.get("rooms", [])
-        return [RoomLobbyItem.model_validate(room) for room in raw_rooms]
+        inner_data: dict[str, Any] = (
+            response_data["data"]
+            if isinstance(response_data.get("data"), dict)
+            else response_data
+        )
+        raw_rooms: list[dict[str, Any]] = inner_data.get(
+            "rooms", response_data.get("rooms", [])
+        )
+        parsed: list[RoomLobbyItem] = []
+        for room in raw_rooms:
+            nodes_count = int(
+                room.get("nodes_online") or room.get("node_count") or 1
+            )
+            shared_ram = float(
+                room.get("total_shared_ram_gb") or room.get("total_ram_gb") or 0.0
+            )
+            coverage = float(
+                room.get("coverage_percent")
+                if room.get("coverage_percent") is not None
+                else 100.0
+            )
+            redundancy = int(
+                room.get("redundancy_factor")
+                if room.get("redundancy_factor") is not None
+                else 1
+            )
+            parsed.append(
+                RoomLobbyItem(
+                    room_id=str(room.get("room_id") or "public"),
+                    model=str(room.get("model") or ""),
+                    nodes_online=max(1, nodes_count),
+                    total_shared_ram_gb=max(0.0, shared_ram),
+                    is_private=bool(room.get("is_private", False)),
+                    network_scope=room.get("network_scope") or "internet",
+                    coverage_percent=max(0.0, min(100.0, coverage)),
+                    redundancy_factor=max(1, redundancy),
+                )
+            )
+        return parsed
 
     async def fetch_peers(
         self,
@@ -184,22 +320,11 @@ class SignalingTrackerClient:
             params["room_key_hash"] = key_hash
         response_data: dict[str, Any] = await self._request_with_retry(
             method="GET",
-            endpoint=f"/peers/{model_id}",
+            endpoint=f"/peers/{room_id}/{model_id}",
             params=params,
         )
         raw_peers: list[dict[str, Any]] = response_data.get("peers", [])
-        return [
-            PeerNodeInfo(
-                peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
-                ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
-                port=int(raw.get("port") or 49152),
-                shard_layer_start=int(raw.get("shard_layer_start") or 0),
-                shard_layer_end=int(raw.get("shard_layer_end") or 31),
-                available_vram_mb=int(raw.get("available_vram_mb") or 0),
-                room_id=str(raw.get("room_id") or room_id),
-            )
-            for raw in raw_peers
-        ]
+        return [_normalize_peer(raw, room_id) for raw in raw_peers]
 
     async def unregister_node(
         self, node_id: str, room_id: str | None = None

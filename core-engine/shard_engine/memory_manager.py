@@ -19,6 +19,7 @@ import subprocess
 from typing import Any
 
 from models.downloader import SUPPORTED_MODELS, read_hf_config_summary
+from models.gguf_reader import read_gguf_total_layers
 from shard_engine.schemas import ComputeBackend, StartNodeRequest
 
 logger = logging.getLogger("shardai.memory")
@@ -76,6 +77,9 @@ def calculate_max_layers(
             # Estimate float32/bf16 memory footprint from safetensors disk size
             model_size_gb = max(0.5, (safetensor_bytes / float(1024**3)) * 1.5)
     elif model_path is not None and model_path.is_file():
+        gguf_layers = read_gguf_total_layers(model_path)
+        if gguf_layers is not None and gguf_layers > 0:
+            total_layers = gguf_layers
         actual_bytes: int = model_path.stat().st_size
         if actual_bytes > 1_048_576:
             model_size_gb = actual_bytes / float(1024**3)

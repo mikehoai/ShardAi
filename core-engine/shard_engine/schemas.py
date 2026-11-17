@@ -29,6 +29,13 @@ class NetworkMode(StrEnum):
     INTERNET = "internet"
 
 
+class PeerRole(StrEnum):
+    """Cloud-orchestrated fault-tolerance role assigned to a node."""
+
+    PRIMARY = "primary"
+    BACKUP = "backup"
+
+
 class PeerNodeInfo(BaseModel):
     """Peer metadata returned by the central Signaling Server (Cloudflare Tracker)."""
 
@@ -37,6 +44,10 @@ class PeerNodeInfo(BaseModel):
     port: int = Field(..., ge=1, le=65535, description="Direct P2P listening port")
     shard_layer_start: int = Field(..., ge=0, description="Starting transformer layer index")
     shard_layer_end: int = Field(..., ge=0, description="Ending transformer layer index")
+    role: PeerRole = Field(
+        default=PeerRole.PRIMARY,
+        description="Fault-tolerance role ('primary' or 'backup') assigned by Tracker",
+    )
     available_vram_mb: int = Field(default=0, ge=0, description="Available VRAM shared by peer")
     room_id: str = Field(
         default="public",
@@ -179,6 +190,17 @@ class RoomLobbyItem(BaseModel):
     total_shared_ram_gb: float = Field(..., ge=0.0)
     is_private: bool = False
     network_scope: Literal["internet", "lan", "hybrid"] = "internet"
+    coverage_percent: float = Field(
+        default=100.0,
+        ge=0.0,
+        le=100.0,
+        description="Percentage of total model layers currently covered by online nodes",
+    )
+    redundancy_factor: int = Field(
+        default=1,
+        ge=1,
+        description="Minimum replication factor across model layers (e.g. 2x backup redundancy)",
+    )
 
 
 class NodeStatusResponse(BaseModel):
@@ -192,6 +214,7 @@ class NodeStatusResponse(BaseModel):
     room_id: str | None = None
     is_private: bool = False
     is_unlisted: bool = False
+    role: PeerRole = PeerRole.PRIMARY
     backend: ComputeBackend | None = None
     n_layers: int = 0
     total_layers: int = 32
@@ -204,6 +227,8 @@ class NodeStatusResponse(BaseModel):
     peers: list[PeerNodeInfo] = Field(default_factory=list)
     session_token: str | None = None
     api_base_url: str | None = None
+    coverage_percent: float = Field(default=0.0, ge=0.0, le=100.0)
+    is_swarm_ready: bool = False
     message: str = ""
 
 

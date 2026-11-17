@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   NetworkMode,
   NodeStatusResponse,
+  PeerRole,
   RoomLobbyItem,
   StartNodeRequest,
   SystemMemoryResponse,
@@ -114,6 +115,12 @@ export const Dashboard: React.FC = () => {
   const [activeModelId, setActiveModelId] = useState<string>(
     "meta-llama/Llama-3.1-8B-Instruct"
   );
+  const [assignedRole, setAssignedRole] = useState<PeerRole>("primary");
+  const [assignedLayerRange, setAssignedLayerRange] = useState<[number, number] | null>(
+    null
+  );
+  const [coveragePercent, setCoveragePercent] = useState<number>(0);
+  const [isSwarmReady, setIsSwarmReady] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>(
     "Idle — Select a room from the Lobby or configure your own node below."
   );
@@ -184,6 +191,19 @@ export const Dashboard: React.FC = () => {
               setApiBaseUrl(statusData.api_base_url ?? DEFAULT_API_BASE_URL);
               setActiveModelId((prev) => statusData.model_id ?? prev);
               setRoomId(statusData.room_id ?? "public");
+              setAssignedRole(statusData.role === "backup" ? "backup" : "primary");
+              if (
+                typeof statusData.shard_layer_start === "number" &&
+                typeof statusData.shard_layer_end === "number"
+              ) {
+                setAssignedLayerRange([
+                  statusData.shard_layer_start,
+                  statusData.shard_layer_end,
+                ]);
+              }
+              const pct = statusData.coverage_percent ?? 100;
+              setCoveragePercent(pct);
+              setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
               setStatusMessage(statusData.message || "Active & Connected");
             }
           }
@@ -199,6 +219,46 @@ export const Dashboard: React.FC = () => {
       cancelled = true;
     };
   }, [fetchAvailableRooms]);
+
+  // Poll local /status every 5s while sharing so API Standby -> API Ready flips live
+  useEffect(() => {
+    if (!isSharing) return;
+    let cancelled = false;
+
+    const pollStatus = async (): Promise<void> => {
+      try {
+        const res = await fetch(`${LOCAL_ENGINE_ROOT}/status`);
+        if (!res.ok) return;
+        const statusData = (await res.json()) as NodeStatusResponse;
+        if (!cancelled && statusData.state === "RUNNING") {
+          const pct = statusData.coverage_percent ?? 100;
+          setCoveragePercent(pct);
+          setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
+          setAssignedRole(statusData.role === "backup" ? "backup" : "primary");
+          if (
+            typeof statusData.shard_layer_start === "number" &&
+            typeof statusData.shard_layer_end === "number"
+          ) {
+            setAssignedLayerRange([
+              statusData.shard_layer_start,
+              statusData.shard_layer_end,
+            ]);
+          }
+        }
+      } catch {
+        // Ignore transient poll errors while engine restarts
+      }
+    };
+
+    const timerId = window.setInterval(() => {
+      void pollStatus();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [isSharing]);
 
   const handleCopy = async (field: string, text: string): Promise<void> => {
     try {
@@ -344,8 +404,11 @@ export const Dashboard: React.FC = () => {
           is_private: Boolean(targetKey),
           is_unlisted: targetUnlisted,
           backend: payload.backend,
+          role: "primary",
           n_layers: 20,
           total_layers: 32,
+          shard_layer_start: 0,
+          shard_layer_end: 19,
           allocated_ram_mb: payload.max_ram_mb,
           allocated_vram_mb: payload.max_vram_mb,
           p2p_listen_port: payload.p2p_listen_port,
@@ -353,6 +416,8 @@ export const Dashboard: React.FC = () => {
           peers: [],
           session_token: "sk-shard-browser-preview-token",
           api_base_url: DEFAULT_API_BASE_URL,
+          coverage_percent: 100,
+          is_swarm_ready: true,
           message: "Gateway simulated in browser preview mode",
         };
       } else {
@@ -367,6 +432,19 @@ export const Dashboard: React.FC = () => {
       setSessionToken(data.session_token ?? null);
       setApiBaseUrl(data.api_base_url ?? DEFAULT_API_BASE_URL);
       setActiveModelId(data.model_id ?? targetModel);
+      const nextRole: PeerRole = data.role === "backup" ? "backup" : "primary";
+      setAssignedRole(nextRole);
+      const initialCoverage = data.coverage_percent ?? 100;
+      setCoveragePercent(initialCoverage);
+      setIsSwarmReady(Boolean(data.is_swarm_ready ?? initialCoverage >= 100));
+      if (
+        typeof data.shard_layer_start === "number" &&
+        typeof data.shard_layer_end === "number"
+      ) {
+        setAssignedLayerRange([data.shard_layer_start, data.shard_layer_end]);
+      } else {
+        setAssignedLayerRange([0, Math.max(0, (data.n_layers ?? 1) - 1)]);
+      }
 
       const layersLabel =
         data.n_layers && data.total_layers
@@ -407,6 +485,10 @@ export const Dashboard: React.FC = () => {
       const stopMsg = await invokeTauriCommand<string>("stop_python_core");
       setIsSharing(false);
       setSessionToken(null);
+      setAssignedRole("primary");
+      setAssignedLayerRange(null);
+      setCoveragePercent(0);
+      setIsSwarmReady(false);
       setDownloadProgress(null);
       setDownloadStatusMsg("");
       setStatusMessage(`Stopped — ${stopMsg}`);
@@ -644,6 +726,7 @@ export const Dashboard: React.FC = () => {
                 <th style={{ padding: "8px 10px" }}>Model</th>
                 <th style={{ padding: "8px 10px" }}>Nodes Online</th>
                 <th style={{ padding: "8px 10px" }}>Total Shared RAM</th>
+                <th style={{ padding: "8px 10px" }}>Resources</th>
                 <th style={{ padding: "8px 10px" }}>Status</th>
                 <th style={{ padding: "8px 10px", textAlign: "right" }}>Action</th>
               </tr>
@@ -652,7 +735,7 @@ export const Dashboard: React.FC = () => {
               {availableRooms.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={6}
+                    colSpan={7}
                     style={{
                       padding: "16px",
                       textAlign: "center",
@@ -663,7 +746,11 @@ export const Dashboard: React.FC = () => {
                   </td>
                 </tr>
               ) : (
-                availableRooms.map((room) => (
+                availableRooms.map((room) => {
+                  const coverage = room.coverage_percent ?? 100;
+                  const redundancy = room.redundancy_factor ?? 1;
+                  const isReady = coverage >= 100;
+                  return (
                   <tr key={room.room_id} style={{ borderTop: "1px solid #f1f5f9" }}>
                     <td style={{ padding: "9px 10px", fontWeight: 600 }}>
                       {room.room_id}{" "}
@@ -684,6 +771,26 @@ export const Dashboard: React.FC = () => {
                     <td style={{ padding: "9px 10px", color: "#334155" }}>{room.model}</td>
                     <td style={{ padding: "9px 10px" }}>{room.nodes_online}</td>
                     <td style={{ padding: "9px 10px" }}>{room.total_shared_ram_gb} GB</td>
+                    <td style={{ padding: "9px 10px" }}>
+                      <span
+                        data-testid={`room-coverage-${room.room_id}`}
+                        style={{
+                          display: "inline-block",
+                          padding: "3px 8px",
+                          borderRadius: "999px",
+                          fontSize: "0.73rem",
+                          fontWeight: 600,
+                          backgroundColor: isReady ? "#dcfce7" : "#fef3c7",
+                          color: isReady ? "#166534" : "#92400e",
+                          border: isReady ? "1px solid #86efac" : "1px solid #fcd34d",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {isReady
+                          ? `✅ Sẵn sàng (Dự phòng: ${redundancy}x)`
+                          : `⚠️ Đang gom RAM: ${Math.round(coverage)}%`}
+                      </span>
+                    </td>
                     <td style={{ padding: "9px 10px" }}>
                       {room.is_private ? "🔒 Private" : "Public"}
                     </td>
@@ -709,7 +816,8 @@ export const Dashboard: React.FC = () => {
                       </button>
                     </td>
                   </tr>
-                ))
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -1320,7 +1428,7 @@ export const Dashboard: React.FC = () => {
       </button>
 
       {/* ===================================================================== */}
-      {/* 3. Session API Credentials Panel (Active & Connected Only)            */}
+      {/* 3. Active Node Role & Session API Credentials Panel                   */}
       {/* ===================================================================== */}
       {isSharing && sessionToken && (
         <div
@@ -1333,6 +1441,46 @@ export const Dashboard: React.FC = () => {
             border: "1px solid #cbd5e1",
           }}
         >
+          <div
+            data-testid="active-node-role-card"
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              padding: "10px 12px",
+              marginBottom: "14px",
+              borderRadius: "8px",
+              backgroundColor: assignedRole === "primary" ? "#eff6ff" : "#fffbeb",
+              border:
+                assignedRole === "primary" ? "1px solid #93c5fd" : "1px solid #fcd34d",
+            }}
+          >
+            <span
+              data-testid="active-node-role-label"
+              style={{
+                fontSize: "0.85rem",
+                fontWeight: 700,
+                color: assignedRole === "primary" ? "#1d4ed8" : "#92400e",
+              }}
+            >
+              {assignedRole === "primary"
+                ? `Role: Primary Seeder (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`
+                : `Role: Backup Node (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`}
+            </span>
+            <span
+              style={{
+                fontSize: "0.72rem",
+                fontWeight: 600,
+                padding: "2px 8px",
+                borderRadius: "999px",
+                backgroundColor: assignedRole === "primary" ? "#dbeafe" : "#fef3c7",
+                color: assignedRole === "primary" ? "#1e40af" : "#78350f",
+              }}
+            >
+              {assignedRole === "primary" ? "PRIMARY" : "BACKUP"}
+            </span>
+          </div>
+
           <h2 style={{ fontSize: "0.95rem", margin: "0 0 12px 0", fontWeight: 700, color: "#0f172a" }}>
             Session API Credentials
           </h2>
@@ -1376,9 +1524,40 @@ export const Dashboard: React.FC = () => {
           </div>
 
           <div style={{ marginBottom: "14px" }}>
-            <span style={{ display: "block", fontSize: "0.75rem", fontWeight: 600, color: "#64748b", marginBottom: "4px" }}>
-              API Key (Session Token)
-            </span>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: "8px",
+                marginBottom: "6px",
+              }}
+            >
+              <span style={{ fontSize: "0.75rem", fontWeight: 600, color: "#64748b" }}>
+                API Key (Session Token)
+              </span>
+              <span
+                data-testid="api-readiness-badge"
+                style={{
+                  fontSize: "0.74rem",
+                  fontWeight: 600,
+                  padding: "3px 9px",
+                  borderRadius: "999px",
+                  backgroundColor:
+                    isSwarmReady && coveragePercent >= 100 ? "#dcfce7" : "#fef3c7",
+                  color: isSwarmReady && coveragePercent >= 100 ? "#166534" : "#92400e",
+                  border:
+                    isSwarmReady && coveragePercent >= 100
+                      ? "1px solid #86efac"
+                      : "1px solid #fcd34d",
+                }}
+              >
+                {isSwarmReady && coveragePercent >= 100
+                  ? "🟢 API Ready (Mạng lưới đã sẵn sàng nhận request)"
+                  : `🟡 API Standby (Đang chờ đủ RAM: ${Math.round(coveragePercent)}% - Chưa thể gọi model)`}
+              </span>
+            </div>
             <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
               <code
                 data-testid="session-token-value"
@@ -1413,6 +1592,33 @@ export const Dashboard: React.FC = () => {
               >
                 {copiedField === "token" ? "Copied!" : "Copy"}
               </button>
+              {(!isSwarmReady || coveragePercent < 100) && (
+                <button
+                  type="button"
+                  data-testid="copy-invite-code-btn"
+                  onClick={() =>
+                    void handleCopy(
+                      "activeInvite",
+                      roomKey.trim()
+                        ? `${roomId.trim() || "public"} | ${roomKey.trim()}`
+                        : roomId.trim() || "public"
+                    )
+                  }
+                  style={{
+                    padding: "7px 12px",
+                    fontSize: "0.78rem",
+                    fontWeight: 600,
+                    borderRadius: "6px",
+                    border: "1px solid #f59e0b",
+                    backgroundColor: "#fffbeb",
+                    color: "#92400e",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {copiedField === "activeInvite" ? "Copied Invite!" : "Copy Invite Code"}
+                </button>
+              )}
             </div>
           </div>
 
