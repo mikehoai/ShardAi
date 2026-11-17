@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import time
@@ -376,17 +377,48 @@ class LocalNodeRuntime:
         self,
         port: int,
         network_mode: NetworkMode = NetworkMode.INTERNET,
-    ) -> None:
-        """Start the async TCP P2P listener (`receive_activations`)."""
+    ) -> int:
+        """Start the async TCP P2P listener (`receive_activations`) and return the bound port."""
         await self.stop_p2p_listener()
         default_bind = "0.0.0.0" if network_mode == NetworkMode.LAN else "127.0.0.1"
         bind_host: str = os.getenv("SHARDAI_P2P_BIND_HOST", default_bind)
-        self.p2p_server = await receive_activations(
-            host=bind_host,
-            port=port,
-            on_activation_frame=self.handle_incoming_activation,
-            on_token_frame=self.handle_incoming_decoded_token,
-        )
+
+        candidates = [port] + [
+            port + offset for offset in range(1, 32) if port + offset <= 65535
+        ] + [0]
+        last_exc: OSError | None = None
+        for candidate_port in candidates:
+            try:
+                self.p2p_server = await receive_activations(
+                    host=bind_host,
+                    port=candidate_port,
+                    on_activation_frame=self.handle_incoming_activation,
+                    on_token_frame=self.handle_incoming_decoded_token,
+                )
+                actual_port = (
+                    int(self.p2p_server.sockets[0].getsockname()[1])
+                    if self.p2p_server is not None and self.p2p_server.sockets
+                    else candidate_port
+                )
+                if actual_port != port:
+                    logger.info(
+                        "Requested P2P port %d unavailable; bound P2P listener on %s:%d",
+                        port,
+                        bind_host,
+                        actual_port,
+                    )
+                return actual_port
+            except OSError as exc:
+                last_exc = exc
+                logger.debug(
+                    "Could not bind P2P listener on %s:%d (%s); trying next port...",
+                    bind_host,
+                    candidate_port,
+                    exc,
+                )
+
+        assert last_exc is not None
+        raise last_exc
 
     async def stop_p2p_listener(self) -> None:
         """Close the async TCP P2P listener cleanly."""
@@ -681,10 +713,7 @@ async def stream_model_download(
 async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
     """Load model shard, join LAN/Internet room, and issue an OpenAI Gateway session token."""
     if runtime.state == NodeState.RUNNING:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Node is already running. Stop the node before starting with a new configuration.",
-        )
+        await stop_node()
 
     if request.shard_layer_end < request.shard_layer_start:
         raise HTTPException(
@@ -781,10 +810,18 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         )
 
         # 5. Start P2P binary activation listener & LAN mDNS advertiser
-        await runtime.start_p2p_listener(
+        bound_port = await runtime.start_p2p_listener(
             request.p2p_listen_port,
             network_mode=request.network_mode,
         )
+        request.p2p_listen_port = bound_port
+        if request.node_id in ("shardai-client-01", "local-node-01"):
+            host_slug = (
+                re.sub(r"[^A-Za-z0-9-]+", "-", socket.gethostname().split(".")[0]).strip("-")
+                or "host"
+            )
+            request.node_id = f"{request.node_id}-{host_slug}-{bound_port}"[:64]
+
         room_key_hash: str | None = hash_room_key(request.room_key)
         is_private_room: bool = room_key_hash is not None
 
@@ -796,11 +833,13 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                 ram_gb=float(effective_ram_gb),
                 is_private=is_private_room,
                 is_unlisted=request.is_unlisted,
-                p2p_port=request.p2p_listen_port,
+                p2p_port=bound_port,
+                shard_layer_start=final_start,
+                shard_layer_end=final_end,
             )
         )
 
-        # 6. Announce to Cloudflare Tracker when enabled
+        # 6. Announce to Cloudflare Tracker when enabled & merge LAN-discovered peers
         discovered_peers: list[PeerNodeInfo] = []
         if _is_tracker_enabled():
             try:
@@ -816,6 +855,30 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                 logger.warning("Tracker registration HTTP error: %s", http_exc)
             except Exception as tracker_exc:
                 logger.warning("Tracker unreachable; continuing in local/LAN P2P mode: %s", tracker_exc)
+
+        known_peer_ids: set[str] = {peer.peer_id for peer in discovered_peers}
+        lan_peers_raw = await lan_mdns_service.scan_lan_rooms(timeout_seconds=0.2)
+        for beacon in lan_peers_raw:
+            peer_id = str(beacon.get("node_id") or "")
+            if (
+                not peer_id
+                or peer_id == request.node_id
+                or peer_id in known_peer_ids
+                or str(beacon.get("room_id") or "public") != request.room_id
+            ):
+                continue
+            known_peer_ids.add(peer_id)
+            discovered_peers.append(
+                PeerNodeInfo(
+                    peer_id=peer_id,
+                    ip_address=str(beacon.get("ip_address") or "127.0.0.1"),
+                    port=int(beacon.get("p2p_port") or 49152),
+                    shard_layer_start=int(beacon.get("shard_layer_start") or 0),
+                    shard_layer_end=int(beacon.get("shard_layer_end") or (final_total_layers - 1)),
+                    available_vram_mb=0,
+                    room_id=request.room_id,
+                )
+            )
 
         # 7. Issue cryptographic Session Token stored strictly in process RAM
         runtime.session_token = f"sk-shard-{secrets.token_urlsafe(24)}"

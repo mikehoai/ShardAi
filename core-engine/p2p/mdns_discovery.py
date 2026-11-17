@@ -31,6 +31,8 @@ class LanRoomBeacon:
     is_private: bool
     is_unlisted: bool
     p2p_port: int
+    shard_layer_start: int = 0
+    shard_layer_end: int = 15
 
 
 class _MdnsResponderProtocol(asyncio.DatagramProtocol):
@@ -55,6 +57,8 @@ class _MdnsResponderProtocol(asyncio.DatagramProtocol):
                 "ram_gb": self.beacon.ram_gb,
                 "is_private": self.beacon.is_private,
                 "p2p_port": self.beacon.p2p_port,
+                "shard_layer_start": self.beacon.shard_layer_start,
+                "shard_layer_end": self.beacon.shard_layer_end,
             }
         ).encode("utf-8")
         try:
@@ -78,18 +82,23 @@ class LanMdnsService:
             return
 
         loop = asyncio.get_running_loop()
-        for port in (SHARDAI_MDNS_PORT, FALLBACK_LAN_PORT):
+        for port in (FALLBACK_LAN_PORT, SHARDAI_MDNS_PORT):
             sock: socket.socket | None = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.bind(("", port))
-                mreq = struct.pack(
-                    "4s4s",
-                    socket.inet_aton(MDNS_MULTICAST_GROUP),
-                    socket.inet_aton("0.0.0.0"),
-                )
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                try:
+                    mreq = struct.pack(
+                        "4s4s",
+                        socket.inet_aton(MDNS_MULTICAST_GROUP),
+                        socket.inet_aton("0.0.0.0"),
+                    )
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                except OSError as exc:
+                    logger.debug("Could not join multicast group on port %d: %s", port, exc)
                 sock.setblocking(False)
 
                 transport, _ = await loop.create_datagram_endpoint(
@@ -133,6 +142,9 @@ class LanMdnsService:
                 "ram_gb": self._active_beacon.ram_gb,
                 "is_private": self._active_beacon.is_private,
                 "p2p_port": self._active_beacon.p2p_port,
+                "shard_layer_start": self._active_beacon.shard_layer_start,
+                "shard_layer_end": self._active_beacon.shard_layer_end,
+                "ip_address": "127.0.0.1",
             }
 
         def _blocking_probe() -> list[dict[str, Any]]:
@@ -140,20 +152,24 @@ class LanMdnsService:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             try:
                 sock.settimeout(timeout_seconds)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-                for target_port in (SHARDAI_MDNS_PORT, FALLBACK_LAN_PORT):
-                    try:
-                        sock.sendto(PROBE_MAGIC, (MDNS_MULTICAST_GROUP, target_port))
-                    except OSError:
-                        pass
+                for target_port in (FALLBACK_LAN_PORT, SHARDAI_MDNS_PORT):
+                    for target_host in (MDNS_MULTICAST_GROUP, "255.255.255.255", "127.0.0.1"):
+                        try:
+                            sock.sendto(PROBE_MAGIC, (target_host, target_port))
+                        except OSError:
+                            pass
 
                 loop_deadline = asyncio.get_event_loop().time() + timeout_seconds if False else None
                 _ = loop_deadline
                 while True:
                     try:
-                        packet, _addr = sock.recvfrom(4096)
+                        packet, addr = sock.recvfrom(4096)
                         data = json.loads(packet.decode("utf-8"))
                         if isinstance(data, dict) and data.get("type") == "SHARDAI_MDNS_ROOM_V1":
+                            data.setdefault("ip_address", addr[0])
                             found.append(data)
                     except (TimeoutError, socket.timeout, OSError, ValueError):
                         break

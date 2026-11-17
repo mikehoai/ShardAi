@@ -174,6 +174,22 @@ export const Dashboard: React.FC = () => {
       }
 
       if (!cancelled) {
+        try {
+          const statusRes = await fetch(`${LOCAL_ENGINE_ROOT}/status`);
+          if (statusRes.ok) {
+            const statusData = (await statusRes.json()) as NodeStatusResponse;
+            if (!cancelled && statusData.state === "RUNNING" && statusData.session_token) {
+              setIsSharing(true);
+              setSessionToken(statusData.session_token);
+              setApiBaseUrl(statusData.api_base_url ?? DEFAULT_API_BASE_URL);
+              setActiveModelId((prev) => statusData.model_id ?? prev);
+              setRoomId(statusData.room_id ?? "public");
+              setStatusMessage(statusData.message || "Active & Connected");
+            }
+          }
+        } catch {
+          // Core engine may not be started yet
+        }
         await fetchAvailableRooms();
       }
     };
@@ -239,14 +255,22 @@ export const Dashboard: React.FC = () => {
         const line = rawEvent.trim();
         if (!line.startsWith("data:")) continue;
         const dataStr = line.slice(5).trim();
-        if (dataStr === "[DONE]") break;
-        try {
-          const payload = JSON.parse(dataStr) as SseDownloadEvent;
-          setDownloadProgress(payload.progress);
-          setDownloadStatusMsg(payload.message || `${payload.progress.toFixed(0)}%`);
-        } catch {
-          // ignore parsing error
+        if (dataStr === "[DONE]") {
+          await reader.cancel();
+          return;
         }
+        let payload: SseDownloadEvent;
+        try {
+          payload = JSON.parse(dataStr) as SseDownloadEvent;
+        } catch {
+          continue;
+        }
+        if (payload.status === "error") {
+          await reader.cancel();
+          throw new Error(payload.message || "Model download failed.");
+        }
+        setDownloadProgress(payload.progress);
+        setDownloadStatusMsg(payload.message || `${payload.progress.toFixed(0)}%`);
       }
     }
   };
@@ -296,44 +320,47 @@ export const Dashboard: React.FC = () => {
         shard_layer_end: 15,
       };
 
-      let data: NodeStatusResponse;
+      let response: Response | null = null;
       try {
-        const response = await fetch(`${LOCAL_ENGINE_ROOT}/start-node`, {
+        response = await fetch(`${LOCAL_ENGINE_ROOT}/start-node`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+      } catch (fetchErr: unknown) {
+        if (isTauriEnvironment()) {
+          throw fetchErr;
+        }
+      }
 
+      let data: NodeStatusResponse;
+      if (response === null) {
+        data = {
+          state: "RUNNING",
+          node_id: payload.node_id,
+          model_id: payload.model_id,
+          network_mode: payload.network_mode,
+          room_id: payload.room_id,
+          is_private: Boolean(targetKey),
+          is_unlisted: targetUnlisted,
+          backend: payload.backend,
+          n_layers: 20,
+          total_layers: 32,
+          allocated_ram_mb: payload.max_ram_mb,
+          allocated_vram_mb: payload.max_vram_mb,
+          p2p_listen_port: payload.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-shard-browser-preview-token",
+          api_base_url: DEFAULT_API_BASE_URL,
+          message: "Gateway simulated in browser preview mode",
+        };
+      } else {
         if (!response.ok) {
           const errText = await response.text();
           throw new Error(`Python API /start-node failed (${response.status}): ${errText}`);
         }
         data = (await response.json()) as NodeStatusResponse;
-      } catch (fetchErr: unknown) {
-        if (!isTauriEnvironment()) {
-          data = {
-            state: "RUNNING",
-            node_id: payload.node_id,
-            model_id: payload.model_id,
-            network_mode: payload.network_mode,
-            room_id: payload.room_id,
-            is_private: Boolean(targetKey),
-            is_unlisted: targetUnlisted,
-            backend: payload.backend,
-            n_layers: 20,
-            total_layers: 32,
-            allocated_ram_mb: payload.max_ram_mb,
-            allocated_vram_mb: payload.max_vram_mb,
-            p2p_listen_port: payload.p2p_listen_port,
-            connected_peers_count: 1,
-            peers: [],
-            session_token: "sk-shard-browser-preview-token",
-            api_base_url: DEFAULT_API_BASE_URL,
-            message: "Gateway simulated in browser preview mode",
-          };
-        } else {
-          throw fetchErr;
-        }
       }
 
       setIsSharing(true);

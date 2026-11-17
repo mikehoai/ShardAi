@@ -425,6 +425,54 @@ class ModelDownloader:
         exists = target_path.stat().st_size >= min_bytes
         return exists, target_path
 
+    def _find_cached_pytorch_shard_files(
+        self,
+        model_dir: Path,
+        shard_layer_start: int | None,
+        shard_layer_end: int | None,
+    ) -> tuple[list[Path], int, int]:
+        """Return locally cached `.safetensors` files for the requested layer range, if complete."""
+        if not (model_dir / "config.json").is_file():
+            return [], 0, 0
+
+        total_layers, tie_embeddings = read_hf_config_summary(model_dir)
+        start_layer: int = max(0, shard_layer_start if shard_layer_start is not None else 0)
+        end_layer: int = min(
+            total_layers - 1,
+            shard_layer_end if shard_layer_end is not None else (total_layers - 1),
+        )
+
+        index_path = model_dir / "model.safetensors.index.json"
+        if index_path.is_file():
+            try:
+                index_data = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map: dict[str, str] = index_data.get("weight_map", {})
+                required_files = filter_required_safetensors_files(
+                    weight_map=weight_map,
+                    shard_layer_start=start_layer,
+                    shard_layer_end=end_layer,
+                    total_layers=total_layers,
+                    tie_word_embeddings=tie_embeddings,
+                )
+                if not required_files:
+                    required_files = sorted(set(weight_map.values()))
+                resolved = [(model_dir / fname).resolve() for fname in required_files]
+                cached = [
+                    p
+                    for p in resolved
+                    if p.is_relative_to(model_dir) and p.is_file() and p.stat().st_size > 0
+                ]
+                if required_files and len(cached) == len(required_files):
+                    return cached, start_layer, end_layer
+            except Exception:
+                return [], start_layer, end_layer
+            return [], start_layer, end_layer
+
+        cached_weights = sorted(
+            p for p in model_dir.glob("*.safetensors") if p.is_file() and p.stat().st_size > 0
+        )
+        return cached_weights, start_layer, end_layer
+
     async def ensure_pytorch_shard_downloaded(
         self,
         model_id: str,
@@ -449,6 +497,29 @@ class ModelDownloader:
                 message=f"Inspecting Hugging Face repository '{repo_id}'...",
             )
         )
+
+        cached_files, start_layer, end_layer = self._find_cached_pytorch_shard_files(
+            model_dir=model_dir,
+            shard_layer_start=shard_layer_start,
+            shard_layer_end=shard_layer_end,
+        )
+        if cached_files:
+            total_bytes = sum(p.stat().st_size for p in cached_files)
+            _emit(
+                DownloadProgressEvent(
+                    model_id=model_id,
+                    status="cached",
+                    progress_percent=100.0,
+                    downloaded_bytes=total_bytes,
+                    total_bytes=total_bytes,
+                    local_path=str(model_dir),
+                    message=(
+                        f"Shard ready from cache for '{repo_id}' (layers {start_layer}..{end_layer}, "
+                        f"{len(cached_files)} weight file(s))."
+                    ),
+                )
+            )
+            return model_dir
 
         if is_offline_mode() or hf_hub_download is None or list_repo_files is None:
             raise RuntimeError(

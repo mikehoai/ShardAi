@@ -17,6 +17,7 @@ from collections import OrderedDict
 import ctypes
 from dataclasses import dataclass, field
 import gc
+import json
 import logging
 import math
 from pathlib import Path
@@ -230,139 +231,168 @@ class ShardModelRunner:
             logger.info("No .safetensors files in %s; keeping simulation mode.", model_dir)
             return
 
-        import torch  # type: ignore[import-not-found]
-        import torch.nn as nn  # type: ignore[import-not-found]
-        from safetensors import safe_open  # type: ignore[import-not-found]
-        from transformers import (  # type: ignore[import-not-found]
-            AutoConfig,
-            AutoModelForCausalLM,
-            AutoTokenizer,
-        )
+        config_path = model_dir / "config.json"
+        if config_path.is_file():
+            try:
+                cfg_data = json.loads(config_path.read_text(encoding="utf-8"))
+                self.total_layers = int(cfg_data.get("num_hidden_layers") or self.total_layers)
+                self.hidden_dim = int(cfg_data.get("hidden_size") or self.hidden_dim)
+                self.shard_layer_start = max(
+                    0, min(self.shard_layer_start, self.total_layers - 1)
+                )
+                self.shard_layer_end = max(
+                    self.shard_layer_start, min(self.shard_layer_end, self.total_layers - 1)
+                )
+                self.n_layers = max(1, self.shard_layer_end - self.shard_layer_start + 1)
+            except Exception as exc:
+                logger.warning("Failed to parse config.json in %s: %s", model_dir, exc)
 
-        config = AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
-        self._hf_config = config
-        self.total_layers = int(getattr(config, "num_hidden_layers", self.total_layers))
-        self.hidden_dim = int(getattr(config, "hidden_size", self.hidden_dim))
-        self.shard_layer_start = max(0, min(self.shard_layer_start, self.total_layers - 1))
-        self.shard_layer_end = max(
-            self.shard_layer_start, min(self.shard_layer_end, self.total_layers - 1)
-        )
-        self.n_layers = max(1, self.shard_layer_end - self.shard_layer_start + 1)
-
-        if self.is_head_node or self.is_tail_node:
-            self._tokenizer = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
-            self._eos_token_ids = _extract_eos_token_ids(config, self._tokenizer)
-
-        # Build zero-RAM model skeleton on PyTorch meta device and discard unowned layers
-        with torch.device("meta"):
-            meta_model = AutoModelForCausalLM.from_config(config)
-
-        inner_meta = getattr(meta_model, "model", meta_model)
-        kept_layers = [
-            inner_meta.layers[idx]
-            for idx in range(self.shard_layer_start, self.shard_layer_end + 1)
-        ]
-
-        container = nn.Module()
-        container.layers = nn.ModuleList(kept_layers)
-        self._layers = kept_layers
-
-        if hasattr(inner_meta, "rotary_emb") and inner_meta.rotary_emb is not None:
-            rotary_cls = type(inner_meta.rotary_emb)
-            self._rotary_emb = rotary_cls(config=config)
-            container.rotary_emb = self._rotary_emb
-
-        if self.is_head_node and hasattr(inner_meta, "embed_tokens"):
-            self._embed_tokens = inner_meta.embed_tokens
-            container.embed_tokens = self._embed_tokens
-
-        if self.is_tail_node:
-            if hasattr(inner_meta, "norm"):
-                self._norm = inner_meta.norm
-                container.norm = self._norm
-            if hasattr(meta_model, "lm_head"):
-                self._lm_head = meta_model.lm_head
-                container.lm_head = self._lm_head
-
-        del meta_model
-
-        # Map safetensors keys strictly for kept submodules so unowned layers never enter RAM
-        target_keys: set[str] = set(container.state_dict().keys())
-        loaded_state: dict[str, torch.Tensor] = {}
-
-        for sf_path in safetensor_files:
-            with safe_open(str(sf_path), framework="pt", device="cpu") as handle:
-                for raw_key in handle.keys():
-                    mapped_key: str | None = None
-                    if raw_key.startswith("model.layers."):
-                        parts = raw_key.split(".", 3)
-                        if len(parts) == 4 and parts[2].isdigit():
-                            layer_num = int(parts[2])
-                            if self.shard_layer_start <= layer_num <= self.shard_layer_end:
-                                local_idx = layer_num - self.shard_layer_start
-                                mapped_key = f"layers.{local_idx}.{parts[3]}"
-                    elif self.is_head_node and raw_key.startswith("model.embed_tokens."):
-                        mapped_key = raw_key[len("model.") :]
-                    elif self.is_tail_node and raw_key.startswith("model.norm."):
-                        mapped_key = raw_key[len("model.") :]
-                    elif self.is_tail_node and raw_key.startswith("lm_head."):
-                        mapped_key = raw_key
-
-                    if mapped_key is not None and mapped_key in target_keys:
-                        loaded_state[mapped_key] = handle.get_tensor(raw_key)
-
-                    # Handle bidirectional weight tying (`tie_word_embeddings=True`)
-                    if (
-                        self.is_tail_node
-                        and raw_key == "model.embed_tokens.weight"
-                        and "lm_head.weight" in target_keys
-                        and "lm_head.weight" not in loaded_state
-                    ):
-                        loaded_state["lm_head.weight"] = handle.get_tensor(raw_key)
-                    elif (
-                        self.is_head_node
-                        and raw_key == "lm_head.weight"
-                        and "embed_tokens.weight" in target_keys
-                        and "embed_tokens.weight" not in loaded_state
-                    ):
-                        loaded_state["embed_tokens.weight"] = handle.get_tensor(raw_key)
-
-        if not loaded_state:
-            raise RuntimeError(
-                f"No matching shard tensors found in {model_dir} for layers "
-                f"{self.shard_layer_start}..{self.shard_layer_end}."
+        try:
+            import torch  # type: ignore[import-not-found]
+            import torch.nn as nn  # type: ignore[import-not-found]
+            from safetensors import safe_open  # type: ignore[import-not-found]
+            from transformers import (  # type: ignore[import-not-found]
+                AutoConfig,
+                AutoModelForCausalLM,
+                AutoTokenizer,
             )
 
-        container.load_state_dict(loaded_state, strict=False, assign=True)
-        loaded_state.clear()
+            config = AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
+            self._hf_config = config
+            self.total_layers = int(getattr(config, "num_hidden_layers", self.total_layers))
+            self.hidden_dim = int(getattr(config, "hidden_size", self.hidden_dim))
+            self.shard_layer_start = max(
+                0, min(self.shard_layer_start, self.total_layers - 1)
+            )
+            self.shard_layer_end = max(
+                self.shard_layer_start, min(self.shard_layer_end, self.total_layers - 1)
+            )
+            self.n_layers = max(1, self.shard_layer_end - self.shard_layer_start + 1)
 
-        # Choose float32 on CPU when budget fits (3x faster on x86), else bfloat16 for half RAM
-        shard_bytes_bf16 = sum(
-            p.numel() * 2 for p in container.parameters() if p.device.type != "meta"
-        )
-        shard_mb_f32 = (shard_bytes_bf16 * 2) / (1024.0 * 1024.0)
-        self._compute_dtype = (
-            torch.float32 if shard_mb_f32 <= (self.max_ram_mb * 0.85) else torch.bfloat16
-        )
+            if self.is_head_node or self.is_tail_node:
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_dir), local_files_only=True
+                )
+                self._eos_token_ids = _extract_eos_token_ids(config, self._tokenizer)
 
-        container.to(dtype=self._compute_dtype, device="cpu")
-        container.eval()
-        for param in container.parameters():
-            param.requires_grad_(False)
+            # Build zero-RAM model skeleton on PyTorch meta device and discard unowned layers
+            with torch.device("meta"):
+                meta_model = AutoModelForCausalLM.from_config(config)
 
-        self._shard_container = container
-        self._is_real_pytorch = True
-        logger.info(
-            "Loaded PyTorch shard for %s: layers %d..%d/%d (dtype=%s, role=%s)",
-            self.model_id,
-            self.shard_layer_start,
-            self.shard_layer_end,
-            self.total_layers,
-            self._compute_dtype,
-            "HEAD+TAIL"
-            if (self.is_head_node and self.is_tail_node)
-            else ("HEAD" if self.is_head_node else ("TAIL" if self.is_tail_node else "MIDDLE")),
-        )
+            inner_meta = getattr(meta_model, "model", meta_model)
+            kept_layers = [
+                inner_meta.layers[idx]
+                for idx in range(self.shard_layer_start, self.shard_layer_end + 1)
+            ]
+
+            container = nn.Module()
+            container.layers = nn.ModuleList(kept_layers)
+            self._layers = kept_layers
+
+            if hasattr(inner_meta, "rotary_emb") and inner_meta.rotary_emb is not None:
+                rotary_cls = type(inner_meta.rotary_emb)
+                self._rotary_emb = rotary_cls(config=config)
+                container.rotary_emb = self._rotary_emb
+
+            if self.is_head_node and hasattr(inner_meta, "embed_tokens"):
+                self._embed_tokens = inner_meta.embed_tokens
+                container.embed_tokens = self._embed_tokens
+
+            if self.is_tail_node:
+                if hasattr(inner_meta, "norm"):
+                    self._norm = inner_meta.norm
+                    container.norm = self._norm
+                if hasattr(meta_model, "lm_head"):
+                    self._lm_head = meta_model.lm_head
+                    container.lm_head = self._lm_head
+
+            del meta_model
+
+            # Map safetensors keys strictly for kept submodules so unowned layers never enter RAM
+            target_keys: set[str] = set(container.state_dict().keys())
+            loaded_state: dict[str, torch.Tensor] = {}
+
+            for sf_path in safetensor_files:
+                with safe_open(str(sf_path), framework="pt", device="cpu") as handle:
+                    for raw_key in handle.keys():
+                        mapped_key: str | None = None
+                        if raw_key.startswith("model.layers."):
+                            parts = raw_key.split(".", 3)
+                            if len(parts) == 4 and parts[2].isdigit():
+                                layer_num = int(parts[2])
+                                if self.shard_layer_start <= layer_num <= self.shard_layer_end:
+                                    local_idx = layer_num - self.shard_layer_start
+                                    mapped_key = f"layers.{local_idx}.{parts[3]}"
+                        elif self.is_head_node and raw_key.startswith("model.embed_tokens."):
+                            mapped_key = raw_key[len("model.") :]
+                        elif self.is_tail_node and raw_key.startswith("model.norm."):
+                            mapped_key = raw_key[len("model.") :]
+                        elif self.is_tail_node and raw_key.startswith("lm_head."):
+                            mapped_key = raw_key
+
+                        if mapped_key is not None and mapped_key in target_keys:
+                            loaded_state[mapped_key] = handle.get_tensor(raw_key)
+
+                        # Handle bidirectional weight tying (`tie_word_embeddings=True`)
+                        if (
+                            self.is_tail_node
+                            and raw_key == "model.embed_tokens.weight"
+                            and "lm_head.weight" in target_keys
+                            and "lm_head.weight" not in loaded_state
+                        ):
+                            loaded_state["lm_head.weight"] = handle.get_tensor(raw_key)
+                        elif (
+                            self.is_head_node
+                            and raw_key == "lm_head.weight"
+                            and "embed_tokens.weight" in target_keys
+                            and "embed_tokens.weight" not in loaded_state
+                        ):
+                            loaded_state["embed_tokens.weight"] = handle.get_tensor(raw_key)
+
+            if not loaded_state:
+                raise RuntimeError(
+                    f"No matching shard tensors found in {model_dir} for layers "
+                    f"{self.shard_layer_start}..{self.shard_layer_end}."
+                )
+
+            container.load_state_dict(loaded_state, strict=False, assign=True)
+            loaded_state.clear()
+
+            # Choose float32 on CPU when budget fits (3x faster on x86), else bfloat16 for half RAM
+            shard_bytes_bf16 = sum(
+                p.numel() * 2 for p in container.parameters() if p.device.type != "meta"
+            )
+            shard_mb_f32 = (shard_bytes_bf16 * 2) / (1024.0 * 1024.0)
+            self._compute_dtype = (
+                torch.float32 if shard_mb_f32 <= (self.max_ram_mb * 0.85) else torch.bfloat16
+            )
+
+            container.to(dtype=self._compute_dtype, device="cpu")
+            container.eval()
+            for param in container.parameters():
+                param.requires_grad_(False)
+
+            self._shard_container = container
+            self._is_real_pytorch = True
+            logger.info(
+                "Loaded PyTorch shard for %s: layers %d..%d/%d (dtype=%s, role=%s)",
+                self.model_id,
+                self.shard_layer_start,
+                self.shard_layer_end,
+                self.total_layers,
+                self._compute_dtype,
+                "HEAD+TAIL"
+                if (self.is_head_node and self.is_tail_node)
+                else ("HEAD" if self.is_head_node else ("TAIL" if self.is_tail_node else "MIDDLE")),
+            )
+        except Exception as exc:
+            logger.info(
+                "Using lightweight float32 shard runner for %s (layers %d..%d): %s",
+                model_dir,
+                self.shard_layer_start,
+                self.shard_layer_end,
+                exc,
+            )
 
     def _init_llama_cpp(self, gguf_path: str, n_layers: int) -> None:
         """Initialize `llama_cpp.Llama` when an explicit real `.gguf` file is provided."""
