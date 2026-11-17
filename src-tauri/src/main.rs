@@ -103,7 +103,26 @@ fn terminate_child_process(state: &PythonCoreState) -> Result<String, String> {
     }
 }
 
-/// Spawns `core-engine/main.py` in the background and waits until `127.0.0.1:8000` is reachable.
+/// Resolves a packaged PyInstaller Tauri Sidecar binary placed next to the desktop executable.
+fn resolve_sidecar_executable() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        exe_dir.join("core-engine.exe"),
+        exe_dir.join("binaries").join("core-engine-x86_64-pc-windows-msvc.exe"),
+    ];
+
+    #[cfg(not(target_os = "windows"))]
+    let candidates = [
+        exe_dir.join("core-engine"),
+        exe_dir.join("binaries").join("core-engine"),
+    ];
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+/// Spawns the bundled PyInstaller sidecar (release) or `core-engine/main.py` (dev) and waits for `127.0.0.1:8000`.
 #[tauri::command]
 fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String> {
     let mut guard = state
@@ -123,16 +142,26 @@ fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String
         }
     }
 
-    let engine_dir = resolve_core_engine_dir()?;
-    let python_bin = resolve_python_executable(&engine_dir);
-
-    let mut cmd = Command::new(&python_bin);
-    cmd.current_dir(&engine_dir)
-        .arg("main.py")
-        .env("SHARDAI_ENGINE_PORT", "8000")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let (mut cmd, launch_label) = if let Some(sidecar_bin) = resolve_sidecar_executable() {
+        let mut c = Command::new(&sidecar_bin);
+        c.args(["--mode", "daemon", "--port", "8000"])
+            .env("SHARDAI_ENGINE_PORT", "8000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        (c, format!("{:?}", sidecar_bin))
+    } else {
+        let engine_dir = resolve_core_engine_dir()?;
+        let python_bin = resolve_python_executable(&engine_dir);
+        let mut c = Command::new(&python_bin);
+        c.current_dir(&engine_dir)
+            .args(["main.py", "--mode", "daemon", "--port", "8000"])
+            .env("SHARDAI_ENGINE_PORT", "8000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        (c, format!("{:?}", python_bin))
+    };
 
     #[cfg(target_os = "windows")]
     {
@@ -141,7 +170,7 @@ fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn Python core ({:?}): {e}", python_bin))?;
+        .map_err(|e| format!("Failed to spawn Python core ({}): {e}", launch_label))?;
 
     let pid = child.id();
     let socket_addr: SocketAddr = LOCAL_ENGINE_ADDR

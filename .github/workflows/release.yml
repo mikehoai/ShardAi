@@ -1,0 +1,134 @@
+name: Release ShardAi (CLI + Desktop Windows & macOS)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            tauri_target: ""
+            tauri_bundles: "msi,nsis"
+            sidecar_triple: "x86_64-pc-windows-msvc"
+          - platform: macos-universal
+            os: macos-latest
+            tauri_target: "universal-apple-darwin"
+            tauri_bundles: "dmg"
+            sidecar_triple: "universal-apple-darwin"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Setup Python (native architecture)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "core-engine/requirements.txt"
+
+      - name: Install Python dependencies & PyInstaller
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r core-engine/requirements.txt
+
+      - name: Build Python Core Sidecar & CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\scripts\build_core.ps1 -TargetTriple x86_64-pc-windows-msvc -PythonExe (Get-Command python).Source
+
+      - name: Build macOS Universal Python Core Sidecar & CLI via lipo
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          chmod +x scripts/build_core.sh
+          # 1. Build Apple Silicon (arm64) binary
+          ./scripts/build_core.sh aarch64-apple-darwin
+
+          # 2. Try x86_64 via Rosetta if universal Python is present, otherwise fallback to universal2 build
+          if arch -x86_64 python3 -c "import sys; print(sys.executable)" >/dev/null 2>&1; then
+            python3 -m venv .venv-x64 --system-site-packages || true
+            arch -x86_64 python3 -m pip install --upgrade pip
+            arch -x86_64 python3 -m pip install -r core-engine/requirements.txt
+            PYTHON_BIN="$(which python3)" TARGET_TRIPLE=x86_64-apple-darwin arch -x86_64 ./scripts/build_core.sh x86_64-apple-darwin
+            lipo -create \
+              src-tauri/binaries/core-engine-x86_64-apple-darwin \
+              src-tauri/binaries/core-engine-aarch64-apple-darwin \
+              -output src-tauri/binaries/core-engine-universal-apple-darwin
+            cp -f src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai-core-universal-apple-darwin
+            chmod +x src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai-core-universal-apple-darwin
+            lipo -info src-tauri/binaries/core-engine-universal-apple-darwin
+          else
+            # Reuse arm64 binary when Intel Rosetta Python is not preinstalled
+            cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin src-tauri/binaries/core-engine-x86_64-apple-darwin || true
+            cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin src-tauri/binaries/core-engine-universal-apple-darwin
+            cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin dist/cli/shardai-core-universal-apple-darwin
+          fi
+
+      - name: Install Frontend & Tauri CLI Dependencies
+        shell: bash
+        run: |
+          npm --prefix src-ui ci
+          npm ci
+
+      - name: Generate Tauri App Icons from assets/logo.png
+        shell: bash
+        run: npx tauri icon assets/logo.png
+
+      - name: Build Tauri Desktop App (Windows .exe/.msi)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npm run tauri build -- --bundles msi,nsis
+
+      - name: Build Tauri Desktop App (macOS Universal .dmg)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: npm run tauri build -- --target universal-apple-darwin --bundles dmg
+
+      - name: Collect Release Artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp -f dist/cli/* release-artifacts/ || true
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            find src-tauri/target/release/bundle -type f \( -name "*.exe" -o -name "*.msi" \) -exec cp -f {} release-artifacts/ \;
+          else
+            find src-tauri/target/universal-apple-darwin/release/bundle -type f -name "*.dmg" -exec cp -f {} release-artifacts/ \;
+          fi
+          ls -lh release-artifacts/
+
+      - name: Upload Artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          generate_release_notes: true

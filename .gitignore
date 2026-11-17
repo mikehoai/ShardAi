@@ -54,6 +54,7 @@ pnpm-debug.log*
 # ==============================================================================
 target/
 src-tauri/target/
+src-tauri/binaries/
 src-tauri/WixTools/
 Cargo.lock
 
