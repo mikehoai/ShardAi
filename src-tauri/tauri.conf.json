@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "network.shardai.node",
   "build": {
-    "beforeDevCommand": "npm --prefix ../src-ui run dev",
+    "beforeDevCommand": "npm --prefix src-ui run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm --prefix ../src-ui run build",
+    "beforeBuildCommand": "npm --prefix src-ui run build",
     "frontendDist": "../src-ui/dist"
   },
   "app": {

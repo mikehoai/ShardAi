@@ -16,7 +16,8 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const LOCAL_ENGINE_ADDR: &str = "127.0.0.1:8000";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+// PyInstaller --onefile bundles PyTorch/Transformers (~200 MB) and can take 30-45s on cold Windows Defender unpack
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Thread-safe container holding the background Python FastAPI child process.
 pub struct PythonCoreState {
@@ -122,19 +123,29 @@ fn resolve_sidecar_executable() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
 }
 
-/// Spawns the bundled PyInstaller sidecar (release) or `core-engine/main.py` (dev) and waits for `127.0.0.1:8000`.
-#[tauri::command]
-fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String> {
+/// Checks whether `127.0.0.1:8000` is currently accepting HTTP connections.
+fn is_engine_listening() -> bool {
+    LOCAL_ENGINE_ADDR
+        .parse::<SocketAddr>()
+        .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok())
+        .unwrap_or(false)
+}
+
+/// Ensures the sidecar (or dev Python core) process is spawned without blocking on HTTP readiness.
+fn ensure_core_spawned(state: &PythonCoreState) -> Result<String, String> {
+    if is_engine_listening() {
+        return Ok("Python core is already listening.".to_string());
+    }
+
     let mut guard = state
         .child
         .lock()
         .map_err(|_| "Failed to acquire lock on PythonCoreState".to_string())?;
 
-    // Check if an existing process is still alive
     if let Some(existing_child) = guard.as_mut() {
         match existing_child.try_wait() {
             Ok(None) => {
-                return Ok("Python core is already running.".to_string());
+                return Ok("Python core process is starting up.".to_string());
             }
             _ => {
                 *guard = None;
@@ -147,8 +158,8 @@ fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String
         c.args(["--mode", "daemon", "--port", "8000"])
             .env("SHARDAI_ENGINE_PORT", "8000")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         (c, format!("{:?}", sidecar_bin))
     } else {
         let engine_dir = resolve_core_engine_dir()?;
@@ -158,8 +169,8 @@ fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String
             .args(["main.py", "--mode", "daemon", "--port", "8000"])
             .env("SHARDAI_ENGINE_PORT", "8000")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         (c, format!("{:?}", python_bin))
     };
 
@@ -168,40 +179,52 @@ fn start_python_core(state: State<'_, PythonCoreState>) -> Result<String, String
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn Python core ({}): {e}", launch_label))?;
-
     let pid = child.id();
-    let socket_addr: SocketAddr = LOCAL_ENGINE_ADDR
-        .parse()
-        .map_err(|e| format!("Invalid local engine socket address: {e}"))?;
+    *guard = Some(child);
+    Ok(format!("Spawned Python core ({launch_label}, PID {pid})."))
+}
 
-    // Poll until FastAPI binds to 127.0.0.1:8000 or the process exits prematurely
-    let start_instant = Instant::now();
-    while start_instant.elapsed() < STARTUP_TIMEOUT {
-        if TcpStream::connect_timeout(&socket_addr, Duration::from_millis(150)).is_ok() {
-            *guard = Some(child);
-            return Ok(format!(
-                "Python core started on http://{LOCAL_ENGINE_ADDR} (PID {pid})."
-            ));
+/// Spawns the bundled PyInstaller sidecar (release) or `core-engine/main.py` (dev) and waits for `127.0.0.1:8000`.
+#[tauri::command]
+async fn start_python_core(app_handle: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle.state::<PythonCoreState>();
+        ensure_core_spawned(&state)?;
+
+        let start_instant = Instant::now();
+        while start_instant.elapsed() < STARTUP_TIMEOUT {
+            if is_engine_listening() {
+                return Ok(format!("Python core is ready on http://{LOCAL_ENGINE_ADDR}."));
+            }
+
+            // Re-check process health without holding the Mutex during sleep
+            {
+                let mut guard = state
+                    .child
+                    .lock()
+                    .map_err(|_| "Failed to acquire lock on PythonCoreState".to_string())?;
+                if let Some(child) = guard.as_mut() {
+                    if let Ok(Some(exit_status)) = child.try_wait() {
+                        *guard = None;
+                        return Err(format!(
+                            "Python core exited prematurely with status: {exit_status}"
+                        ));
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_millis(250));
         }
 
-        if let Ok(Some(exit_status)) = child.try_wait() {
-            return Err(format!(
-                "Python core exited prematurely with status: {exit_status}"
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(150));
-    }
-
-    // Startup timed out; ensure the hung process is killed and reaped
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(format!(
-        "Timed out waiting for Python core to listen on http://{LOCAL_ENGINE_ADDR}."
-    ))
+        Err(format!(
+            "Timed out waiting for Python core to listen on http://{LOCAL_ENGINE_ADDR}."
+        ))
+    })
+    .await
+    .map_err(|e| format!("Failed joining core startup task: {e}"))?
 }
 
 /// Kills the background Python core process on user request or application shutdown.
@@ -294,6 +317,16 @@ fn get_available_ram_gb() -> Result<f64, String> {
 fn main() {
     tauri::Builder::default()
         .manage(PythonCoreState::default())
+        .setup(|app| {
+            // Auto-boot core-engine sidecar in the background as soon as the desktop app opens
+            // so the UI Network Status Indicator, Room Lobby, and Model Catalog populate immediately.
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let state = app_handle.state::<PythonCoreState>();
+                let _ = ensure_core_spawned(&state);
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_python_core,
             stop_python_core,

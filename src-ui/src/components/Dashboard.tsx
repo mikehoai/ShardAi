@@ -196,7 +196,9 @@ export const Dashboard: React.FC = () => {
     }
   }, []);
 
-  const fetchNetworkStatus = useCallback(async (): Promise<void> => {
+  const engineSyncedRef = useRef<boolean>(false);
+
+  const fetchNetworkStatus = useCallback(async (): Promise<boolean> => {
     try {
       const res = await fetch(`${LOCAL_ENGINE_ROOT}/network-status`);
       if (res.ok) {
@@ -210,23 +212,14 @@ export const Dashboard: React.FC = () => {
           setLanPeersCount(
             typeof data.lan_peers_count === "number" ? data.lan_peers_count : 0
           );
+          return true;
         }
       }
     } catch {
-      // Engine not reachable yet; keep the last known indicator
+      // Engine still booting/unpacking; keep waiting silently
     }
+    return false;
   }, []);
-
-  // Network Status Indicator: probe on mount and every 10s (Cloud -> LAN -> Solo)
-  useEffect(() => {
-    void fetchNetworkStatus();
-    const timerId = window.setInterval(() => {
-      void fetchNetworkStatus();
-    }, NETWORK_STATUS_POLL_MS);
-    return () => {
-      window.clearInterval(timerId);
-    };
-  }, [fetchNetworkStatus]);
 
   const fetchModelCatalog = useCallback(async (): Promise<void> => {
     setIsLoadingCatalog(true);
@@ -262,6 +255,29 @@ export const Dashboard: React.FC = () => {
       setIsLoadingCatalog(false);
     }
   }, []);
+
+  // Network Status Indicator: fast 2s poll while engine is unpacking, 10s once connected
+  useEffect(() => {
+    let cancelled = false;
+    const pollMs = networkStatus === null ? 2000 : NETWORK_STATUS_POLL_MS;
+
+    const tick = async (): Promise<void> => {
+      const connected = await fetchNetworkStatus();
+      if (!cancelled && connected && !engineSyncedRef.current) {
+        engineSyncedRef.current = true;
+        void Promise.all([fetchAvailableRooms(), fetchModelCatalog()]);
+      }
+    };
+
+    void tick();
+    const timerId = window.setInterval(() => {
+      void tick();
+    }, pollMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [networkStatus, fetchNetworkStatus, fetchAvailableRooms, fetchModelCatalog]);
 
   const applyNodeNetworkFields = (statusData: NodeStatusResponse): void => {
     if (statusData.network_status) {
@@ -697,16 +713,20 @@ export const Dashboard: React.FC = () => {
     setErrorMessage(null);
     try {
       setStatusMessage("Revoking session token & releasing RAM/VRAM shards...");
+      let stoppedViaApi = false;
       try {
-        await fetch(`${LOCAL_ENGINE_ROOT}/stop-node`, {
+        const stopRes = await fetch(`${LOCAL_ENGINE_ROOT}/stop-node`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
+        stoppedViaApi = stopRes.ok;
       } catch {
-        // Proceed to terminate Python process even if HTTP endpoint is unreachable
+        // Proceed to terminate Python process if HTTP endpoint is unreachable
       }
 
-      const stopMsg = await invokeTauriCommand<string>("stop_python_core");
+      const stopMsg = stoppedViaApi
+        ? "Node stopped & shards released (Core Engine ready)."
+        : await invokeTauriCommand<string>("stop_python_core");
       setIsSharing(false);
       setSessionToken(null);
       setAssignedRole("primary");
@@ -878,7 +898,7 @@ export const Dashboard: React.FC = () => {
                 ? NETWORK_STATUS_META[networkStatus]
                 : {
                     icon: "⚪",
-                    label: "Checking Network...",
+                    label: "Starting Engine...",
                     color: "#475569",
                     background: "#f8fafc",
                     border: "#cbd5e1",
@@ -920,7 +940,7 @@ export const Dashboard: React.FC = () => {
                 color: isSharing ? "#15803d" : "#475569",
               }}
             >
-              {isSharing ? "ACTIVE" : "OFFLINE"}
+              {isSharing ? "ACTIVE" : "STANDBY"}
             </span>
           </div>
         </div>
