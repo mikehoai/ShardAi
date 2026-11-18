@@ -7,7 +7,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{Manager, State, WindowEvent};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, State, WindowEvent,
+};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -314,23 +318,101 @@ fn get_available_ram_gb() -> Result<f64, String> {
     }
 }
 
+#[tauri::command]
+fn window_minimize(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_toggle_maximize(window: tauri::Window) -> Result<bool, String> {
+    let is_max = window.is_maximized().map_err(|e| e.to_string())?;
+    if is_max {
+        window.unmaximize().map_err(|e| e.to_string())?;
+        Ok(false)
+    } else {
+        window.maximize().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+fn window_close(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let state = app_handle.state::<PythonCoreState>();
+    let _ = terminate_child_process(&state);
+    app_handle.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn window_start_drag(window: tauri::Window) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(PythonCoreState::default())
         .setup(|app| {
-            // Auto-boot core-engine sidecar in the background as soon as the desktop app opens
-            // so the UI Network Status Indicator, Room Lobby, and Model Catalog populate immediately.
+            // 1. Auto-boot core-engine sidecar in the background as soon as the desktop app opens
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let state = app_handle.state::<PythonCoreState>();
                 let _ = ensure_core_spawned(&state);
             });
+
+            // 2. Native System Tray icon & menu (Windows taskbar tray / macOS menu bar)
+            let show_item = MenuItem::with_id(app, "tray_show", "Show ShardAi", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "tray_quit", "Quit ShardAi", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let mut tray_builder = TrayIconBuilder::new()
+                .menu(&tray_menu)
+                .tooltip("ShardAi — P2P AI Gateway")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "tray_show" => {
+                        if let Some(win) = app.get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.unminimize();
+                            let _ = win.set_focus();
+                        }
+                    }
+                    "tray_quit" => {
+                        let state = app.state::<PythonCoreState>();
+                        let _ = terminate_child_process(&state);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(win) = app.get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.unminimize();
+                            let _ = win.set_focus();
+                        }
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+            tray_builder.build(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             start_python_core,
             stop_python_core,
-            get_available_ram_gb
+            get_available_ram_gb,
+            window_minimize,
+            window_toggle_maximize,
+            window_close,
+            window_start_drag
         ])
         .on_window_event(|window, event| {
             if matches!(

@@ -50,6 +50,8 @@ const NETWORK_STATUS_META: Record<
 };
 
 type ModelTab = "catalog" | "custom" | "local";
+type ThemeMode = "system" | "light" | "dark";
+type NavSection = "overview" | "node" | "rooms" | "credentials";
 
 function inferCustomSourceType(rawInput: string): ModelSourceType {
   const lowered = rawInput.trim().toLowerCase();
@@ -108,6 +110,36 @@ async function invokeTauriCommand<T>(
 }
 
 export const Dashboard: React.FC = () => {
+  // Native Desktop Shell State (Navigation + OS/User Theme)
+  const [activeSection, setActiveSection] = useState<NavSection>("overview");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    try {
+      const saved = window.localStorage.getItem("shardai_theme");
+      if (saved === "light" || saved === "dark" || saved === "system") {
+        return saved;
+      }
+    } catch {
+      // Ignore storage access errors in restricted environments
+    }
+    return "system";
+  });
+  const [isMaximized, setIsMaximized] = useState<boolean>(false);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", themeMode);
+    try {
+      window.localStorage.setItem("shardai_theme", themeMode);
+    } catch {
+      // Ignore storage write errors
+    }
+  }, [themeMode]);
+
+  const cycleThemeMode = (): void => {
+    setThemeMode((prev) =>
+      prev === "system" ? "dark" : prev === "dark" ? "light" : "system"
+    );
+  };
+
   // Network Rooms Lobby State
   const [availableRooms, setAvailableRooms] = useState<RoomLobbyItem[]>([]);
   const [isLoadingRooms, setIsLoadingRooms] = useState<boolean>(false);
@@ -167,6 +199,7 @@ export const Dashboard: React.FC = () => {
   );
   const [coveragePercent, setCoveragePercent] = useState<number>(0);
   const [isSwarmReady, setIsSwarmReady] = useState<boolean>(false);
+  const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState<string>(
     "Idle — Select a room from the Lobby or configure your own node below."
   );
@@ -285,6 +318,7 @@ export const Dashboard: React.FC = () => {
     }
     setSsdOffloadActive(Boolean(statusData.ssd_offload_active));
     setModelFingerprint(statusData.model_fingerprint ?? null);
+    setConnectedPeersCount(statusData.connected_peers_count ?? 0);
   };
 
   // Public/Cloud rooms cannot be fetched while offline: hide the Lobby list in LAN/Solo mode
@@ -735,6 +769,7 @@ export const Dashboard: React.FC = () => {
       setIsSwarmReady(false);
       setSsdOffloadActive(false);
       setModelFingerprint(null);
+      setConnectedPeersCount(0);
       setDownloadProgress(null);
       setDownloadStatusMsg("");
       setStatusMessage(`Stopped — ${stopMsg}`);
@@ -848,1536 +883,1409 @@ export const Dashboard: React.FC = () => {
     `  }'`,
   ].join("\n");
 
+  const showNodeConfig = activeSection === "overview" || activeSection === "node";
+  const showRooms = activeSection === "overview" || activeSection === "rooms";
+  const showCredentials =
+    activeSection === "overview" || activeSection === "credentials";
+
+  const themeLabel =
+    themeMode === "system" ? "Auto" : themeMode === "dark" ? "Dark" : "Light";
+
   return (
-    <section
-      aria-label="ShardAi P2P AI Gateway"
-      style={{
-        maxWidth: "720px",
-        margin: "32px auto",
-        padding: "28px",
-        borderRadius: "14px",
-        border: "1px solid #e2e8f0",
-        fontFamily: "system-ui, -apple-system, sans-serif",
-        backgroundColor: "#ffffff",
-        color: "#0f172a",
-        boxShadow: "0 6px 20px rgba(15, 23, 42, 0.06)",
-      }}
-    >
-      <header style={{ marginBottom: "22px" }}>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: "8px",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <img
-              src="/logo.png"
-              alt="ShardAi Logo"
-              data-testid="shardai-logo"
-              style={{
-                width: "36px",
-                height: "36px",
-                borderRadius: "8px",
-                border: "1px solid #e2e8f0",
-                objectFit: "contain",
-                backgroundColor: "#ffffff",
-                padding: "2px",
-              }}
-            />
-            <h1 style={{ fontSize: "1.4rem", margin: 0, fontWeight: 700 }}>
-              ShardAi Gateway
-            </h1>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            {(() => {
-              const meta = networkStatus
-                ? NETWORK_STATUS_META[networkStatus]
-                : {
-                    icon: "⚪",
-                    label: "Starting Engine...",
-                    color: "#475569",
-                    background: "#f8fafc",
-                    border: "#cbd5e1",
-                  };
-              return (
-                <span
-                  data-testid="network-status-indicator"
-                  title={
-                    networkStatus === "lan_only"
-                      ? `${lanPeersCount} LAN peer(s) discovered via mDNS/zeroconf`
-                      : meta.label
-                  }
-                  style={{
-                    fontSize: "0.75rem",
-                    fontWeight: 600,
-                    padding: "4px 10px",
-                    borderRadius: "999px",
-                    backgroundColor: meta.background,
-                    color: meta.color,
-                    border: `1px solid ${meta.border}`,
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {meta.icon} {meta.label}
-                  {networkStatus === "lan_only" && lanPeersCount > 0
-                    ? ` (${lanPeersCount})`
-                    : ""}
-                </span>
-              );
-            })()}
-            <span
-              data-testid="gateway-badge"
-              style={{
-                fontSize: "0.75rem",
-                fontWeight: 600,
-                padding: "4px 10px",
-                borderRadius: "999px",
-                backgroundColor: isSharing ? "#dcfce7" : "#f1f5f9",
-                color: isSharing ? "#15803d" : "#475569",
-              }}
-            >
-              {isSharing ? "ACTIVE" : "STANDBY"}
-            </span>
-          </div>
-        </div>
-        <p style={{ margin: "6px 0 0 0", fontSize: "0.85rem", color: "#64748b" }}>
-          Discover active compute rooms or launch your own P2P OpenAI-compatible gateway.
-        </p>
-      </header>
-
-      {/* ===================================================================== */}
-      {/* 1. Network Rooms Lobby                                                */}
-      {/* ===================================================================== */}
-      <div
-        data-testid="network-rooms-lobby"
-        style={{
-          marginBottom: "24px",
-          padding: "16px",
-          borderRadius: "10px",
-          backgroundColor: "#f8fafc",
-          border: "1px solid #e2e8f0",
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: "8px",
-            marginBottom: "12px",
-          }}
-        >
-          <h2 style={{ fontSize: "0.95rem", margin: 0, fontWeight: 700 }}>
-            Network Rooms Lobby
-          </h2>
-          <div style={{ display: "flex", gap: "8px" }}>
-            <button
-              type="button"
-              data-testid="refresh-rooms-btn"
-              onClick={() => {
-                void fetchAvailableRooms();
-                void fetchNetworkStatus();
-              }}
-              disabled={isLoadingRooms}
-              style={{
-                padding: "6px 12px",
-                fontSize: "0.78rem",
-                fontWeight: 600,
-                borderRadius: "6px",
-                border: "1px solid #cbd5e1",
-                backgroundColor: "#ffffff",
-                color: "#334155",
-                cursor: isLoadingRooms ? "wait" : "pointer",
-              }}
-            >
-              {isLoadingRooms ? "Scanning..." : "Refresh"}
-            </button>
-            <button
-              type="button"
-              data-testid="create-room-modal-btn"
-              disabled={isSharing || isBusy}
-              onClick={() => setShowRoomModal(true)}
-              style={{
-                padding: "6px 12px",
-                fontSize: "0.78rem",
-                fontWeight: 600,
-                borderRadius: "6px",
-                border: "none",
-                backgroundColor: "#0f172a",
-                color: "#ffffff",
-                cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-              }}
-            >
-              Create New Room / Join Unlisted
-            </button>
-          </div>
-        </div>
-
-        {isCloudOffline ? (
-          <div
-            data-testid="offline-rooms-hidden-notice"
-            style={{
-              padding: "14px",
-              borderRadius: "8px",
-              backgroundColor: "#ffffff",
-              border: "1px dashed #cbd5e1",
-              fontSize: "0.82rem",
-              color: "#475569",
-            }}
-          >
-            {networkStatus === "lan_only" ? (
-              <>
-                <div style={{ fontWeight: 600, color: "#854d0e", marginBottom: "6px" }}>
-                  🟡 Public Cloud Rooms hidden in LAN Only mode (Cloudflare Tracker unreachable).
-                </div>
-                {availableRooms.filter((r) => r.network_scope === "lan").length > 0 ? (
-                  <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "8px" }}>
-                    {availableRooms
-                      .filter((r) => r.network_scope === "lan")
-                      .map((room) => (
-                        <div
-                          key={room.room_id}
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                            padding: "8px 10px",
-                            borderRadius: "6px",
-                            backgroundColor: "#fefce8",
-                            border: "1px solid #fde047",
-                          }}
-                        >
-                          <span>
-                            <strong>{room.room_id}</strong> ({room.model}) — {room.nodes_online} LAN node(s), {room.total_shared_ram_gb} GB
-                          </span>
-                          <button
-                            type="button"
-                            data-testid={`join-room-${room.room_id}`}
-                            disabled={isSharing || isBusy}
-                            onClick={() => handleJoinLobbyRoom(room)}
-                            style={{
-                              padding: "4px 10px",
-                              fontSize: "0.75rem",
-                              fontWeight: 600,
-                              borderRadius: "6px",
-                              border: "none",
-                              backgroundColor: "#2563eb",
-                              color: "#ffffff",
-                              cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            Join LAN
-                          </button>
-                        </div>
-                      ))}
-                  </div>
-                ) : (
-                  <span>Configure a room below or wait for mDNS/Zeroconf LAN peers.</span>
-                )}
-              </>
-            ) : (
-              <span>
-                🔴 <strong>Offline (Solo Mode)</strong> — Public Rooms list is hidden while offline. Click{" "}
-                <strong>Start Sharing &amp; Join Room</strong> below to run standalone (with optional SSD Offloading).
-              </span>
-            )}
-          </div>
-        ) : (
-        <div style={{ overflowX: "auto" }}>
-          <table
-            data-testid="rooms-lobby-table"
-            style={{
-              width: "100%",
-              borderCollapse: "collapse",
-              fontSize: "0.82rem",
-              backgroundColor: "#ffffff",
-              borderRadius: "8px",
-              overflow: "hidden",
-              border: "1px solid #e2e8f0",
-            }}
-          >
-            <thead>
-              <tr style={{ backgroundColor: "#f1f5f9", textAlign: "left", color: "#475569" }}>
-                <th style={{ padding: "8px 10px" }}>Room Name</th>
-                <th style={{ padding: "8px 10px" }}>Model</th>
-                <th style={{ padding: "8px 10px" }}>Nodes Online</th>
-                <th style={{ padding: "8px 10px" }}>Total Shared RAM</th>
-                <th style={{ padding: "8px 10px" }}>Resources</th>
-                <th style={{ padding: "8px 10px" }}>Status</th>
-                <th style={{ padding: "8px 10px", textAlign: "right" }}>Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {availableRooms.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={7}
-                    style={{
-                      padding: "16px",
-                      textAlign: "center",
-                      color: "#64748b",
-                    }}
-                  >
-                    No active rooms discovered yet. Click "Refresh" or start sharing below.
-                  </td>
-                </tr>
-              ) : (
-                availableRooms.map((room) => {
-                  const coverage = room.coverage_percent ?? 100;
-                  const redundancy = room.redundancy_factor ?? 1;
-                  const isReady = coverage >= 100;
-                  return (
-                  <tr key={room.room_id} style={{ borderTop: "1px solid #f1f5f9" }}>
-                    <td style={{ padding: "9px 10px", fontWeight: 600 }}>
-                      {room.room_id}{" "}
-                      <span
-                        style={{
-                          fontSize: "0.68rem",
-                          padding: "2px 6px",
-                          borderRadius: "4px",
-                          backgroundColor:
-                            room.network_scope === "lan" ? "#dbeafe" : "#e2e8f0",
-                          color: "#1e40af",
-                          marginLeft: "4px",
-                        }}
-                      >
-                        {room.network_scope.toUpperCase()}
-                      </span>
-                    </td>
-                    <td style={{ padding: "9px 10px", color: "#334155" }}>{room.model}</td>
-                    <td style={{ padding: "9px 10px" }}>{room.nodes_online}</td>
-                    <td style={{ padding: "9px 10px" }}>{room.total_shared_ram_gb} GB</td>
-                    <td style={{ padding: "9px 10px" }}>
-                      <span
-                        data-testid={`room-coverage-${room.room_id}`}
-                        style={{
-                          display: "inline-block",
-                          padding: "3px 8px",
-                          borderRadius: "999px",
-                          fontSize: "0.73rem",
-                          fontWeight: 600,
-                          backgroundColor: isReady ? "#dcfce7" : "#fef3c7",
-                          color: isReady ? "#166534" : "#92400e",
-                          border: isReady ? "1px solid #86efac" : "1px solid #fcd34d",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {isReady
-                          ? `✅ Sẵn sàng (Dự phòng: ${redundancy}x)`
-                          : `⚠️ Đang gom RAM: ${Math.round(coverage)}%`}
-                      </span>
-                    </td>
-                    <td style={{ padding: "9px 10px" }}>
-                      {room.is_private ? "🔒 Private" : "Public"}
-                    </td>
-                    <td style={{ padding: "9px 10px", textAlign: "right" }}>
-                      <button
-                        type="button"
-                        data-testid={`join-room-${room.room_id}`}
-                        disabled={isSharing || isBusy}
-                        onClick={() => handleJoinLobbyRoom(room)}
-                        style={{
-                          padding: "5px 12px",
-                          fontSize: "0.76rem",
-                          fontWeight: 600,
-                          borderRadius: "6px",
-                          border: "none",
-                          backgroundColor: "#2563eb",
-                          color: "#ffffff",
-                          cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-                          opacity: isSharing || isBusy ? 0.5 : 1,
-                        }}
-                      >
-                        Join
-                      </button>
-                    </td>
-                  </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-        )}
-      </div>
-
-      {/* ===================================================================== */}
-      {/* Private Room Key Prompt Modal                                         */}
-      {/* ===================================================================== */}
-      {pendingPrivateRoom !== null && (
-        <div
-          role="dialog"
-          aria-label="Enter Private Room Key"
-          data-testid="private-room-key-modal"
-          style={{
-            marginBottom: "22px",
-            padding: "16px",
-            borderRadius: "10px",
-            backgroundColor: "#fffbeb",
-            border: "1px solid #fcd34d",
-          }}
-        >
-          <form onSubmit={handleConfirmPrivateJoin}>
-            <h3 style={{ margin: "0 0 8px 0", fontSize: "0.95rem" }}>
-              🔒 Enter Room Key for "{pendingPrivateRoom.room_id}"
-            </h3>
-            <p style={{ margin: "0 0 10px 0", fontSize: "0.8rem", color: "#78350f" }}>
-              Key is SHA-256 hashed locally before verifying with the Signaling Tracker.
-            </p>
-            <div style={{ display: "flex", gap: "8px" }}>
-              <input
-                type="password"
-                data-testid="private-key-modal-input"
-                value={privateKeyInput}
-                onChange={(e) => setPrivateKeyInput(e.target.value)}
-                placeholder="Enter secret room key..."
-                autoFocus
-                style={{
-                  flex: 1,
-                  padding: "8px 10px",
-                  borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
-                  fontSize: "0.85rem",
-                }}
-              />
-              <button
-                type="submit"
-                data-testid="confirm-private-join-btn"
-                style={{
-                  padding: "8px 14px",
-                  borderRadius: "6px",
-                  border: "none",
-                  backgroundColor: "#2563eb",
-                  color: "#ffffff",
-                  fontWeight: 600,
-                  fontSize: "0.82rem",
-                  cursor: "pointer",
-                }}
-              >
-                Unlock & Join
-              </button>
-              <button
-                type="button"
-                onClick={() => setPendingPrivateRoom(null)}
-                style={{
-                  padding: "8px 12px",
-                  borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
-                  backgroundColor: "#ffffff",
-                  fontSize: "0.82rem",
-                  cursor: "pointer",
-                }}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* ===================================================================== */}
-      {/* Create New Room / Join Unlisted Modal                                 */}
-      {/* ===================================================================== */}
-      {showRoomModal && (
-        <div
-          role="dialog"
-          aria-label="Create New Room or Join Unlisted"
-          data-testid="create-room-modal"
-          style={{
-            marginBottom: "22px",
-            padding: "18px",
-            borderRadius: "10px",
-            backgroundColor: "#f8fafc",
-            border: "1px solid #94a3b8",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "12px" }}>
-            <h3 style={{ margin: 0, fontSize: "0.95rem", fontWeight: 700 }}>
-              Create New Room / Join Unlisted
-            </h3>
-            <button
-              type="button"
-              onClick={() => setShowRoomModal(false)}
-              style={{
-                border: "none",
-                background: "transparent",
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-            >
-              ✕
-            </button>
-          </div>
-
-          <form onSubmit={handleCreateOrJoinUnlisted}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "10px" }}>
-              <div>
-                <label style={{ display: "block", fontSize: "0.78rem", fontWeight: 600, marginBottom: "4px" }}>
-                  New Room Name
-                </label>
-                <input
-                  type="text"
-                  data-testid="modal-room-name-input"
-                  value={modalRoomId}
-                  onChange={(e) => setModalRoomId(e.target.value)}
-                  placeholder="my-private-cluster"
-                  style={{
-                    width: "100%",
-                    boxSizing: "border-box",
-                    padding: "8px 10px",
-                    borderRadius: "6px",
-                    border: "1px solid #cbd5e1",
-                    fontSize: "0.84rem",
-                  }}
-                />
-              </div>
-              <div>
-                <label style={{ display: "block", fontSize: "0.78rem", fontWeight: 600, marginBottom: "4px" }}>
-                  Room Key (Optional — 🔒 Private)
-                </label>
-                <input
-                  type="text"
-                  data-testid="modal-room-key-input"
-                  value={modalRoomKey}
-                  onChange={(e) => setModalRoomKey(e.target.value)}
-                  placeholder="Leave blank for Public"
-                  style={{
-                    width: "100%",
-                    boxSizing: "border-box",
-                    padding: "8px 10px",
-                    borderRadius: "6px",
-                    border: "1px solid #cbd5e1",
-                    fontSize: "0.84rem",
-                  }}
-                />
-              </div>
-            </div>
-
-            <div style={{ marginBottom: "10px" }}>
-              <label style={{ display: "block", fontSize: "0.78rem", fontWeight: 600, marginBottom: "4px" }}>
-                Model
-              </label>
-              <input
-                type="text"
-                list="suggested-models"
-                value={modalModel}
-                onChange={(e) => setModalModel(e.target.value)}
-                style={{
-                  width: "100%",
-                  boxSizing: "border-box",
-                  padding: "8px 10px",
-                  borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
-                  fontSize: "0.84rem",
-                }}
-              />
-            </div>
-
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                fontSize: "0.82rem",
-                marginBottom: "12px",
-                cursor: "pointer",
-              }}
-            >
-              <input
-                type="checkbox"
-                data-testid="modal-unlisted-checkbox"
-                checked={modalUnlisted}
-                onChange={(e) => setModalUnlisted(e.target.checked)}
-              />
-              Unlisted Room (hide from public Network Rooms Lobby)
-            </label>
-
-            {/* Invite String Copy Box */}
-            <div style={{ marginBottom: "12px" }}>
-              <span style={{ display: "block", fontSize: "0.75rem", fontWeight: 600, color: "#64748b", marginBottom: "4px" }}>
-                Invite String (Share with teammates)
-              </span>
-              <div style={{ display: "flex", gap: "8px" }}>
-                <code
-                  data-testid="invite-string-preview"
-                  style={{
-                    flex: 1,
-                    padding: "7px 10px",
-                    borderRadius: "6px",
-                    backgroundColor: "#ffffff",
-                    border: "1px solid #cbd5e1",
-                    fontSize: "0.8rem",
-                  }}
-                >
-                  {generatedInviteString}
-                </code>
-                <button
-                  type="button"
-                  onClick={() => void handleCopy("invite", generatedInviteString)}
-                  style={{
-                    padding: "7px 12px",
-                    borderRadius: "6px",
-                    border: "1px solid #cbd5e1",
-                    backgroundColor: "#ffffff",
-                    fontSize: "0.78rem",
-                    fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  {copiedField === "invite" ? "Copied!" : "Copy Invite"}
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              data-testid="modal-create-join-btn"
-              style={{
-                width: "100%",
-                padding: "9px 14px",
-                borderRadius: "6px",
-                border: "none",
-                backgroundColor: "#2563eb",
-                color: "#ffffff",
-                fontWeight: 600,
-                fontSize: "0.85rem",
-                cursor: "pointer",
-              }}
-            >
-              Create & Start Sharing
-            </button>
-          </form>
-
-          {/* Paste Invite String Quick Join */}
-          <div style={{ marginTop: "14px", paddingTop: "12px", borderTop: "1px solid #e2e8f0" }}>
-            <span style={{ display: "block", fontSize: "0.75rem", fontWeight: 600, color: "#64748b", marginBottom: "6px" }}>
-              Or Paste Invite String (RoomID | Key)
-            </span>
-            <div style={{ display: "flex", gap: "8px" }}>
-              <input
-                type="text"
-                data-testid="paste-invite-input"
-                value={invitePasteInput}
-                onChange={(e) => setInvitePasteInput(e.target.value)}
-                placeholder="e.g. studio-room-1 | secret-pass"
-                style={{
-                  flex: 1,
-                  padding: "7px 10px",
-                  borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
-                  fontSize: "0.82rem",
-                }}
-              />
-              <button
-                type="button"
-                onClick={handleJoinByInviteString}
-                style={{
-                  padding: "7px 14px",
-                  borderRadius: "6px",
-                  border: "none",
-                  backgroundColor: "#0f172a",
-                  color: "#ffffff",
-                  fontWeight: 600,
-                  fontSize: "0.8rem",
-                  cursor: "pointer",
-                }}
-              >
-                Join Unlisted
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ===================================================================== */}
-      {/* 2. Node Configuration Form (3-Tab Model Selector)                     */}
-      {/* ===================================================================== */}
-      <div style={{ marginBottom: "18px" }}>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: "8px",
-            marginBottom: "8px",
-          }}
-        >
-          <span style={{ fontSize: "0.875rem", fontWeight: 600 }}>Model Source</span>
-          {catalogSource !== null && modelTab === "catalog" && (
-            <span
-              data-testid="catalog-source-badge"
-              style={{
-                fontSize: "0.72rem",
-                fontWeight: 600,
-                padding: "2px 8px",
-                borderRadius: "999px",
-                backgroundColor: catalogSource === "cloud" ? "#dcfce7" : "#fefce8",
-                color: catalogSource === "cloud" ? "#166534" : "#854d0e",
-                border:
-                  catalogSource === "cloud" ? "1px solid #86efac" : "1px solid #fde047",
-              }}
-            >
-              {catalogSource === "cloud"
-                ? "Synced from Cloud"
-                : catalogSource === "cache"
-                  ? "Loaded from ~/.shardai/models_cache.json"
-                  : "Default Offline Catalog"}
-            </span>
-          )}
-        </div>
-
-        {/* 3 Model Selection Tabs */}
-        <div
-          role="tablist"
-          aria-label="Model Source Tabs"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr 1fr",
-            gap: "6px",
-            marginBottom: "10px",
-          }}
-        >
-          {(
-            [
-              { id: "catalog", label: "Online Catalog" },
-              { id: "custom", label: "Custom HF / URL" },
-              { id: "local", label: "Local File" },
-            ] as const
-          ).map((tab) => {
-            const active = modelTab === tab.id;
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                data-testid={`tab-${tab.id}`}
-                disabled={isSharing || isBusy}
-                onClick={() => {
-                  setModelTab(tab.id);
-                  setDownloadProgress(null);
-                  setDownloadStatusMsg("");
-                }}
-                style={{
-                  padding: "8px 10px",
-                  fontSize: "0.8rem",
-                  fontWeight: 600,
-                  borderRadius: "8px",
-                  border: active ? "1px solid #2563eb" : "1px solid #cbd5e1",
-                  backgroundColor: active ? "#eff6ff" : "#f8fafc",
-                  color: active ? "#1d4ed8" : "#475569",
-                  cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-                }}
-              >
-                {tab.label}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Tab 1: Online Catalog */}
-        {modelTab === "catalog" && (
-          <div data-testid="panel-catalog" style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-            <select
-              aria-label="Online Model Catalog"
-              data-testid="catalog-model-select"
-              value={selectedCatalogId}
-              disabled={isSharing || isBusy || catalogModels.length === 0}
-              onChange={(e) => {
-                const chosenId = e.target.value;
-                setSelectedCatalogId(chosenId);
-                const found = catalogModels.find((m) => m.id === chosenId);
-                if (found) {
-                  setModelInput(found.repo_id);
-                }
-                setDownloadProgress(null);
-                setDownloadStatusMsg("");
-              }}
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: "8px",
-                border: "1px solid #cbd5e1",
-                fontSize: "0.875rem",
-                backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-                color: "#0f172a",
-              }}
-            >
-              {catalogModels.length === 0 ? (
-                <option value="">
-                  {isLoadingCatalog ? "Loading model catalog..." : "No catalog models loaded yet — click Refresh"}
-                </option>
-              ) : (
-                catalogModels.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name} (~{item.estimated_ram_gb} GB)
-                  </option>
-                ))
-              )}
-            </select>
-            <button
-              type="button"
-              data-testid="refresh-catalog-btn"
-              onClick={() => void fetchModelCatalog()}
-              disabled={isLoadingCatalog || isSharing || isBusy}
-              style={{
-                padding: "10px 14px",
-                fontSize: "0.8rem",
-                fontWeight: 600,
-                borderRadius: "8px",
-                border: "1px solid #cbd5e1",
-                backgroundColor: "#ffffff",
-                color: "#334155",
-                cursor: isLoadingCatalog || isSharing || isBusy ? "wait" : "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {isLoadingCatalog ? "Syncing..." : "Refresh"}
-            </button>
-          </div>
-        )}
-
-        {/* Tab 2: Custom HF Repo / External Direct URL */}
-        {modelTab === "custom" && (
-          <div data-testid="panel-custom" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-            <input
-              id="model-input"
-              data-testid="model-input"
-              type="text"
-              value={modelInput}
-              disabled={isSharing || isBusy}
-              onChange={(e) => {
-                setModelInput(e.target.value);
-                setDownloadProgress(null);
-                setDownloadStatusMsg("");
-              }}
-              placeholder="HuggingFace Repo (e.g. bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) or Direct .gguf URL"
-              style={{
-                width: "100%",
-                boxSizing: "border-box",
-                padding: "10px 12px",
-                borderRadius: "8px",
-                border: "1px solid #cbd5e1",
-                fontSize: "0.875rem",
-                backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-                color: "#0f172a",
-              }}
-            />
-            {inferCustomSourceType(modelInput) === "huggingface" && (
-              <input
-                type="text"
-                data-testid="custom-filename-input"
-                value={customFilename}
-                disabled={isSharing || isBusy}
-                onChange={(e) => setCustomFilename(e.target.value)}
-                placeholder="Optional .gguf filename (leave blank to auto-pick Q4_K_M)"
-                style={{
-                  width: "100%",
-                  boxSizing: "border-box",
-                  padding: "8px 12px",
-                  borderRadius: "8px",
-                  border: "1px solid #e2e8f0",
-                  fontSize: "0.8rem",
-                  backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-                  color: "#334155",
-                }}
-              />
-            )}
-          </div>
-        )}
-
-        {/* Tab 3: Local File (.gguf via Tauri File Dialog) */}
-        {modelTab === "local" && (
-          <div data-testid="panel-local" style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-            <input
-              type="text"
-              data-testid="local-file-input"
-              value={localFilePath}
-              disabled={isSharing || isBusy}
-              onChange={(e) => {
-                setLocalFilePath(e.target.value);
-                setDownloadProgress(null);
-                setDownloadStatusMsg("");
-              }}
-              placeholder="Select or paste absolute path to local .gguf file..."
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: "8px",
-                border: "1px solid #cbd5e1",
-                fontSize: "0.85rem",
-                backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-                color: "#0f172a",
-              }}
-            />
-            <input
-              ref={localFileInputRef}
-              type="file"
-              accept=".gguf"
-              aria-hidden="true"
-              tabIndex={-1}
-              style={{ display: "none" }}
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                  const fileWithPath = file as File & { path?: string };
-                  setLocalFilePath(fileWithPath.path ?? file.name);
-                  setDownloadProgress(null);
-                  setDownloadStatusMsg("");
-                }
-              }}
-            />
-            <button
-              type="button"
-              data-testid="browse-gguf-btn"
-              disabled={isSharing || isBusy}
-              onClick={() => void handleBrowseGgufFile()}
-              style={{
-                padding: "10px 14px",
-                fontSize: "0.8rem",
-                fontWeight: 600,
-                borderRadius: "8px",
-                border: "none",
-                backgroundColor: "#0f172a",
-                color: "#ffffff",
-                cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              Browse (.gguf)
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* RAM Slider */}
-      <div style={{ marginBottom: "20px" }}>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            marginBottom: "6px",
-          }}
-        >
-          <label htmlFor="ram-slider" style={{ fontSize: "0.875rem", fontWeight: 600 }}>
-            Shared RAM Contribution
-          </label>
-          <span
-            data-testid="selected-ram-label"
-            style={{ fontSize: "0.95rem", fontWeight: 700, color: "#2563eb" }}
-          >
-            {sharedRamGb} GB
-          </span>
-        </div>
-
-        <input
-          id="ram-slider"
-          type="range"
-          min={MIN_RAM_GB}
-          max={maxRamGb}
-          step={1}
-          value={sharedRamGb}
-          disabled={isSharing || isBusy}
-          onChange={(e) => setSharedRamGb(Number(e.target.value))}
-          style={{
-            width: "100%",
-            cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-          }}
-        />
-
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            fontSize: "0.75rem",
-            color: "#64748b",
-            marginTop: "4px",
-          }}
-        >
-          <span>{MIN_RAM_GB} GB</span>
-          {availableRamGb !== null && (
-            <span data-testid="free-ram-note">
-              Free: {availableRamGb.toFixed(1)} GB (1 GB reserved for OS)
-            </span>
-          )}
-          <span>{maxRamGb} GB</span>
-        </div>
-
-        <label
-          htmlFor="ssd-offload-checkbox"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "8px",
-            marginTop: "10px",
-            padding: "8px 10px",
-            borderRadius: "8px",
-            backgroundColor: allowSsdOffload ? "#eff6ff" : "#f8fafc",
-            border: allowSsdOffload ? "1px solid #93c5fd" : "1px solid #e2e8f0",
-            fontSize: "0.8rem",
-            color: "#334155",
-            cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-          }}
-        >
-          <input
-            id="ssd-offload-checkbox"
-            data-testid="ssd-offload-checkbox"
-            type="checkbox"
-            checked={allowSsdOffload}
-            disabled={isSharing || isBusy}
-            onChange={(e) => setAllowSsdOffload(e.target.checked)}
-          />
-          <span>
-            Allow SSD Offloading (Slow but guarantees 100% run in Solo Mode)
-          </span>
-        </label>
-      </div>
-
-      {/* Network Mode (LAN / Internet), Room ID & Optional Room Key */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "1fr 1fr 1fr",
-          gap: "10px",
-          marginBottom: "20px",
-        }}
-      >
-        <div>
-          <span
-            style={{
-              display: "block",
-              fontSize: "0.85rem",
-              fontWeight: 600,
-              marginBottom: "6px",
-            }}
-          >
-            Network
-          </span>
-          <div style={{ display: "flex", gap: "6px" }}>
-            {(["lan", "internet"] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                data-testid={`network-mode-${mode}`}
-                disabled={isSharing || isBusy}
-                onClick={() => setNetworkMode(mode)}
-                style={{
-                  flex: 1,
-                  padding: "9px 6px",
-                  fontSize: "0.8rem",
-                  fontWeight: 600,
-                  borderRadius: "8px",
-                  border:
-                    networkMode === mode ? "1px solid #2563eb" : "1px solid #cbd5e1",
-                  backgroundColor: networkMode === mode ? "#eff6ff" : "#ffffff",
-                  color: networkMode === mode ? "#1d4ed8" : "#475569",
-                  cursor: isSharing || isBusy ? "not-allowed" : "pointer",
-                }}
-              >
-                {mode === "lan" ? "LAN" : "Internet"}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div>
-          <label
-            htmlFor="room-id-input"
-            style={{
-              display: "block",
-              fontSize: "0.85rem",
-              fontWeight: 600,
-              marginBottom: "6px",
-            }}
-          >
-            Room ID
-          </label>
-          <input
-            id="room-id-input"
-            data-testid="room-id-input"
-            type="text"
-            value={roomId}
-            disabled={isSharing || isBusy}
-            onChange={(e) => setRoomId(e.target.value)}
-            placeholder="public"
-            style={{
-              width: "100%",
-              boxSizing: "border-box",
-              padding: "9px 10px",
-              borderRadius: "8px",
-              border: "1px solid #cbd5e1",
-              fontSize: "0.85rem",
-              backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-              color: "#0f172a",
-            }}
-          />
-        </div>
-
-        <div>
-          <label
-            htmlFor="room-key-input"
-            style={{
-              display: "block",
-              fontSize: "0.85rem",
-              fontWeight: 600,
-              marginBottom: "6px",
-            }}
-          >
-            Room Key (Optional)
-          </label>
-          <input
-            id="room-key-input"
-            data-testid="room-key-input"
-            type="password"
-            value={roomKey}
-            disabled={isSharing || isBusy}
-            onChange={(e) => setRoomKey(e.target.value)}
-            placeholder="Public if blank"
-            style={{
-              width: "100%",
-              boxSizing: "border-box",
-              padding: "9px 10px",
-              borderRadius: "8px",
-              border: "1px solid #cbd5e1",
-              fontSize: "0.85rem",
-              backgroundColor: isSharing || isBusy ? "#f8fafc" : "#ffffff",
-              color: "#0f172a",
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Model Download Progress Bar */}
-      {downloadProgress !== null && (
-        <div style={{ marginBottom: "18px" }}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              fontSize: "0.8rem",
-              marginBottom: "6px",
-            }}
-          >
-            <span data-testid="model-download-status-msg" style={{ color: "#475569" }}>
-              {downloadStatusMsg || "Preparing model..."}
-            </span>
-            <span
-              data-testid="model-download-percent"
-              style={{ fontWeight: 600, color: "#2563eb" }}
-            >
-              {downloadProgress.toFixed(0)}%
-            </span>
-          </div>
-          <div
-            style={{
-              width: "100%",
-              height: "8px",
-              backgroundColor: "#e2e8f0",
-              borderRadius: "4px",
-              overflow: "hidden",
-            }}
-          >
-            <div
-              data-testid="model-download-progress-bar"
-              style={{
-                width: `${downloadProgress}%`,
-                height: "100%",
-                backgroundColor: downloadProgress >= 100 ? "#16a34a" : "#2563eb",
-                transition: "width 0.2s ease-in-out",
-              }}
-            />
-          </div>
-        </div>
-      )}
-
-      {/* Primary Action Button */}
-      <button
-        type="button"
-        data-testid="toggle-sharing-btn"
-        onClick={() => {
-          if (isSharing) {
-            void handleStopSharing();
-          } else {
-            void startSharingWithConfig();
+    <div className="native-shell" aria-label="ShardAi P2P AI Gateway">
+      {/* =================================================================== */}
+      {/* Custom Native OS Window Titlebar                                    */}
+      {/* =================================================================== */}
+      <header
+        className="native-titlebar"
+        data-tauri-drag-region
+        onMouseDown={(e) => {
+          if (
+            isTauriEnvironment() &&
+            e.button === 0 &&
+            !(e.target as HTMLElement).closest("button")
+          ) {
+            void invokeTauriCommand("window_start_drag");
           }
         }}
-        disabled={isBusy}
-        style={{
-          width: "100%",
-          padding: "12px 16px",
-          fontSize: "0.95rem",
-          fontWeight: 600,
-          color: "#ffffff",
-          backgroundColor: isSharing ? "#dc2626" : "#2563eb",
-          border: "none",
-          borderRadius: "8px",
-          cursor: isBusy ? "wait" : "pointer",
-          opacity: isBusy ? 0.7 : 1,
+        onDoubleClick={(e) => {
+          if (
+            isTauriEnvironment() &&
+            !(e.target as HTMLElement).closest("button")
+          ) {
+            void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) =>
+              setIsMaximized(Boolean(max))
+            );
+          }
         }}
       >
-        {isBusy
-          ? "Connecting..."
-          : isSharing
-            ? "Stop Sharing"
-            : "Start Sharing & Join Room"}
-      </button>
+        <div className="native-titlebar-left" data-tauri-drag-region>
+          <img
+            src="/logo.png"
+            alt="ShardAi Logo"
+            data-testid="shardai-logo"
+            className="native-titlebar-logo"
+          />
+          <span className="native-titlebar-title" data-tauri-drag-region>
+            ShardAi Gateway
+          </span>
+          <span className="native-titlebar-version">v0.1.0</span>
+        </div>
 
-      {/* ===================================================================== */}
-      {/* 3. Active Node Role & Session API Credentials Panel                   */}
-      {/* ===================================================================== */}
-      {isSharing && sessionToken && (
-        <div
-          data-testid="session-credentials-panel"
-          style={{
-            marginTop: "22px",
-            padding: "18px",
-            borderRadius: "10px",
-            backgroundColor: "#f8fafc",
-            border: "1px solid #cbd5e1",
-          }}
-        >
-          <div
-            data-testid="active-node-role-card"
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              padding: "10px 12px",
-              marginBottom: "14px",
-              borderRadius: "8px",
-              backgroundColor: assignedRole === "primary" ? "#eff6ff" : "#fffbeb",
-              border:
-                assignedRole === "primary" ? "1px solid #93c5fd" : "1px solid #fcd34d",
-            }}
-          >
-            <span
-              data-testid="active-node-role-label"
-              style={{
-                fontSize: "0.85rem",
-                fontWeight: 700,
-                color: assignedRole === "primary" ? "#1d4ed8" : "#92400e",
-              }}
-            >
-              {assignedRole === "primary"
-                ? `Role: Primary Seeder (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`
-                : `Role: Backup Node (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`}
-            </span>
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-              {modelFingerprint && (
-                <span
-                  data-testid="model-fingerprint-badge"
-                  title={`SHA-256 (10MB + size): ${modelFingerprint}`}
-                  style={{
-                    fontSize: "0.7rem",
-                    fontWeight: 600,
-                    padding: "2px 8px",
-                    borderRadius: "999px",
-                    backgroundColor: "#f1f5f9",
-                    color: "#334155",
-                    border: "1px solid #cbd5e1",
-                    fontFamily: "monospace",
-                  }}
-                >
-                  FP: {modelFingerprint.slice(0, 10)}
-                </span>
-              )}
-              {ssdOffloadActive && (
-                <span
-                  data-testid="ssd-offload-active-badge"
-                  style={{
-                    fontSize: "0.72rem",
-                    fontWeight: 600,
-                    padding: "2px 8px",
-                    borderRadius: "999px",
-                    backgroundColor: "#f3e8ff",
-                    color: "#6b21a8",
-                    border: "1px solid #d8b4fe",
-                  }}
-                >
-                  💾 SSD Offload (mmap)
-                </span>
-              )}
+        <div className="native-titlebar-right">
+          {(() => {
+            const meta = networkStatus
+              ? NETWORK_STATUS_META[networkStatus]
+              : {
+                  icon: "⚪",
+                  label: "Starting Engine...",
+                  color: "var(--text-secondary)",
+                  background: "var(--bg-surface-subtle)",
+                  border: "var(--border-strong)",
+                };
+            return (
               <span
+                data-testid="network-status-indicator"
+                title={
+                  networkStatus === "lan_only"
+                    ? `${lanPeersCount} LAN peer(s) discovered via mDNS/zeroconf`
+                    : meta.label
+                }
                 style={{
-                  fontSize: "0.72rem",
-                  fontWeight: 600,
-                  padding: "2px 8px",
-                  borderRadius: "999px",
-                  backgroundColor: assignedRole === "primary" ? "#dbeafe" : "#fef3c7",
-                  color: assignedRole === "primary" ? "#1e40af" : "#78350f",
-                }}
-              >
-                {assignedRole === "primary" ? "PRIMARY" : "BACKUP"}
-              </span>
-            </div>
-          </div>
-
-          <h2 style={{ fontSize: "0.95rem", margin: "0 0 12px 0", fontWeight: 700, color: "#0f172a" }}>
-            Session API Credentials
-          </h2>
-
-          <div style={{ marginBottom: "12px" }}>
-            <span style={{ display: "block", fontSize: "0.75rem", fontWeight: 600, color: "#64748b", marginBottom: "4px" }}>
-              OpenAI Base URL
-            </span>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-              <code
-                data-testid="gateway-base-url"
-                style={{
-                  flex: 1,
-                  padding: "7px 10px",
-                  borderRadius: "6px",
-                  backgroundColor: "#ffffff",
-                  border: "1px solid #e2e8f0",
-                  fontSize: "0.825rem",
-                  color: "#0f172a",
-                }}
-              >
-                {apiBaseUrl}
-              </code>
-              <button
-                type="button"
-                onClick={() => void handleCopy("baseUrl", apiBaseUrl)}
-                style={{
-                  padding: "7px 12px",
-                  fontSize: "0.78rem",
-                  fontWeight: 600,
-                  borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
-                  backgroundColor: "#ffffff",
-                  color: "#0f172a",
-                  cursor: "pointer",
-                }}
-              >
-                {copiedField === "baseUrl" ? "Copied!" : "Copy"}
-              </button>
-            </div>
-          </div>
-
-          <div style={{ marginBottom: "14px" }}>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                flexWrap: "wrap",
-                gap: "8px",
-                marginBottom: "6px",
-              }}
-            >
-              <span style={{ fontSize: "0.75rem", fontWeight: 600, color: "#64748b" }}>
-                API Key (Session Token)
-              </span>
-              <span
-                data-testid="api-readiness-badge"
-                style={{
-                  fontSize: "0.74rem",
+                  fontSize: "11.5px",
                   fontWeight: 600,
                   padding: "3px 9px",
                   borderRadius: "999px",
-                  backgroundColor:
-                    isSwarmReady && coveragePercent >= 100 ? "#dcfce7" : "#fef3c7",
-                  color: isSwarmReady && coveragePercent >= 100 ? "#166534" : "#92400e",
-                  border:
-                    isSwarmReady && coveragePercent >= 100
-                      ? "1px solid #86efac"
-                      : "1px solid #fcd34d",
-                }}
-              >
-                {isSwarmReady && coveragePercent >= 100
-                  ? "🟢 API Ready (Mạng lưới đã sẵn sàng nhận request)"
-                  : `🟡 API Standby (Đang chờ đủ RAM: ${Math.round(coveragePercent)}% - Chưa thể gọi model)`}
-              </span>
-            </div>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-              <code
-                data-testid="session-token-value"
-                style={{
-                  flex: 1,
-                  padding: "7px 10px",
-                  borderRadius: "6px",
-                  backgroundColor: "#ffffff",
-                  border: "1px solid #e2e8f0",
-                  fontSize: "0.8rem",
-                  color: "#0f172a",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
+                  backgroundColor: meta.background,
+                  color: meta.color,
+                  border: `1px solid ${meta.border}`,
                   whiteSpace: "nowrap",
                 }}
               >
-                {sessionToken}
-              </code>
+                {meta.icon} {meta.label}
+                {networkStatus === "lan_only" && lanPeersCount > 0
+                  ? ` (${lanPeersCount})`
+                  : ""}
+              </span>
+            );
+          })()}
+
+          <span
+            data-testid="gateway-badge"
+            style={{
+              fontSize: "11px",
+              fontWeight: 700,
+              padding: "3px 9px",
+              borderRadius: "999px",
+              backgroundColor: isSharing ? "var(--success-bg)" : "var(--bg-surface-hover)",
+              color: isSharing ? "var(--success-fg)" : "var(--text-secondary)",
+              border: `1px solid ${isSharing ? "var(--success-border)" : "var(--border-hairline)"}`,
+            }}
+          >
+            {isSharing ? "ACTIVE" : "STANDBY"}
+          </span>
+
+          <button
+            type="button"
+            data-testid="theme-toggle-btn"
+            className="native-btn"
+            style={{ padding: "3px 8px", fontSize: "11px" }}
+            onClick={cycleThemeMode}
+            title="Switch OS Theme (System / Dark / Light)"
+          >
+            {themeMode === "dark" ? "🌙" : themeMode === "light" ? "☀️" : "🖥️"} {themeLabel}
+          </button>
+
+          {isTauriEnvironment() && (
+            <div className="window-controls">
               <button
                 type="button"
-                onClick={() => void handleCopy("token", sessionToken)}
-                style={{
-                  padding: "7px 12px",
-                  fontSize: "0.78rem",
-                  fontWeight: 600,
-                  borderRadius: "6px",
-                  border: "1px solid #cbd5e1",
-                  backgroundColor: "#ffffff",
-                  color: "#0f172a",
-                  cursor: "pointer",
-                }}
+                aria-label="Minimize window"
+                className="window-caption-btn"
+                onClick={() => void invokeTauriCommand("window_minimize")}
               >
-                {copiedField === "token" ? "Copied!" : "Copy"}
+                ─
               </button>
-              {(!isSwarmReady || coveragePercent < 100) && (
+              <button
+                type="button"
+                aria-label="Maximize window"
+                className="window-caption-btn"
+                onClick={() =>
+                  void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) =>
+                    setIsMaximized(Boolean(max))
+                  )
+                }
+              >
+                {isMaximized ? "❐" : "□"}
+              </button>
+              <button
+                type="button"
+                aria-label="Close application"
+                className="window-caption-btn close"
+                onClick={() => void invokeTauriCommand("window_close")}
+              >
+                ✕
+              </button>
+            </div>
+          )}
+        </div>
+      </header>
+
+      {/* =================================================================== */}
+      {/* Desktop Split Body: Left Sidebar + Main Workspace                   */}
+      {/* =================================================================== */}
+      <div className="native-body">
+        <aside className="native-sidebar" aria-label="Primary Navigation">
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+            <nav>
+              <div className="sidebar-section-label">Workspace</div>
+              {(
+                [
+                  { id: "overview", icon: "⊞", label: "Overview" },
+                  { id: "node", icon: "⚙", label: "Node & Model" },
+                  { id: "rooms", icon: "🌐", label: "Rooms Lobby" },
+                  { id: "credentials", icon: "🔑", label: "API Gateway" },
+                ] as const
+              ).map((item) => (
                 <button
+                  key={item.id}
                   type="button"
-                  data-testid="copy-invite-code-btn"
-                  onClick={() =>
-                    void handleCopy(
-                      "activeInvite",
-                      roomKey.trim()
-                        ? `${roomId.trim() || "public"} | ${roomKey.trim()}`
-                        : roomId.trim() || "public"
-                    )
-                  }
-                  style={{
-                    padding: "7px 12px",
-                    fontSize: "0.78rem",
-                    fontWeight: 600,
-                    borderRadius: "6px",
-                    border: "1px solid #f59e0b",
-                    backgroundColor: "#fffbeb",
-                    color: "#92400e",
-                    cursor: "pointer",
-                    whiteSpace: "nowrap",
-                  }}
+                  data-testid={`nav-${item.id}`}
+                  className={`sidebar-nav-btn${activeSection === item.id ? " active" : ""}`}
+                  onClick={() => setActiveSection(item.id)}
                 >
-                  {copiedField === "activeInvite" ? "Copied Invite!" : "Copy Invite Code"}
+                  <span>{item.icon}</span>
+                  <span>{item.label}</span>
                 </button>
-              )}
+              ))}
+            </nav>
+
+            <div className="sidebar-telemetry" data-testid="sidebar-telemetry">
+              <div className="sidebar-section-label" style={{ padding: 0, marginBottom: "2px" }}>
+                Node Telemetry
+              </div>
+              <div className="sidebar-telemetry-row">
+                <span style={{ color: "var(--text-muted)" }}>Allocated</span>
+                <strong>{sharedRamGb} GB RAM</strong>
+              </div>
+              <div className="sidebar-telemetry-row">
+                <span style={{ color: "var(--text-muted)" }}>Layers</span>
+                <strong>
+                  {isSharing && assignedLayerRange
+                    ? `${assignedLayerRange[0]}..${assignedLayerRange[1]}`
+                    : "Idle"}
+                </strong>
+              </div>
+              <div className="sidebar-telemetry-row">
+                <span style={{ color: "var(--text-muted)" }}>Peers</span>
+                <strong>{connectedPeersCount}</strong>
+              </div>
+              <div className="sidebar-telemetry-row">
+                <span style={{ color: "var(--text-muted)" }}>Swarm</span>
+                <strong style={{ color: isSwarmReady ? "var(--success-fg)" : "var(--text-secondary)" }}>
+                  {isSharing ? `${Math.round(coveragePercent)}%` : "Standby"}
+                </strong>
+              </div>
             </div>
           </div>
 
-          <div>
-            <div
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <a
+              href={GITHUB_REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-testid="github-repo-link"
+              aria-label="ShardAi on GitHub"
+              className="native-btn"
               style={{
                 display: "flex",
-                justifyContent: "space-between",
                 alignItems: "center",
-                marginBottom: "6px",
+                justifyContent: "center",
+                gap: "6px",
+                textDecoration: "none",
               }}
             >
-              <span style={{ fontSize: "0.75rem", fontWeight: 600, color: "#64748b" }}>
-                Quick Test (curl / IDE Config)
-              </span>
-              <button
-                type="button"
-                onClick={() => void handleCopy("curl", curlExample)}
-                style={{
-                  padding: "3px 9px",
-                  fontSize: "0.72rem",
-                  fontWeight: 600,
-                  borderRadius: "5px",
-                  border: "1px solid #cbd5e1",
-                  backgroundColor: "#ffffff",
-                  color: "#334155",
-                  cursor: "pointer",
-                }}
-              >
-                {copiedField === "curl" ? "Copied!" : "Copy curl"}
-              </button>
-            </div>
-            <pre
-              data-testid="curl-snippet"
-              style={{
-                margin: 0,
-                padding: "12px",
-                borderRadius: "8px",
-                backgroundColor: "#0f172a",
-                color: "#e2e8f0",
-                fontSize: "0.75rem",
-                lineHeight: 1.45,
-                overflowX: "auto",
-              }}
-            >
-              <code>{curlExample}</code>
-            </pre>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
+              </svg>
+              <span>ShardAi GitHub</span>
+            </a>
           </div>
-        </div>
-      )}
+        </aside>
 
-      <footer style={{ marginTop: "18px", fontSize: "0.825rem", color: "#475569" }}>
-        <p data-testid="status-message" style={{ margin: "0 0 6px 0" }}>
-          {statusMessage}
-        </p>
-        {errorMessage !== null && (
-          <p
-            role="alert"
-            style={{
-              margin: 0,
-              padding: "8px 10px",
-              borderRadius: "6px",
-              backgroundColor: "#fef2f2",
-              color: "#b91c1c",
-            }}
-          >
-            {errorMessage}
-          </p>
-        )}
+        <main className="native-main">
+          {errorMessage !== null && (
+            <div
+              role="alert"
+              style={{
+                padding: "9px 12px",
+                borderRadius: "8px",
+                backgroundColor: "var(--danger-soft)",
+                border: "1px solid var(--danger)",
+                color: "var(--danger)",
+                fontSize: "12.5px",
+                fontWeight: 500,
+              }}
+            >
+              {errorMessage}
+            </div>
+          )}
 
-        <div
+          <div className={activeSection === "overview" ? "native-grid" : "native-grid single"}>
+            {/* =============================================================== */}
+            {/* Left Workspace Column: Node & Model Configuration               */}
+            {/* =============================================================== */}
+            {showNodeConfig && (
+              <section className="native-panel" aria-label="Node Configuration">
+                <div className="native-panel-header">
+                  <h2 className="native-panel-title">Node &amp; Model Configuration</h2>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Local Gateway :8000
+                  </span>
+                </div>
+
+                {/* 3-Tab Model Selector */}
+                <div style={{ marginBottom: "16px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      flexWrap: "wrap",
+                      gap: "6px",
+                      marginBottom: "6px",
+                    }}
+                  >
+                    <span className="native-label" style={{ marginBottom: 0 }}>
+                      Model Source
+                    </span>
+                    {catalogSource !== null && modelTab === "catalog" && (
+                      <span
+                        data-testid="catalog-source-badge"
+                        style={{
+                          fontSize: "11px",
+                          fontWeight: 600,
+                          padding: "2px 8px",
+                          borderRadius: "999px",
+                          backgroundColor:
+                            catalogSource === "cloud" ? "var(--success-bg)" : "var(--warn-bg)",
+                          color:
+                            catalogSource === "cloud" ? "var(--success-fg)" : "var(--warn-fg)",
+                          border: `1px solid ${
+                            catalogSource === "cloud"
+                              ? "var(--success-border)"
+                              : "var(--warn-border)"
+                          }`,
+                        }}
+                      >
+                        {catalogSource === "cloud"
+                          ? "Synced from Cloud"
+                          : catalogSource === "cache"
+                            ? "Loaded from ~/.shardai/models_cache.json"
+                            : "Default Offline Catalog"}
+                      </span>
+                    )}
+                  </div>
+
+                  <div
+                    role="tablist"
+                    aria-label="Model Source Tabs"
+                    className="native-segmented"
+                  >
+                    {(
+                      [
+                        { id: "catalog", label: "Online Catalog" },
+                        { id: "custom", label: "Custom HF / URL" },
+                        { id: "local", label: "Local File" },
+                      ] as const
+                    ).map((tab) => {
+                      const active = modelTab === tab.id;
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          data-testid={`tab-${tab.id}`}
+                          disabled={isSharing || isBusy}
+                          className={`native-seg-btn${active ? " active" : ""}`}
+                          onClick={() => {
+                            setModelTab(tab.id);
+                            setDownloadProgress(null);
+                            setDownloadStatusMsg("");
+                          }}
+                        >
+                          {tab.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Tab 1: Online Catalog */}
+                  {modelTab === "catalog" && (
+                    <div
+                      data-testid="panel-catalog"
+                      style={{ display: "flex", gap: "6px", alignItems: "center" }}
+                    >
+                      <select
+                        aria-label="Online Model Catalog"
+                        data-testid="catalog-model-select"
+                        className="native-select"
+                        value={selectedCatalogId}
+                        disabled={isSharing || isBusy || catalogModels.length === 0}
+                        onChange={(e) => {
+                          const chosenId = e.target.value;
+                          setSelectedCatalogId(chosenId);
+                          const found = catalogModels.find((m) => m.id === chosenId);
+                          if (found) {
+                            setModelInput(found.repo_id);
+                          }
+                          setDownloadProgress(null);
+                          setDownloadStatusMsg("");
+                        }}
+                        style={{ flex: 1 }}
+                      >
+                        {catalogModels.length === 0 ? (
+                          <option value="">
+                            {isLoadingCatalog
+                              ? "Loading model catalog..."
+                              : "No catalog models loaded yet — click Refresh"}
+                          </option>
+                        ) : (
+                          catalogModels.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.name} (~{item.estimated_ram_gb} GB)
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      <button
+                        type="button"
+                        data-testid="refresh-catalog-btn"
+                        className="native-btn"
+                        onClick={() => void fetchModelCatalog()}
+                        disabled={isLoadingCatalog || isSharing || isBusy}
+                      >
+                        {isLoadingCatalog ? "Syncing..." : "Refresh"}
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Tab 2: Custom HF Repo / External Direct URL */}
+                  {modelTab === "custom" && (
+                    <div
+                      data-testid="panel-custom"
+                      style={{ display: "flex", flexDirection: "column", gap: "6px" }}
+                    >
+                      <input
+                        id="model-input"
+                        data-testid="model-input"
+                        type="text"
+                        className="native-input"
+                        value={modelInput}
+                        disabled={isSharing || isBusy}
+                        onChange={(e) => {
+                          setModelInput(e.target.value);
+                          setDownloadProgress(null);
+                          setDownloadStatusMsg("");
+                        }}
+                        placeholder="HuggingFace Repo (e.g. bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) or Direct .gguf URL"
+                      />
+                      {inferCustomSourceType(modelInput) === "huggingface" && (
+                        <input
+                          type="text"
+                          data-testid="custom-filename-input"
+                          className="native-input"
+                          value={customFilename}
+                          disabled={isSharing || isBusy}
+                          onChange={(e) => setCustomFilename(e.target.value)}
+                          placeholder="Optional .gguf filename (leave blank to auto-pick Q4_K_M)"
+                          style={{ fontSize: "12px" }}
+                        />
+                      )}
+                    </div>
+                  )}
+
+                  {/* Tab 3: Local File (.gguf via Tauri File Dialog) */}
+                  {modelTab === "local" && (
+                    <div
+                      data-testid="panel-local"
+                      style={{ display: "flex", gap: "6px", alignItems: "center" }}
+                    >
+                      <input
+                        type="text"
+                        data-testid="local-file-input"
+                        className="native-input"
+                        value={localFilePath}
+                        disabled={isSharing || isBusy}
+                        onChange={(e) => {
+                          setLocalFilePath(e.target.value);
+                          setDownloadProgress(null);
+                          setDownloadStatusMsg("");
+                        }}
+                        placeholder="Select or paste absolute path to local .gguf file..."
+                        style={{ flex: 1 }}
+                      />
+                      <input
+                        ref={localFileInputRef}
+                        type="file"
+                        accept=".gguf"
+                        aria-hidden="true"
+                        tabIndex={-1}
+                        style={{ display: "none" }}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            const fileWithPath = file as File & { path?: string };
+                            setLocalFilePath(fileWithPath.path ?? file.name);
+                            setDownloadProgress(null);
+                            setDownloadStatusMsg("");
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        data-testid="browse-gguf-btn"
+                        className="native-btn"
+                        disabled={isSharing || isBusy}
+                        onClick={() => void handleBrowseGgufFile()}
+                      >
+                        Browse (.gguf)
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* RAM Slider */}
+                <div style={{ marginBottom: "16px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: "6px",
+                    }}
+                  >
+                    <label
+                      htmlFor="ram-slider"
+                      className="native-label"
+                      style={{ marginBottom: 0 }}
+                    >
+                      Shared RAM Contribution
+                    </label>
+                    <span
+                      data-testid="selected-ram-label"
+                      style={{ fontSize: "13px", fontWeight: 700, color: "var(--accent-text)" }}
+                    >
+                      {sharedRamGb} GB
+                    </span>
+                  </div>
+
+                  <input
+                    id="ram-slider"
+                    type="range"
+                    min={MIN_RAM_GB}
+                    max={maxRamGb}
+                    step={1}
+                    value={sharedRamGb}
+                    disabled={isSharing || isBusy}
+                    onChange={(e) => setSharedRamGb(Number(e.target.value))}
+                    style={{
+                      width: "100%",
+                      accentColor: "var(--accent)",
+                      cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+                    }}
+                  />
+
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      fontSize: "11px",
+                      color: "var(--text-muted)",
+                      marginTop: "4px",
+                    }}
+                  >
+                    <span>{MIN_RAM_GB} GB</span>
+                    {availableRamGb !== null && (
+                      <span data-testid="free-ram-note">
+                        Free: {availableRamGb.toFixed(1)} GB (1 GB reserved for OS)
+                      </span>
+                    )}
+                    <span>{maxRamGb} GB</span>
+                  </div>
+
+                  <label
+                    htmlFor="ssd-offload-checkbox"
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      marginTop: "10px",
+                      padding: "8px 10px",
+                      borderRadius: "6px",
+                      backgroundColor: allowSsdOffload
+                        ? "var(--info-bg)"
+                        : "var(--bg-surface-subtle)",
+                      border: `1px solid ${
+                        allowSsdOffload ? "var(--info-border)" : "var(--border-hairline)"
+                      }`,
+                      fontSize: "12px",
+                      color: "var(--text-secondary)",
+                      cursor: isSharing || isBusy ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    <input
+                      id="ssd-offload-checkbox"
+                      data-testid="ssd-offload-checkbox"
+                      type="checkbox"
+                      checked={allowSsdOffload}
+                      disabled={isSharing || isBusy}
+                      onChange={(e) => setAllowSsdOffload(e.target.checked)}
+                    />
+                    <span>
+                      Allow SSD Offloading (Slow but guarantees 100% run in Solo Mode)
+                    </span>
+                  </label>
+                </div>
+
+                {/* Network Mode, Room ID & Optional Room Key */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: "10px",
+                    marginBottom: "16px",
+                  }}
+                >
+                  <div style={{ gridColumn: "1 / -1" }}>
+                    <span className="native-label">Network Scope</span>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                      {(["lan", "internet"] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          data-testid={`network-mode-${mode}`}
+                          disabled={isSharing || isBusy}
+                          onClick={() => setNetworkMode(mode)}
+                          className={`native-btn${networkMode === mode ? " native-btn-primary" : ""}`}
+                        >
+                          {mode === "lan" ? "LAN (Wi-Fi / mDNS)" : "Internet (Cloud)"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label htmlFor="room-id-input" className="native-label">
+                      Room ID
+                    </label>
+                    <input
+                      id="room-id-input"
+                      data-testid="room-id-input"
+                      type="text"
+                      className="native-input"
+                      value={roomId}
+                      disabled={isSharing || isBusy}
+                      onChange={(e) => setRoomId(e.target.value)}
+                      placeholder="public"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="room-key-input" className="native-label">
+                      Room Key (Optional)
+                    </label>
+                    <input
+                      id="room-key-input"
+                      data-testid="room-key-input"
+                      type="password"
+                      className="native-input"
+                      value={roomKey}
+                      disabled={isSharing || isBusy}
+                      onChange={(e) => setRoomKey(e.target.value)}
+                      placeholder="Public if blank"
+                    />
+                  </div>
+                </div>
+
+                {/* Model Download Progress Bar */}
+                {downloadProgress !== null && (
+                  <div style={{ marginBottom: "14px" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: "11.5px",
+                        marginBottom: "5px",
+                      }}
+                    >
+                      <span
+                        data-testid="model-download-status-msg"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {downloadStatusMsg || "Preparing model..."}
+                      </span>
+                      <span
+                        data-testid="model-download-percent"
+                        style={{ fontWeight: 700, color: "var(--accent-text)" }}
+                      >
+                        {downloadProgress.toFixed(0)}%
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        width: "100%",
+                        height: "6px",
+                        backgroundColor: "var(--bg-app)",
+                        borderRadius: "999px",
+                        overflow: "hidden",
+                        border: "1px solid var(--border-hairline)",
+                      }}
+                    >
+                      <div
+                        data-testid="model-download-progress-bar"
+                        style={{
+                          width: `${downloadProgress}%`,
+                          height: "100%",
+                          backgroundColor:
+                            downloadProgress >= 100 ? "#16a34a" : "var(--accent)",
+                          transition: "width 0.2s ease-in-out",
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Primary Action Button */}
+                <button
+                  type="button"
+                  data-testid="toggle-sharing-btn"
+                  onClick={() => {
+                    if (isSharing) {
+                      void handleStopSharing();
+                    } else {
+                      void startSharingWithConfig();
+                    }
+                  }}
+                  disabled={isBusy}
+                  className={`native-btn ${isSharing ? "native-btn-danger" : "native-btn-primary"}`}
+                  style={{
+                    width: "100%",
+                    padding: "10px 14px",
+                    fontSize: "13px",
+                  }}
+                >
+                  {isBusy
+                    ? "Connecting..."
+                    : isSharing
+                      ? "Stop Sharing"
+                      : "Start Sharing & Join Room"}
+                </button>
+              </section>
+            )}
+
+            {/* =============================================================== */}
+            {/* Right Workspace Column: Rooms Lobby + Modals + API Credentials  */}
+            {/* =============================================================== */}
+            {(showRooms || showCredentials) && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "14px", minWidth: 0 }}>
+                {showRooms && (
+                  <section
+                    data-testid="network-rooms-lobby"
+                    className="native-panel"
+                    aria-label="Network Rooms Lobby"
+                  >
+                    <div className="native-panel-header">
+                      <h2 className="native-panel-title">Network Rooms Lobby</h2>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button
+                          type="button"
+                          data-testid="refresh-rooms-btn"
+                          className="native-btn"
+                          onClick={() => {
+                            void fetchAvailableRooms();
+                            void fetchNetworkStatus();
+                          }}
+                          disabled={isLoadingRooms}
+                        >
+                          {isLoadingRooms ? "Scanning..." : "Refresh"}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="create-room-modal-btn"
+                          className="native-btn native-btn-primary"
+                          disabled={isSharing || isBusy}
+                          onClick={() => setShowRoomModal(true)}
+                        >
+                          Create New Room / Join Unlisted
+                        </button>
+                      </div>
+                    </div>
+
+                    {isCloudOffline ? (
+                      <div
+                        data-testid="offline-rooms-hidden-notice"
+                        style={{
+                          padding: "12px",
+                          borderRadius: "8px",
+                          backgroundColor: "var(--bg-surface-subtle)",
+                          border: "1px dashed var(--border-strong)",
+                          fontSize: "12px",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {networkStatus === "lan_only" ? (
+                          <>
+                            <div
+                              style={{
+                                fontWeight: 600,
+                                color: "var(--warn-fg)",
+                                marginBottom: "6px",
+                              }}
+                            >
+                              🟡 Public Cloud Rooms hidden in LAN Only mode (Cloudflare Tracker
+                              unreachable).
+                            </div>
+                            {availableRooms.filter((r) => r.network_scope === "lan").length > 0 ? (
+                              <div
+                                style={{
+                                  display: "flex",
+                                  flexDirection: "column",
+                                  gap: "6px",
+                                  marginTop: "8px",
+                                }}
+                              >
+                                {availableRooms
+                                  .filter((r) => r.network_scope === "lan")
+                                  .map((room) => (
+                                    <div
+                                      key={room.room_id}
+                                      style={{
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        alignItems: "center",
+                                        padding: "8px 10px",
+                                        borderRadius: "6px",
+                                        backgroundColor: "var(--warn-bg)",
+                                        border: "1px solid var(--warn-border)",
+                                      }}
+                                    >
+                                      <span>
+                                        <strong>{room.room_id}</strong> ({room.model}) —{" "}
+                                        {room.nodes_online} LAN node(s), {room.total_shared_ram_gb} GB
+                                      </span>
+                                      <button
+                                        type="button"
+                                        data-testid={`join-room-${room.room_id}`}
+                                        className="native-btn native-btn-primary"
+                                        disabled={isSharing || isBusy}
+                                        onClick={() => handleJoinLobbyRoom(room)}
+                                      >
+                                        Join LAN
+                                      </button>
+                                    </div>
+                                  ))}
+                              </div>
+                            ) : (
+                              <span>
+                                Configure a room on the left or wait for mDNS/Zeroconf LAN peers.
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span>
+                            🔴 <strong>Offline (Solo Mode)</strong> — Public Rooms list is hidden
+                            while offline. Click <strong>Start Sharing &amp; Join Room</strong> to
+                            run standalone (with optional SSD Offloading).
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="native-table-wrap">
+                        <table data-testid="rooms-lobby-table" className="native-table">
+                          <thead>
+                            <tr>
+                              <th>Room Name</th>
+                              <th>Model</th>
+                              <th>Nodes</th>
+                              <th>Shared RAM</th>
+                              <th>Resources</th>
+                              <th>Status</th>
+                              <th style={{ textAlign: "right" }}>Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {availableRooms.length === 0 ? (
+                              <tr>
+                                <td
+                                  colSpan={7}
+                                  style={{
+                                    padding: "18px",
+                                    textAlign: "center",
+                                    color: "var(--text-muted)",
+                                  }}
+                                >
+                                  No active rooms discovered yet. Click &quot;Refresh&quot; or start sharing.
+                                </td>
+                              </tr>
+                            ) : (
+                              availableRooms.map((room) => {
+                                const coverage = room.coverage_percent ?? 100;
+                                const redundancy = room.redundancy_factor ?? 1;
+                                const isReady = coverage >= 100;
+                                return (
+                                  <tr key={room.room_id}>
+                                    <td style={{ fontWeight: 600 }}>
+                                      {room.room_id}{" "}
+                                      <span
+                                        style={{
+                                          fontSize: "10px",
+                                          padding: "1px 5px",
+                                          borderRadius: "4px",
+                                          backgroundColor: "var(--info-bg)",
+                                          color: "var(--info-fg)",
+                                          marginLeft: "4px",
+                                        }}
+                                      >
+                                        {room.network_scope.toUpperCase()}
+                                      </span>
+                                    </td>
+                                    <td style={{ color: "var(--text-secondary)" }}>{room.model}</td>
+                                    <td>{room.nodes_online}</td>
+                                    <td>{room.total_shared_ram_gb} GB</td>
+                                    <td>
+                                      <span
+                                        data-testid={`room-coverage-${room.room_id}`}
+                                        style={{
+                                          display: "inline-block",
+                                          padding: "2px 8px",
+                                          borderRadius: "999px",
+                                          fontSize: "11px",
+                                          fontWeight: 600,
+                                          backgroundColor: isReady
+                                            ? "var(--success-bg)"
+                                            : "var(--warn-bg)",
+                                          color: isReady ? "var(--success-fg)" : "var(--warn-fg)",
+                                          border: `1px solid ${
+                                            isReady
+                                              ? "var(--success-border)"
+                                              : "var(--warn-border)"
+                                          }`,
+                                          whiteSpace: "nowrap",
+                                        }}
+                                      >
+                                        {isReady
+                                          ? `✅ Sẵn sàng (Dự phòng: ${redundancy}x)`
+                                          : `⚠️ Đang gom RAM: ${Math.round(coverage)}%`}
+                                      </span>
+                                    </td>
+                                    <td>{room.is_private ? "🔒 Private" : "Public"}</td>
+                                    <td style={{ textAlign: "right" }}>
+                                      <button
+                                        type="button"
+                                        data-testid={`join-room-${room.room_id}`}
+                                        className="native-btn native-btn-primary"
+                                        disabled={isSharing || isBusy}
+                                        onClick={() => handleJoinLobbyRoom(room)}
+                                        style={{ padding: "4px 10px", fontSize: "11.5px" }}
+                                      >
+                                        Join
+                                      </button>
+                                    </td>
+                                  </tr>
+                                );
+                              })
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </section>
+                )}
+
+                {/* Private Room Key Prompt Modal */}
+                {pendingPrivateRoom !== null && (
+                  <div
+                    role="dialog"
+                    aria-label="Enter Private Room Key"
+                    data-testid="private-room-key-modal"
+                    className="native-panel"
+                    style={{
+                      backgroundColor: "var(--warn-bg)",
+                      borderColor: "var(--warn-border)",
+                    }}
+                  >
+                    <h3
+                      style={{
+                        margin: "0 0 8px 0",
+                        fontSize: "13px",
+                        fontWeight: 700,
+                        color: "var(--warn-fg)",
+                      }}
+                    >
+                      🔒 Enter Room Key for &quot;{pendingPrivateRoom.room_id}&quot;
+                    </h3>
+                    <form onSubmit={handleConfirmPrivateJoin}>
+                      <div style={{ display: "flex", gap: "8px" }}>
+                        <input
+                          type="password"
+                          data-testid="private-room-key-input"
+                          className="native-input"
+                          value={privateKeyInput}
+                          onChange={(e) => setPrivateKeyInput(e.target.value)}
+                          placeholder="Room passphrase / invite key"
+                          autoFocus
+                          style={{ flex: 1 }}
+                        />
+                        <button
+                          type="submit"
+                          data-testid="confirm-private-join-btn"
+                          className="native-btn native-btn-primary"
+                        >
+                          Unlock &amp; Join
+                        </button>
+                        <button
+                          type="button"
+                          className="native-btn"
+                          onClick={() => setPendingPrivateRoom(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                )}
+
+                {/* Create New Room / Join Unlisted Modal */}
+                {showRoomModal && (
+                  <div
+                    role="dialog"
+                    aria-label="Create New Room or Join Unlisted"
+                    data-testid="create-room-modal"
+                    className="native-panel"
+                  >
+                    <div className="native-panel-header">
+                      <h3 className="native-panel-title">
+                        Create New Room / Join Unlisted
+                      </h3>
+                      <button
+                        type="button"
+                        className="native-btn"
+                        style={{ padding: "2px 8px" }}
+                        onClick={() => setShowRoomModal(false)}
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    <form onSubmit={handleCreateOrJoinUnlisted}>
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "1fr 1fr",
+                          gap: "10px",
+                          marginBottom: "10px",
+                        }}
+                      >
+                        <div>
+                          <label className="native-label">New Room Name</label>
+                          <input
+                            type="text"
+                            data-testid="modal-room-name-input"
+                            className="native-input"
+                            value={modalRoomId}
+                            onChange={(e) => setModalRoomId(e.target.value)}
+                            placeholder="my-private-cluster"
+                          />
+                        </div>
+                        <div>
+                          <label className="native-label">
+                            Room Key (Optional — 🔒 Private)
+                          </label>
+                          <input
+                            type="text"
+                            data-testid="modal-room-key-input"
+                            className="native-input"
+                            value={modalRoomKey}
+                            onChange={(e) => setModalRoomKey(e.target.value)}
+                            placeholder="Leave blank for Public"
+                          />
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: "10px" }}>
+                        <label className="native-label">Model</label>
+                        <input
+                          type="text"
+                          className="native-input"
+                          value={modalModel}
+                          onChange={(e) => setModalModel(e.target.value)}
+                        />
+                      </div>
+
+                      <label
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          fontSize: "12px",
+                          marginBottom: "12px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          data-testid="modal-unlisted-checkbox"
+                          checked={modalUnlisted}
+                          onChange={(e) => setModalUnlisted(e.target.checked)}
+                        />
+                        Unlisted Room (hide from public Network Rooms Lobby)
+                      </label>
+
+                      <div style={{ marginBottom: "12px" }}>
+                        <span className="native-label">
+                          Invite String (Share with teammates)
+                        </span>
+                        <div style={{ display: "flex", gap: "8px" }}>
+                          <code
+                            data-testid="invite-string-preview"
+                            className="native-input"
+                            style={{ flex: 1, fontFamily: "monospace" }}
+                          >
+                            {generatedInviteString}
+                          </code>
+                          <button
+                            type="button"
+                            className="native-btn"
+                            onClick={() => void handleCopy("invite", generatedInviteString)}
+                          >
+                            {copiedField === "invite" ? "Copied!" : "Copy Invite"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <button
+                        type="submit"
+                        data-testid="modal-create-join-btn"
+                        className="native-btn native-btn-primary"
+                        style={{ width: "100%", padding: "8px 14px" }}
+                      >
+                        Create &amp; Start Sharing
+                      </button>
+                    </form>
+
+                    <div
+                      style={{
+                        marginTop: "12px",
+                        paddingTop: "12px",
+                        borderTop: "1px solid var(--border-hairline)",
+                      }}
+                    >
+                      <span className="native-label">
+                        Or Paste Invite String (RoomID | Key)
+                      </span>
+                      <div style={{ display: "flex", gap: "8px" }}>
+                        <input
+                          type="text"
+                          data-testid="paste-invite-input"
+                          className="native-input"
+                          value={invitePasteInput}
+                          onChange={(e) => setInvitePasteInput(e.target.value)}
+                          placeholder="e.g. studio-room-1 | secret-pass"
+                          style={{ flex: 1 }}
+                        />
+                        <button
+                          type="button"
+                          className="native-btn"
+                          onClick={handleJoinByInviteString}
+                        >
+                          Join Unlisted
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Active Node Role & Session API Credentials Panel */}
+                {showCredentials && isSharing && sessionToken ? (
+                  <section
+                    data-testid="session-credentials-panel"
+                    className="native-panel"
+                    aria-label="Session API Credentials"
+                  >
+                    <div
+                      data-testid="active-node-role-card"
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: "8px",
+                        padding: "9px 12px",
+                        marginBottom: "12px",
+                        borderRadius: "8px",
+                        backgroundColor:
+                          assignedRole === "primary" ? "var(--info-bg)" : "var(--warn-bg)",
+                        border: `1px solid ${
+                          assignedRole === "primary"
+                            ? "var(--info-border)"
+                            : "var(--warn-border)"
+                        }`,
+                      }}
+                    >
+                      <span
+                        data-testid="active-node-role-label"
+                        style={{
+                          fontSize: "12.5px",
+                          fontWeight: 700,
+                          color:
+                            assignedRole === "primary" ? "var(--info-fg)" : "var(--warn-fg)",
+                        }}
+                      >
+                        {assignedRole === "primary"
+                          ? `Role: Primary Seeder (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`
+                          : `Role: Backup Node (Layers ${assignedLayerRange?.[0] ?? 0} - ${assignedLayerRange?.[1] ?? 0})`}
+                      </span>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        {modelFingerprint && (
+                          <span
+                            data-testid="model-fingerprint-badge"
+                            title={`SHA-256 (10MB + size): ${modelFingerprint}`}
+                            style={{
+                              fontSize: "11px",
+                              fontWeight: 600,
+                              padding: "2px 8px",
+                              borderRadius: "999px",
+                              backgroundColor: "var(--bg-surface-subtle)",
+                              color: "var(--text-secondary)",
+                              border: "1px solid var(--border-strong)",
+                              fontFamily: "monospace",
+                            }}
+                          >
+                            FP: {modelFingerprint.slice(0, 10)}
+                          </span>
+                        )}
+                        {ssdOffloadActive && (
+                          <span
+                            data-testid="ssd-offload-active-badge"
+                            style={{
+                              fontSize: "11px",
+                              fontWeight: 600,
+                              padding: "2px 8px",
+                              borderRadius: "999px",
+                              backgroundColor: "var(--info-bg)",
+                              color: "var(--info-fg)",
+                              border: "1px solid var(--info-border)",
+                            }}
+                          >
+                            💾 SSD Offload (mmap)
+                          </span>
+                        )}
+                        <span
+                          style={{
+                            fontSize: "11px",
+                            fontWeight: 700,
+                            padding: "2px 8px",
+                            borderRadius: "999px",
+                            backgroundColor:
+                              assignedRole === "primary" ? "var(--info-bg)" : "var(--warn-bg)",
+                            color:
+                              assignedRole === "primary" ? "var(--info-fg)" : "var(--warn-fg)",
+                          }}
+                        >
+                          {assignedRole === "primary" ? "PRIMARY" : "BACKUP"}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="native-panel-header">
+                      <h2 className="native-panel-title">Session API Credentials</h2>
+                      <span
+                        data-testid="api-readiness-badge"
+                        style={{
+                          fontSize: "11px",
+                          fontWeight: 600,
+                          padding: "2px 8px",
+                          borderRadius: "999px",
+                          backgroundColor:
+                            isSwarmReady && coveragePercent >= 100
+                              ? "var(--success-bg)"
+                              : "var(--warn-bg)",
+                          color:
+                            isSwarmReady && coveragePercent >= 100
+                              ? "var(--success-fg)"
+                              : "var(--warn-fg)",
+                          border: `1px solid ${
+                            isSwarmReady && coveragePercent >= 100
+                              ? "var(--success-border)"
+                              : "var(--warn-border)"
+                          }`,
+                        }}
+                      >
+                        {isSwarmReady && coveragePercent >= 100
+                          ? "🟢 API Ready (Mạng lưới đã sẵn sàng nhận request)"
+                          : `🟡 API Standby (Đang chờ đủ RAM: ${Math.round(coveragePercent)}% - Chưa thể gọi model)`}
+                      </span>
+                    </div>
+
+                    <div style={{ marginBottom: "10px" }}>
+                      <span className="native-label">OpenAI Base URL</span>
+                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                        <code
+                          data-testid="gateway-base-url"
+                          className="native-input"
+                          style={{ flex: 1, fontFamily: "monospace" }}
+                        >
+                          {apiBaseUrl}
+                        </code>
+                        <button
+                          type="button"
+                          className="native-btn"
+                          onClick={() => void handleCopy("baseUrl", apiBaseUrl)}
+                        >
+                          {copiedField === "baseUrl" ? "Copied!" : "Copy"}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div style={{ marginBottom: "12px" }}>
+                      <span className="native-label">API Key (Session Token)</span>
+                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                        <code
+                          data-testid="session-token-value"
+                          className="native-input"
+                          style={{
+                            flex: 1,
+                            fontFamily: "monospace",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {sessionToken}
+                        </code>
+                        <button
+                          type="button"
+                          className="native-btn"
+                          onClick={() => void handleCopy("token", sessionToken)}
+                        >
+                          {copiedField === "token" ? "Copied!" : "Copy"}
+                        </button>
+                        {(!isSwarmReady || coveragePercent < 100) && (
+                          <button
+                            type="button"
+                            data-testid="copy-invite-code-btn"
+                            className="native-btn"
+                            style={{
+                              borderColor: "var(--warn-border)",
+                              backgroundColor: "var(--warn-bg)",
+                              color: "var(--warn-fg)",
+                            }}
+                            onClick={() =>
+                              void handleCopy(
+                                "activeInvite",
+                                roomKey.trim()
+                                  ? `${roomId.trim() || "public"} | ${roomKey.trim()}`
+                                  : roomId.trim() || "public"
+                              )
+                            }
+                          >
+                            {copiedField === "activeInvite"
+                              ? "Copied Invite!"
+                              : "Copy Invite Code"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          marginBottom: "6px",
+                        }}
+                      >
+                        <span className="native-label" style={{ marginBottom: 0 }}>
+                          Quick Test (curl / IDE Config)
+                        </span>
+                        <button
+                          type="button"
+                          className="native-btn"
+                          style={{ padding: "3px 8px", fontSize: "11px" }}
+                          onClick={() => void handleCopy("curl", curlExample)}
+                        >
+                          {copiedField === "curl" ? "Copied!" : "Copy curl"}
+                        </button>
+                      </div>
+                      <pre
+                        data-testid="curl-snippet"
+                        style={{
+                          margin: 0,
+                          padding: "10px 12px",
+                          borderRadius: "8px",
+                          backgroundColor: "var(--bg-code)",
+                          color: "#e2e8f0",
+                          fontSize: "11.5px",
+                          lineHeight: 1.45,
+                          overflowX: "auto",
+                        }}
+                      >
+                        <code>{curlExample}</code>
+                      </pre>
+                    </div>
+                  </section>
+                ) : (
+                  activeSection === "credentials" && (
+                    <section className="native-panel">
+                      <div className="native-panel-header">
+                        <h2 className="native-panel-title">Session API Credentials</h2>
+                      </div>
+                      <p style={{ margin: 0, fontSize: "12.5px", color: "var(--text-secondary)" }}>
+                        Start sharing RAM in <strong>Node &amp; Model</strong> (or click{" "}
+                        <strong>Overview</strong>) to issue your local OpenAI Base URL and
+                        Session API Token.
+                      </p>
+                    </section>
+                  )
+                )}
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+
+      {/* =================================================================== */}
+      {/* Bottom Native OS Statusbar                                          */}
+      {/* =================================================================== */}
+      <footer className="native-statusbar">
+        <span
+          data-testid="status-message"
           style={{
-            marginTop: "14px",
-            paddingTop: "12px",
-            borderTop: "1px solid #e2e8f0",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: "10px",
-            fontSize: "0.75rem",
-            color: "#64748b",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
           }}
         >
-          <span data-testid="footer-copyright">
-            © {new Date().getFullYear()} ShardAi — Open-Source P2P Distributed LLM Engine (MIT)
-          </span>
-          <a
-            href={GITHUB_REPO_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            data-testid="github-repo-link"
-            aria-label="ShardAi on GitHub"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "6px",
-              padding: "5px 10px",
-              borderRadius: "6px",
-              border: "1px solid #cbd5e1",
-              backgroundColor: "#f8fafc",
-              color: "#0f172a",
-              textDecoration: "none",
-              fontWeight: 600,
-              fontSize: "0.75rem",
-            }}
-          >
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="currentColor"
-              aria-hidden="true"
-            >
-              <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
-            </svg>
-            <span>GitHub</span>
-          </a>
-        </div>
+          {statusMessage}
+        </span>
+        <span
+          data-testid="footer-copyright"
+          style={{ whiteSpace: "nowrap", color: "var(--text-muted)" }}
+        >
+          © {new Date().getFullYear()} ShardAi (MIT)
+        </span>
       </footer>
-    </section>
+    </div>
   );
 };
 
