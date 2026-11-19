@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import logging
 import random
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -74,26 +75,86 @@ def hash_room_key(room_key: str | None) -> str | None:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
 
 
+_VIETNAMESE_DIACRITICS_RE: re.Pattern[str] = re.compile(
+    r"[\u00C0-\u00C3\u00C8-\u00CA\u00CC-\u00CD\u00D2-\u00D5\u00D9-\u00DA\u00DD"
+    r"\u00E0-\u00E3\u00E8-\u00EA\u00EC-\u00ED\u00F2-\u00F5\u00F9-\u00FA\u00FD"
+    r"\u0102-\u0103\u0110-\u0111\u0128-\u0129\u0168-\u0169\u01A0-\u01B0\u1EA0-\u1EF9]"
+)
+_QUOTED_ROOM_RE: re.Pattern[str] = re.compile(r'Room\s+"([^"]+)"', re.IGNORECASE)
+_RAM_PCT_RE: re.Pattern[str] = re.compile(r"(\d+(?:\.\d+)?)%\s*RAM", re.IGNORECASE)
+
+
+def _contains_vietnamese_diacritics(text: str) -> bool:
+    """Return True if the text contains Vietnamese accented characters."""
+    return bool(_VIETNAMESE_DIACRITICS_RE.search(text))
+
+
+def _normalize_tracker_notice_to_english(
+    message: str,
+    error_code: str | None,
+    fallback: str,
+) -> str:
+    """Ensure client-facing tracker error notices are rendered in clear English.
+
+    English messages are preserved verbatim. Non-English (Vietnamese) notices from
+    external trackers are normalized using the public error code and room context.
+    """
+    cleaned = message.strip()
+    if not cleaned:
+        return fallback
+    if not _contains_vietnamese_diacritics(cleaned):
+        return cleaned
+
+    room_match = _QUOTED_ROOM_RE.search(cleaned)
+    room_label = f'Room "{room_match.group(1)}"' if room_match else "This room"
+    pct_match = _RAM_PCT_RE.search(cleaned)
+    normalized_code = (error_code or "").strip().upper()
+
+    if normalized_code == "ROOM_FULL" or "100% RAM" in cleaned:
+        return (
+            f"{room_label} has reached 100% RAM/Layer capacity and is locked "
+            "for active inference. Please select another room or create a new room."
+        )
+    if normalized_code == "ROOM_QUEUE_BUSY":
+        pct_part = f" ({pct_match.group(1)}% RAM)" if pct_match else ""
+        return (
+            f"{room_label}{pct_part} currently has another client joining and "
+            "syncing layers. Please wait or create a new room."
+        )
+    if normalized_code == "FORBIDDEN":
+        return "Invalid room key for this private room."
+
+    return fallback
+
+
 def extract_tracker_error_detail(
     response: httpx.Response,
     fallback: str,
 ) -> str:
-    """Extract a human-readable error message from a Signaling Tracker JSON error response."""
+    """Extract a human-readable English error message from a Signaling Tracker JSON response."""
     try:
         payload: Any = response.json()
     except Exception:
         return fallback
 
     if isinstance(payload, dict):
+        error_code: str | None = None
         error_obj = payload.get("error")
         if isinstance(error_obj, dict):
+            raw_code = error_obj.get("code")
+            if isinstance(raw_code, str) and raw_code.strip():
+                error_code = raw_code.strip()
             nested_msg = error_obj.get("message")
             if isinstance(nested_msg, str) and nested_msg.strip():
-                return nested_msg.strip()
+                return _normalize_tracker_notice_to_english(
+                    nested_msg, error_code, fallback
+                )
         for key in ("message", "detail"):
             val = payload.get(key)
             if isinstance(val, str) and val.strip():
-                return val.strip()
+                return _normalize_tracker_notice_to_english(
+                    val, error_code, fallback
+                )
     return fallback
 
 

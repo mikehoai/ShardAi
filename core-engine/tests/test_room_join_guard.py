@@ -11,7 +11,10 @@ import pytest
 
 from main import app, runtime
 from shard_engine.schemas import NetworkStatus, NodeState
-from shard_engine.tracker_client import SignalingTrackerClient
+from shard_engine.tracker_client import (
+    SignalingTrackerClient,
+    extract_tracker_error_detail,
+)
 
 client = TestClient(app)
 
@@ -329,3 +332,107 @@ def test_start_node_preserves_offline_solo_fallback_on_tracker_timeout(
     stop_res = client.post("/stop-node")
     assert stop_res.status_code == 200
     assert stop_res.json()["allocated_ram_mb"] == 0
+
+
+def test_check_room_join_normalizes_vietnamese_full_room_notice_to_english(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_tracker(monkeypatch)
+    vn_msg = (
+        'Room "deepseek-r1-vn-01" \u0111\u00E3 \u0111\u1EA1t 100% RAM/Layer '
+        'v\u00E0 \u0111ang kh\u00F3a phi\u00EAn ch\u1EA1y model.'
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=409,
+            json={
+                "success": False,
+                "error": {"code": "ROOM_FULL", "message": vn_msg},
+                "message": vn_msg,
+            },
+        )
+
+    runtime.tracker_client = _make_mock_tracker(_handler)
+
+    res = client.post(
+        "/rooms/check-join",
+        json={
+            "room_id": "deepseek-r1-vn-01",
+            "model_id": "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
+            "network_mode": "internet",
+        },
+    )
+    assert res.status_code == 409
+    assert res.json()["detail"] == (
+        'Room "deepseek-r1-vn-01" has reached 100% RAM/Layer capacity and is locked '
+        "for active inference. Please select another room or create a new room."
+    )
+
+
+def test_check_room_join_normalizes_vietnamese_busy_queue_notice_to_english(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_tracker(monkeypatch)
+    vn_msg = (
+        'Room "qwen-coder-7b-dev" (65% RAM) hi\u1EC7n \u0111\u00E3 c\u00F3 '
+        'l\u01B0\u1EE3t ch\u1EDD k\u1EBFt n\u1ED1i \u0111ang \u0111\u1ED3ng b\u1ED9 layer.'
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=409,
+            json={
+                "success": False,
+                "error": {"code": "ROOM_QUEUE_BUSY", "message": vn_msg},
+                "message": vn_msg,
+            },
+        )
+
+    runtime.tracker_client = _make_mock_tracker(_handler)
+
+    res = client.post(
+        "/rooms/check-join",
+        json={
+            "room_id": "qwen-coder-7b-dev",
+            "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            "network_mode": "internet",
+        },
+    )
+    assert res.status_code == 409
+    assert res.json()["detail"] == (
+        'Room "qwen-coder-7b-dev" (65% RAM) currently has another client joining '
+        "and syncing layers. Please wait or create a new room."
+    )
+
+
+def test_extract_tracker_error_detail_handles_vietnamese_forbidden_and_fallback() -> None:
+    forbidden_res = httpx.Response(
+        status_code=403,
+        json={
+            "success": False,
+            "error": {
+                "code": "FORBIDDEN",
+                "message": "M\u00E3 ph\u00F2ng ri\u00EAng kh\u00F4ng h\u1EE3p l\u1EC7.",
+            },
+        },
+    )
+    assert (
+        extract_tracker_error_detail(forbidden_res, "Fallback forbidden")
+        == "Invalid room key for this private room."
+    )
+
+    unknown_vn_res = httpx.Response(
+        status_code=409,
+        json={
+            "success": False,
+            "error": {
+                "code": "CUSTOM_ERROR",
+                "message": "Kh\u00F4ng th\u1EC3 tham gia ph\u00F2ng l\u00FAc n\u00E0y.",
+            },
+        },
+    )
+    assert (
+        extract_tracker_error_detail(unknown_vn_res, "Unable to join room.")
+        == "Unable to join room."
+    )

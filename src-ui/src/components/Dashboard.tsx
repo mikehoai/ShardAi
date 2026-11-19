@@ -1934,8 +1934,8 @@ export const Dashboard: React.FC = () => {
                                         }}
                                       >
                                         {isReady
-                                          ? `✅ Sẵn sàng (Dự phòng: ${redundancy}x)`
-                                          : `⚠️ Đang gom RAM: ${Math.round(coverage)}%`}
+                                          ? `✅ Ready (Redundancy: ${redundancy}x)`
+                                          : `⚠️ Pooling RAM: ${Math.round(coverage)}%`}
                                       </span>
                                     </td>
                                     <td>{room.is_private ? "🔒 Private" : "Public"}</td>
@@ -2289,8 +2289,8 @@ export const Dashboard: React.FC = () => {
                         }}
                       >
                         {isSwarmReady && coveragePercent >= 100
-                          ? "🟢 API Ready (Mạng lưới đã sẵn sàng nhận request)"
-                          : `🟡 API Standby (Đang chờ đủ RAM: ${Math.round(coveragePercent)}% - Chưa thể gọi model)`}
+                          ? "🟢 API Ready (Swarm is ready to accept requests)"
+                          : `🟡 API Standby (Waiting for sufficient RAM: ${Math.round(coveragePercent)}% - Model not ready)`}
                       </span>
                     </div>
 
