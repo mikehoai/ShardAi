@@ -1,13 +1,18 @@
 <div align="center">
   <img src="assets/logo.png" alt="ShardAi Logo" width="140" />
-  <h1>ShardAi</h1>
-  <p><strong>Peer-to-Peer Distributed LLM Inference Engine</strong></p>
+  <h1>ShardAi Node</h1>
+  <p><strong>Open-Source P2P Distributed LLM Desktop Client &amp; Local OpenAI-Compatible API Gateway</strong></p>
 
   <p>
+    <a href="https://shardai.online"><img src="https://img.shields.io/badge/Website-shardai.online-2563eb?style=flat-square" alt="Official Website" /></a>
     <a href="https://github.com/mikehoai/ShardAi/stargazers"><img src="https://img.shields.io/github/stars/mikehoai/ShardAi?style=flat-square&color=2563eb" alt="Stars" /></a>
     <a href="https://github.com/mikehoai/ShardAi/network/members"><img src="https://img.shields.io/github/forks/mikehoai/ShardAi?style=flat-square" alt="Forks" /></a>
     <a href="https://github.com/mikehoai/ShardAi/issues"><img src="https://img.shields.io/github/issues/mikehoai/ShardAi?style=flat-square" alt="Issues" /></a>
     <a href="https://github.com/mikehoai/ShardAi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/mikehoai/ShardAi?style=flat-square" alt="License" /></a>
+  </p>
+
+  <p>
+    🌐 <strong>Official Homepage:</strong> <a href="https://shardai.online">https://shardai.online</a>
   </p>
 </div>
 
@@ -15,65 +20,77 @@
 
 ## 📖 Overview
 
-**ShardAi** is an open-source, peer-to-peer (P2P) distributed inference engine that allows everyday consumer hardware (low-RAM laptops, desktops, and edge devices) to pool their idle RAM/VRAM together to run massive Large Language Models (LLMs) — much like BitTorrent, but for AI inference.
+**ShardAi Node** (`shardai-node`) is an open-source, peer-to-peer (P2P) distributed LLM inference desktop client and **Local OpenAI-Compatible API Gateway** (`/v1/chat/completions`). It enables everyday consumer hardware (laptops, desktops, and local workstations) to pool idle RAM and GPU VRAM together to load and run Large Language Models collaboratively.
 
-Instead of requiring a single \$10,000+ GPU rig, ShardAi splits (shards) an AI model across multiple peers using **Pipeline Parallelism**. Each node holds only a few layers of the model and passes intermediate activations (tensors) to the next peer over LAN or the Internet.
+Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) model layers across participating peers using **Pipeline Parallelism**. Each node loads only its assigned slice of model layers into memory and streams compressed intermediate activation tensors directly to the next peer in the pipeline.
 
-> **Note:** This repository (`ShardAi`) contains the open-source client application (Desktop GUI + Core AI/P2P Engine). For transparency and security, all local memory allocation and P2P tensor routing logic are 100% open for community audit.
+> **Client-Only Open-Source Repository:** This repository (`shardai-node`) contains **100% client-side code** — the native **Tauri v2 Desktop App** (`src-ui/` + `src-tauri/`) and the local **Python AI & P2P Core Engine** (`core-engine/`). It operates across three network modes: **Internet Swarm** (via a configurable Signaling REST API endpoint), **LAN Only** (zero-config local mDNS discovery), and **Offline Solo** (100% local execution).
+
+---
 
 ## ✨ Key Features
 
-* **🧠 Dynamic Model Sharding:** Automatically slices GGUF models (e.g., Llama-3.1-8B, Qwen-2.5) based on the exact RAM/VRAM limit you allocate via the UI slider.
-* **🌐 Hybrid P2P Networking:** Seamlessly discovers peers on Local Area Networks (mDNS/UDP) for ultra-low latency or connects globally over WAN via lightweight signaling trackers.
-* **⚡ Zero-Bloat Desktop App:** Built with **Tauri (Rust)** instead of Electron, ensuring the client itself consumes minimal RAM (<50MB), leaving maximum memory for AI workloads.
-* **📦 Automatic Layer Fetching:** Streams and caches only the specific model weights required for your assigned layers directly from Hugging Face.
-* **🔒 Privacy-First & Auditable:** End-to-end serialized binary tensor streaming (`msgpack`/`lz4`). Peers only process mathematical hidden states, never raw user prompts (except entry/exit nodes).
+* **🔌 Local OpenAI-Compatible API Gateway:** Exposes `POST http://127.0.0.1:8000/v1/chat/completions` (streaming SSE & non-streaming) and `GET /v1/models`, allowing drop-in integration with Cursor, Continue, OpenWebUI, LangChain, and the official OpenAI SDKs.
+* **🧠 Dynamic Layer Sharding:** Automatically slices GGUF (`llama-cpp-python` with `mmap` fallback) and Hugging Face `safetensors` (`PyTorch`) models based on the RAM/VRAM budget you allocate in the desktop UI.
+* **🌐 Hybrid Network Modes (Online / LAN / Offline Solo):**
+  * **Internet Swarm:** Connects to public or private rooms via a configurable Signaling REST API (`SHARDAI_TRACKER_URL`).
+  * **LAN Only (`zeroconf` mDNS):** Discovers peers automatically on your local network (`_shardai._tcp.local.`) with zero external internet dependency.
+  * **Offline Solo Fallback:** Runs all model layers locally on a single machine when offline or unassisted.
+* **⚡ Lightweight Native Desktop Shell:** Built with **Tauri v2 (Rust)** and **React 18 + TypeScript**, providing system tray controls, hardware telemetry, collapsible workspace navigation, and automatic Python sidecar lifecycle management (zero orphan/zombie processes).
+* **🔒 Binary Tensor Streaming & Loopback Security:** Uses `lz4`-compressed binary tensor framing over P2P sockets (never `pickle` or raw JSON tensors) and binds the local control plane strictly to `127.0.0.1` with IPC token authentication (`X-ShardAi-Local-Token`).
 
-## 🏗 Architecture
+---
 
-ShardAi separates the **Control Plane (Signaling/Tracker)** from the **Data Plane (P2P Tensor Pipeline)**:
+## 🏗 Client Architecture
+
+`shardai-node` is structured into three decoupled client layers:
 
 ```text
-+-------------------------------------------------------------------+
-|                        ShardAi Desktop Client                     |
-|  +-----------------------------+   +---------------------------+  |
-|  |   Tauri UI (React + Rust)   |   |   Core Engine (Python)    |  |
-|  |  - RAM Allocation Slider    |-->|  - FastAPI Local IPC      |  |
-|  |  - Model Selector           |   |  - llama.cpp Sharding     |  |
-|  |  - System Tray Daemon       |   |  - Binary Tensor Streamer|  |
-|  +-----------------------------+   +-------------+-------------+  |
-+--------------------------------------------------|----------------+
-                                                   |
-                   1. Announce / Discover Peers    | 2. Direct P2P Tensor Pipeline
-                      (HTTP/REST Heartbeat)        |    (TCP/WebSockets + LZ4)
-                                                   v
-                +--------------------+      +------+------+
-                |  Signaling Server  |      |   Peer B    |
-                | (Cloudflare Edge)  |      | Layers 16-31|
-                +--------------------+      +-------------+
++-----------------------------------------------------------------------+
+|                     ShardAi Node (Desktop Client)                     |
+|                                                                       |
+|  +------------------------------+   +------------------------------+  |
+|  |  Tauri v2 Shell (UI + Rust)  |   |    Core Engine (Python)      |  |
+|  |  - React 18 + TypeScript UI  |-->|  - FastAPI (127.0.0.1:8000)  |  |
+|  |  - RAM/VRAM Budget Controls  |   |  - /v1/chat/completions      |  |
+|  |  - Rooms Lobby & Telemetry   |   |  - PyTorch / llama.cpp Shards|  |
+|  |  - Rust Sidecar Supervisor   |   |  - LAN mDNS & P2P Transport  |  |
+|  +------------------------------+   +--------------+---------------+  |
++----------------------------------------------------|------------------+
+                                                     |
+          +------------------------------------------+------------------------------------------+
+          | 1a. Optional Room Discovery              | 1b. Local LAN Discovery                  | 2. Direct P2P Tensor Pipeline
+          |     (Configurable Signaling REST API)    |     (Zeroconf mDNS: _shardai._tcp.local) |    (Binary Frame + LZ4 Stream)
+          v                                          v                                          v
++-----------------------+                  +-------------------+                      +-------------------+
+|   Signaling Tracker   |                  |     LAN Peers     |                      |   Peer Node B     |
+| (SHARDAI_TRACKER_URL) |                  |  (Local Subnet)   |                      |  (Layers 16..31)  |
++-----------------------+                  +-------------------+                      +-------------------+
 ```
 
-1. **Discovery (Signaling):** When you click *Start Sharing*, your node registers its available RAM, assigned model, and endpoint with the lightweight Signaling Tracker.
-2. **Allocation:** The Core Engine downloads the required model shards from Hugging Face and loads specific layers (e.g., `Layers 0..15`) into memory via `llama.cpp`.
-3. **Pipeline Inference:** When an inference request arrives, Peer A computes its layers, serializes the output tensors into compressed binary frames, and streams them directly to Peer B (`Layers 16..31`) to generate the final tokens.
+1. **Pre-Flight & Room Admission:** When joining a room, `core-engine` verifies room availability, downloads only the required model weights/shards from Hugging Face into `core-engine/cache_models/`, and loads the assigned layer range into RAM/VRAM.
+2. **Peer Discovery:** Nodes discover pipeline neighbors either via the configurable Signaling REST API (`POST /announce`, `GET /rooms`, `GET /peers/:room_id/:model`, `GET /config/models`) or locally on LAN via `zeroconf` mDNS.
+3. **Distributed Pipeline Inference:** Requests sent to `http://127.0.0.1:8000/v1/chat/completions` traverse the layer pipeline across connected peers using compressed binary tensor streams and return standard OpenAI chat completion payloads.
 
-## 🛠 Tech Stack
+---
 
-* **Desktop & Native OS Integration:** [Tauri](https://tauri.app/) (Rust), React, TypeScript, TailwindCSS
-* **Core AI & Inference Engine:** Python 3.10+, `llama-cpp-python`, PyTorch, Hugging Face Hub
-* **Local IPC & P2P Transport:** FastAPI, `asyncio`, WebSockets / Raw TCP Sockets, `msgpack` + `lz4` compression
-* **Signaling & Discovery (Cloud):** Cloudflare Workers, Hono, Cloudflare KV (TTL-based peer registry)
+## 🛠 Tech Stack (`shardai-node`)
+
+* **Desktop UI (`src-ui/`):** React 18, TypeScript (strict mode), Vite, Vitest, Testing Library
+* **Native Desktop Core (`src-tauri/`):** Rust (Edition 2021), Tauri v2 (`tray-icon`, native dialog plugin, thread-safe Python sidecar process supervisor)
+* **AI & P2P Engine (`core-engine/`):** Python 3.11+, FastAPI, Uvicorn, Pydantic v2, PyTorch, `transformers`, `safetensors`, `accelerate`, `llama-cpp-python` (optional GGUF extra), `huggingface-hub`, `typer`
+* **Networking & Serialization:** `httpx` (async REST client with exponential backoff), `zeroconf` (LAN mDNS discovery), `lz4` binary tensor compression, raw TCP / HTTP tensor transport
+
+---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 
-Ensure you have the following installed on your development machine:
-
-* **Node.js** (v18+) & `pnpm`
-* **Rust & Cargo** (latest stable via `rustup`)
-* **Python** (3.10 or 3.11) & `uv` (or `poetry`)
-* **C++ Build Tools** (Required for compiling `llama-cpp-python` with hardware acceleration like Metal, CUDA, or AVX2)
+* **Node.js** `>= 20` & **npm**
+* **Rust & Cargo** (latest stable toolchain via `rustup`)
+* **Python** `>= 3.11` (with `venv` or `uv`)
+* **C++ Build Tools** (optional, required only if compiling `llama-cpp-python` from source with CUDA / Metal / AVX2 acceleration)
 
 ### Installation
 
@@ -83,67 +100,131 @@ Ensure you have the following installed on your development machine:
    cd ShardAi
    ```
 
-2. **Setup the Python Core Engine:**
+2. **Set up the Python Core Engine (`core-engine/`):**
    ```bash
    cd core-engine
    python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   # Windows (PowerShell):
+   .\.venv\Scripts\Activate.ps1
+   # macOS / Linux:
+   # source .venv/bin/activate
+
    pip install -r requirements.txt
    cd ..
    ```
 
-3. **Install Frontend & Tauri Dependencies:**
+3. **Install Desktop & Frontend Dependencies:**
    ```bash
-   pnpm install
+   npm install
+   npm --prefix src-ui install
    ```
 
 ### Running in Development Mode
 
-Start the Tauri desktop application (which will automatically spawn the Python background engine):
+1. **Start the Python Core Engine (Daemon Mode on `127.0.0.1:8000`):**
+   ```bash
+   cd core-engine
+   python main.py --mode daemon --host 127.0.0.1 --port 8000
+   ```
+
+2. **Launch the Tauri Desktop Client (or Vite UI Dev Server):**
+   ```bash
+   # Full native Tauri desktop app:
+   npm run tauri dev
+
+   # Or frontend UI dev server only (http://localhost:1420):
+   npm run dev:ui
+   ```
+
+3. **Using the Local OpenAI-Compatible API Gateway:**
+   Once your node is active, point any OpenAI-compatible client to `http://127.0.0.1:8000/v1`:
+   ```bash
+   curl http://127.0.0.1:8000/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "Qwen/Qwen2.5-1.5B-Instruct",
+       "messages": [{"role": "user", "content": "Hello from ShardAi P2P pipeline!"}],
+       "stream": false
+     }'
+   ```
+
+---
+
+## ⚙️ Environment Variables
+
+`shardai-node` never hardcodes private keys or non-configurable endpoints. You can customize client behavior via environment variables:
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `SHARDAI_TRACKER_URL` | `https://network.shardai.online` | Base URL of the public/custom Signaling REST API for Internet Swarm discovery |
+| `SHARDAI_OFFLINE_MODE` | `false` | Set to `true` (or `1`) to disable Internet Tracker calls and operate strictly in LAN / Offline Solo mode |
+| `SHARDAI_LOCAL_TOKEN` | Auto-generated by Tauri | Internal IPC authentication token verified via `X-ShardAi-Local-Token` on local control routes |
+| `SHARDAI_P2P_PORT` | `9100` | Local TCP port used for peer-to-peer binary tensor streaming |
+
+---
+
+## 🧪 Running Automated Tests
 
 ```bash
-pnpm tauri dev
+# 1. Python Core Engine unit & integration tests (pytest)
+cd core-engine
+pytest -v
+
+# 2. Frontend React/TypeScript unit tests (Vitest) & typecheck/build
+cd ../src-ui
+npm run test
+npm run build
+
+# 3. Rust Tauri shell unit tests (Cargo)
+cd ../src-tauri
+cargo test
 ```
 
-1. Select a supported model from the dropdown (e.g., `meta-llama/Llama-3.1-8B-Instruct`).
-2. Adjust the **RAM Allocation Slider** (e.g., `4 GB`).
-3. Click **Start Sharing** to download shards and join the swarm.
+For production packaging instructions (Standalone CLI executable, Windows `.msi`/`.exe` installers, and macOS Universal `.dmg`), see [`docs/BUILD.md`](docs/BUILD.md).
+
+---
 
 ## 📂 Project Structure
 
 ```text
 ShardAi/
-├── .antigravity/        # AI Agent coding rules, review checklists, and test guidelines
-├── assets/              # Project branding, logos, and media files
-├── core-engine/         # Python AI & P2P background daemon
-│   ├── api/             # FastAPI local IPC endpoints (/start-node, /generate)
-│   ├── models/          # HuggingFace downloader & llama.cpp layer sharding
-│   ├── p2p/             # Binary serialization, compression, and socket routing
-│   └── tests/           # Pytest unit and integration tests
-├── src-tauri/           # Rust backend (System tray, child process lifecycle)
-├── src-ui/              # React + TypeScript frontend dashboard
-└── docs/                # Architecture specs and protocol documentation
+├── .github/             # GitHub Actions release workflows & declarative repo metadata
+├── assets/              # Project branding and application logos
+├── core-engine/         # Python AI sharding & P2P background engine (FastAPI)
+│   ├── models/          # Hugging Face downloader, GGUF reader & shard runner
+│   ├── p2p/             # Peer discovery, mDNS (zeroconf), LZ4 binary serializer & transport
+│   ├── shard_engine/    # Memory manager, Pydantic v2 schemas & signaling REST client
+│   ├── tests/           # Pytest unit and integration test suites
+│   ├── main.py          # FastAPI control plane, /v1/chat/completions gateway & CLI entry
+│   ├── pyproject.toml   # Python project metadata & tool configuration
+│   └── requirements.txt # Pinned runtime and test dependencies
+├── docs/                # Build and cross-platform packaging documentation (BUILD.md)
+├── scripts/             # PyInstaller sidecar & standalone CLI build scripts (.ps1 / .sh)
+├── src-tauri/           # Rust native shell (windowing, system tray, Python process guard)
+├── src-ui/              # React 18 + TypeScript desktop UI dashboard
+├── package.json         # Root Tauri CLI & UI workspace scripts
+└── README.md            # Client documentation
 ```
 
-## 🗺 Roadmap
-
-* [x] **Phase 1: Core Architecture & Signaling** — Lightweight Edge Tracker with TTL peer discovery.
-* [x] **Phase 2: Desktop Wrapper** — Tauri + React UI communicating with local Python FastAPI daemon.
-* [x] **Phase 3: Model Sharding & Pipeline** — `llama.cpp` layer splitting and binary tensor streaming.
-* [ ] **Phase 4: Fault Tolerance & Auto-Rerouting** — Automatic pipeline recovery when a mid-chain peer disconnects mid-generation.
-* [ ] **Phase 5: End-to-End Encryption (E2EE)** — Cryptographic blinding of activations so edge nodes cannot reconstruct prompt data.
-* [ ] **Phase 6: Standalone CLI & Docker Image** — Headless mode for Linux servers and pro-users.
+---
 
 ## 🤝 Contributing
 
-Contributions are what make the open-source community an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
+Contributions to `shardai-node` are welcome!
 
-1. Fork the Project (`https://github.com/mikehoai/ShardAi`)
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Ensure all tests pass (`pytest` for Python, `pnpm test` for UI, `cargo test` for Rust)
-4. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-5. Push to the Branch (`git push origin feature/AmazingFeature`)
-6. Open a Pull Request
+1. Fork the repository ([https://github.com/mikehoai/ShardAi](https://github.com/mikehoai/ShardAi))
+2. Create a feature branch (`git checkout -b feat/your-feature`)
+3. Run the automated test suites (`pytest`, `npm --prefix src-ui run test`, `cargo test`)
+4. Commit your changes using Conventional Commits (`git commit -m "feat(node): add your feature"`)
+5. Open a Pull Request
+
+---
+
+## 🔗 Links
+
+* **Official Website:** [https://shardai.online](https://shardai.online)
+* **GitHub Repository:** [https://github.com/mikehoai/ShardAi](https://github.com/mikehoai/ShardAi)
+* **Issue Tracker:** [https://github.com/mikehoai/ShardAi/issues](https://github.com/mikehoai/ShardAi/issues)
 
 ## 📄 License
 

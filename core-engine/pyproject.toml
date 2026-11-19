@@ -3,6 +3,7 @@ name = "shardai-core-engine"
 version = "0.1.0"
 description = "ShardAi Local AI Sharding & P2P Engine (FastAPI + PyTorch/llama.cpp)"
 readme = "../README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
@@ -19,6 +20,12 @@ dependencies = [
     "lz4>=4.3.3",
     "zeroconf>=0.132.0",
 ]
+
+[project.urls]
+Homepage = "https://shardai.online"
+Website = "https://shardai.online"
+Repository = "https://github.com/mikehoai/ShardAi"
+Issues = "https://github.com/mikehoai/ShardAi/issues"
 
 [project.optional-dependencies]
 gguf = [

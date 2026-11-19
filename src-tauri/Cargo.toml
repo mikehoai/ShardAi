@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "ShardAi P2P Distributed LLM Desktop Client (Tauri Shell)"
 authors = ["ShardAi Team"]
 edition = "2021"
+license = "MIT"
+homepage = "https://shardai.online"
+repository = "https://github.com/mikehoai/ShardAi"
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
