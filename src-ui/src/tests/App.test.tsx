@@ -127,4 +127,77 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     expect(stoppedStatus.session_token).toBeNull();
     expect(stoppedStatus.allocated_ram_mb).toBe(0);
   });
+
+  it("blocks model download and room join immediately when /rooms/check-join returns 409", async () => {
+    const mockRooms: RoomLobbyItem[] = [
+      {
+        room_id: "deepseek-r1-vn-01",
+        model: "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
+        nodes_online: 3,
+        total_shared_ram_gb: 12,
+        is_private: false,
+        network_scope: "internet",
+        coverage_percent: 100,
+        redundancy_factor: 1,
+      },
+    ];
+
+    const rejectionDetail =
+      'Room "deepseek-r1-vn-01" is at 100% RAM/Layer capacity and cannot accept new nodes.';
+    const calledUrls: string[] = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      calledUrls.push(url);
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify(mockRooms), { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(JSON.stringify({ detail: rejectionDetail }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("join-room-deepseek-r1-vn-01")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("join-room-deepseek-r1-vn-01"));
+
+    await waitFor(() => {
+      expect(screen.getByText(rejectionDetail)).toBeTruthy();
+    });
+
+    expect(calledUrls.some((u) => u.includes("/rooms/check-join"))).toBe(true);
+    expect(calledUrls.some((u) => u.includes("/models/download-stream"))).toBe(false);
+    expect(calledUrls.some((u) => u.includes("/start-node"))).toBe(false);
+    expect(screen.queryByTestId("model-download-progress-bar")).toBeNull();
+  });
 });

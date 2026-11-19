@@ -74,6 +74,29 @@ def hash_room_key(room_key: str | None) -> str | None:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
 
 
+def extract_tracker_error_detail(
+    response: httpx.Response,
+    fallback: str,
+) -> str:
+    """Extract a human-readable error message from a Signaling Tracker JSON error response."""
+    try:
+        payload: Any = response.json()
+    except Exception:
+        return fallback
+
+    if isinstance(payload, dict):
+        error_obj = payload.get("error")
+        if isinstance(error_obj, dict):
+            nested_msg = error_obj.get("message")
+            if isinstance(nested_msg, str) and nested_msg.strip():
+                return nested_msg.strip()
+        for key in ("message", "detail"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return fallback
+
+
 class SignalingTrackerClient:
     """Client for node registration and peer discovery via the central REST Signaling Server."""
 
@@ -372,6 +395,25 @@ class SignalingTrackerClient:
         )
         raw_peers: list[dict[str, Any]] = response_data.get("peers", [])
         return [_normalize_peer(raw, room_id) for raw in raw_peers]
+
+    async def check_room_join(
+        self,
+        model_id: str,
+        room_id: str = "public",
+        room_key: str | None = None,
+        room_key_hash: str | None = None,
+    ) -> list[PeerNodeInfo]:
+        """Pre-flight check against `GET /peers/:room_id/:model` without mutating tracker state.
+
+        Raises `httpx.HTTPStatusError` immediately (no retries) on deterministic 403/409
+        rejections (invalid private room key, full room, or busy join queue).
+        """
+        return await self.fetch_peers(
+            model_id=model_id,
+            room_id=room_id,
+            room_key=room_key,
+            room_key_hash=room_key_hash,
+        )
 
     async def unregister_node(
         self, node_id: str, room_id: str | None = None

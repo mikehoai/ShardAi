@@ -62,6 +62,8 @@ from shard_engine.memory_manager import (
 from shard_engine.schemas import (
     CatalogModelItem,
     ChatMessage,
+    CheckRoomJoinRequest,
+    CheckRoomJoinResponse,
     ComputeBackend,
     GenerateRequest,
     ModelCatalogResponse,
@@ -84,6 +86,7 @@ from shard_engine.tracker_client import (
     AnnounceAssignment,
     SignalingTrackerClient,
     TrackerUnreachableError,
+    extract_tracker_error_detail,
     hash_room_key,
 )
 
@@ -1023,6 +1026,83 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
     return rooms_list
 
 
+async def _verify_cloud_room_join_permission(
+    room_id: str,
+    model_id: str,
+    network_mode: NetworkMode = NetworkMode.INTERNET,
+    room_key: str | None = None,
+) -> tuple[bool, str]:
+    """Verify with the Cloud Signaling Tracker whether this node may join `room_id`.
+
+    Raises `HTTPException` (403 or 409) immediately on deterministic tracker rejection so
+    no model download or offline fallback occurs. Genuine network/5xx errors allow
+    continuation into the existing LAN / Offline Solo fallback chain.
+    """
+    if not _is_tracker_enabled() or network_mode != NetworkMode.INTERNET:
+        return True, "Cloud pre-flight skipped for LAN/offline mode."
+
+    try:
+        await runtime.tracker_client.check_room_join(
+            model_id=model_id,
+            room_id=room_id,
+            room_key=room_key,
+        )
+        runtime.last_tracker_reachable = True
+        return True, f"Room '{room_id}' is available to join."
+    except httpx.HTTPStatusError as http_exc:
+        status_code = http_exc.response.status_code
+        if status_code == status.HTTP_403_FORBIDDEN:
+            detail = extract_tracker_error_detail(
+                http_exc.response,
+                f"Invalid room key for private room '{room_id}'.",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=detail,
+            ) from http_exc
+        if status_code == status.HTTP_409_CONFLICT:
+            detail = extract_tracker_error_detail(
+                http_exc.response,
+                f"Room '{room_id}' is full or currently busy and cannot be joined.",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=detail,
+            ) from http_exc
+        logger.warning(
+            "Tracker room check returned HTTP %d; allowing offline/LAN fallback.",
+            status_code,
+        )
+        return True, "Cloud tracker returned a transient error; offline/LAN fallback enabled."
+    except (TrackerUnreachableError, httpx.HTTPError, OSError) as tracker_exc:
+        runtime.last_tracker_reachable = False
+        logger.warning(
+            "Cloudflare Tracker unreachable during room pre-flight (%s); allowing offline/LAN fallback.",
+            tracker_exc,
+        )
+        return True, "Cloud tracker unreachable; offline/LAN fallback enabled."
+
+
+@app.post(
+    "/rooms/check-join",
+    response_model=CheckRoomJoinResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def check_room_join(request: CheckRoomJoinRequest) -> CheckRoomJoinResponse:
+    """Pre-flight admission check before downloading model weights or joining a room."""
+    allowed, msg = await _verify_cloud_room_join_permission(
+        room_id=request.room_id,
+        model_id=request.model_id,
+        network_mode=request.network_mode,
+        room_key=request.room_key,
+    )
+    return CheckRoomJoinResponse(
+        allowed=allowed,
+        room_id=request.room_id,
+        message=msg,
+    )
+
+
 @app.get("/models/catalog", response_model=ModelCatalogResponse)
 async def get_model_catalog() -> ModelCatalogResponse:
     """Sync enabled models from Cloud `GET /config/models` and cache to `~/.shardai/models_cache.json`."""
@@ -1078,8 +1158,20 @@ async def stream_model_download(
     ram_gb: int | None = None,
     source_type: ModelSourceType = ModelSourceType.CATALOG,
     filename: str | None = None,
+    room_id: str | None = None,
+    room_key: str | None = None,
+    network_mode: NetworkMode = NetworkMode.INTERNET,
 ) -> StreamingResponse:
     """Ensure any requested catalog, HF repo, direct URL, or local `.gguf` model is ready."""
+    cleaned_room_id = room_id.strip() if room_id is not None else ""
+    if cleaned_room_id:
+        await _verify_cloud_room_join_permission(
+            room_id=cleaned_room_id,
+            model_id=model_id.strip(),
+            network_mode=network_mode,
+            room_key=room_key,
+        )
+
     try:
         cleaned_id = model_id.strip()
         if not cleaned_id:
@@ -1310,9 +1402,22 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                     )
             except httpx.HTTPStatusError as http_exc:
                 if http_exc.response.status_code == status.HTTP_403_FORBIDDEN:
+                    detail = extract_tracker_error_detail(
+                        http_exc.response,
+                        f"Invalid room key for private room '{request.room_id}'.",
+                    )
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        detail=f"Invalid room key for private room '{request.room_id}'.",
+                        detail=detail,
+                    ) from http_exc
+                if http_exc.response.status_code == status.HTTP_409_CONFLICT:
+                    detail = extract_tracker_error_detail(
+                        http_exc.response,
+                        f"Room '{request.room_id}' is full or currently busy and cannot be joined.",
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=detail,
                     ) from http_exc
                 logger.warning(
                     "Tracker rejected announce (HTTP %d); falling back to OFFLINE_MODE.",
@@ -1560,7 +1665,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                 f"[{effective_backend.value}{offload_note}]."
             )
         )
-    except HTTPException:
+    except HTTPException as http_err:
         runtime.session_token = None
         runtime.is_swarm_ready = False
         runtime.coverage_percent = 0.0
@@ -1572,7 +1677,11 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
             runtime.model_runner.release()
             runtime.model_runner = None
         runtime.memory_manager.release_all()
-        runtime.state = NodeState.ERROR
+        runtime.state = (
+            NodeState.STOPPED
+            if http_err.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_409_CONFLICT)
+            else NodeState.ERROR
+        )
         raise
     except Exception as exc:
         runtime.session_token = None

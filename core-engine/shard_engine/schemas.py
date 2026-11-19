@@ -277,6 +277,60 @@ class RoomLobbyItem(BaseModel):
     )
 
 
+class CheckRoomJoinRequest(BaseModel):
+    """Pre-flight request verifying whether a node is permitted to join a room before downloading."""
+
+    room_id: str = Field(
+        default="public",
+        max_length=128,
+        description="Target room ID ('public' or custom room name)",
+    )
+    model_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=1024,
+        description="Target model identifier",
+    )
+    network_mode: NetworkMode = Field(
+        default=NetworkMode.INTERNET,
+        description="Network scope: 'lan' or 'internet'",
+    )
+    room_key: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Optional secret key for private rooms; hashed with SHA-256 before transmission",
+    )
+
+    @field_validator("room_id", mode="before")
+    @classmethod
+    def _normalize_room_id(cls, value: str | None) -> str:
+        if value is None:
+            return "public"
+        cleaned = value.strip()
+        return cleaned if cleaned else "public"
+
+    @field_validator("room_key", mode="before")
+    @classmethod
+    def _normalize_room_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned if cleaned else None
+
+    @field_validator("model_id", mode="before")
+    @classmethod
+    def _normalize_model_id(cls, value: str) -> str:
+        return value.strip()
+
+
+class CheckRoomJoinResponse(BaseModel):
+    """Pre-flight room admission result returned by `POST /rooms/check-join`."""
+
+    allowed: bool = True
+    room_id: str
+    message: str = "Room is available to join."
+
+
 class NodeStatusResponse(BaseModel):
     """Current runtime status of the local ShardAi Node returned to Tauri UI."""
 

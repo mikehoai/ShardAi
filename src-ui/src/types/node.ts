@@ -61,6 +61,19 @@ export interface RoomLobbyItem {
   redundancy_factor?: number;
 }
 
+export interface CheckRoomJoinRequest {
+  room_id: string;
+  model_id: string;
+  network_mode: NetworkMode;
+  room_key?: string | null;
+}
+
+export interface CheckRoomJoinResponse {
+  allowed: boolean;
+  room_id: string;
+  message: string;
+}
+
 export interface SystemMemoryResponse {
   total_ram_gb: number;
   available_ram_gb: number;
