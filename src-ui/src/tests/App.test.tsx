@@ -10,6 +10,7 @@ import type {
 describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    window.localStorage.clear();
   });
 
   it("renders Network Rooms Lobby table, Refresh button, and Create/Unlisted Room modal", async () => {
@@ -126,5 +127,70 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     expect(stoppedStatus.state).toBe("STOPPED");
     expect(stoppedStatus.session_token).toBeNull();
     expect(stoppedStatus.allocated_ram_mb).toBe(0);
+  });
+
+  it("hides and unhides the navigation sidebar menu via toggle button and persists state", () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+
+    const { unmount } = render(<Dashboard />);
+
+    const toggleBtn = screen.getByTestId("sidebar-toggle-btn");
+    const sidebar = screen.getByTestId("native-sidebar");
+
+    // Visible by default
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("true");
+    expect(sidebar.classList.contains("collapsed")).toBe(false);
+    expect(sidebar.hidden).toBe(false);
+    expect(sidebar.getAttribute("aria-hidden")).toBe("false");
+
+    // Click to hide
+    fireEvent.click(toggleBtn);
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+    expect(sidebar.classList.contains("collapsed")).toBe(true);
+    expect(sidebar.hidden).toBe(true);
+    expect(sidebar.getAttribute("aria-hidden")).toBe("true");
+    expect(window.localStorage.getItem("shardai_sidebar_hidden")).toBe("true");
+
+    // Persists hidden state across remount
+    unmount();
+    render(<Dashboard />);
+    const remountedToggle = screen.getByTestId("sidebar-toggle-btn");
+    const remountedSidebar = screen.getByTestId("native-sidebar");
+    expect(remountedToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(remountedSidebar.hidden).toBe(true);
+
+    // Click to unhide
+    fireEvent.click(remountedToggle);
+    expect(remountedToggle.getAttribute("aria-expanded")).toBe("true");
+    expect(remountedSidebar.classList.contains("collapsed")).toBe(false);
+    expect(remountedSidebar.hidden).toBe(false);
+    expect(window.localStorage.getItem("shardai_sidebar_hidden")).toBe("false");
+  });
+
+  it("toggles sidebar with Ctrl+B shortcut unless focus is inside an input field", () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+
+    render(<Dashboard />);
+
+    const toggleBtn = screen.getByTestId("sidebar-toggle-btn");
+    const sidebar = screen.getByTestId("native-sidebar");
+
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("true");
+
+    // Ctrl+B on window hides sidebar
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+    expect(sidebar.hidden).toBe(true);
+
+    // Ctrl+B inside an input does NOT toggle sidebar
+    const roomInput = screen.getByTestId("room-id-input");
+    fireEvent.keyDown(roomInput, { key: "b", ctrlKey: true });
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+    expect(sidebar.hidden).toBe(true);
+
+    // Meta+B on window restores sidebar
+    fireEvent.keyDown(window, { key: "B", metaKey: true });
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("true");
+    expect(sidebar.hidden).toBe(false);
   });
 });

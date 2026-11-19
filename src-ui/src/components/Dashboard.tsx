@@ -112,6 +112,13 @@ async function invokeTauriCommand<T>(
 export const Dashboard: React.FC = () => {
   // Native Desktop Shell State (Navigation + OS/User Theme)
   const [activeSection, setActiveSection] = useState<NavSection>("overview");
+  const [isSidebarHidden, setIsSidebarHidden] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem("shardai_sidebar_hidden") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     try {
       const saved = window.localStorage.getItem("shardai_theme");
@@ -124,6 +131,49 @@ export const Dashboard: React.FC = () => {
     return "system";
   });
   const [isMaximized, setIsMaximized] = useState<boolean>(false);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "shardai_sidebar_hidden",
+        isSidebarHidden ? "true" : "false"
+      );
+    } catch {
+      // Ignore storage write errors
+    }
+  }, [isSidebarHidden]);
+
+  const toggleSidebar = useCallback((): void => {
+    setIsSidebarHidden((prev) => !prev);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) {
+        return;
+      }
+      if (event.key.toLowerCase() !== "b") {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      toggleSidebar();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [toggleSidebar]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", themeMode);
@@ -920,6 +970,43 @@ export const Dashboard: React.FC = () => {
         }}
       >
         <div className="native-titlebar-left" data-tauri-drag-region>
+          <button
+            type="button"
+            data-testid="sidebar-toggle-btn"
+            className="sidebar-toggle-btn"
+            onClick={toggleSidebar}
+            aria-expanded={!isSidebarHidden}
+            aria-controls="primary-navigation-sidebar"
+            aria-label={isSidebarHidden ? "Show sidebar menu" : "Hide sidebar menu"}
+            title={isSidebarHidden ? "Show Sidebar (Ctrl+B)" : "Hide Sidebar (Ctrl+B)"}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="1.75" y="2.25" width="12.5" height="11.5" rx="2" />
+              <line x1="6" y1="2.25" x2="6" y2="13.75" />
+              {!isSidebarHidden && (
+                <rect
+                  x="2.25"
+                  y="2.75"
+                  width="3.25"
+                  height="10.5"
+                  rx="1"
+                  fill="currentColor"
+                  stroke="none"
+                  opacity="0.28"
+                />
+              )}
+            </svg>
+          </button>
           <img
             src="/logo.png"
             alt="ShardAi Logo"
@@ -1035,7 +1122,14 @@ export const Dashboard: React.FC = () => {
       {/* Desktop Split Body: Left Sidebar + Main Workspace                   */}
       {/* =================================================================== */}
       <div className="native-body">
-        <aside className="native-sidebar" aria-label="Primary Navigation">
+        <aside
+          id="primary-navigation-sidebar"
+          data-testid="native-sidebar"
+          className={`native-sidebar${isSidebarHidden ? " collapsed" : ""}`}
+          aria-label="Primary Navigation"
+          aria-hidden={isSidebarHidden}
+          hidden={isSidebarHidden}
+        >
           <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             <nav>
               <div className="sidebar-section-label">Workspace</div>
