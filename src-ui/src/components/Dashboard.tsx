@@ -14,6 +14,11 @@ import type {
   StartNodeRequest,
   SystemMemoryResponse,
 } from "../types/node";
+import {
+  checkRoomJoin,
+  extractApiErrorDetail,
+  RoomJoinRejectedError,
+} from "../services/engineApi";
 
 const LOCAL_ENGINE_ROOT = "http://127.0.0.1:8000";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000/v1";
@@ -503,7 +508,12 @@ export const Dashboard: React.FC = () => {
   const streamModelDownload = async (
     modelId: string,
     sourceType: ModelSourceType = "catalog",
-    filename?: string | null
+    filename?: string | null,
+    roomContext?: {
+      roomId: string;
+      networkMode: NetworkMode;
+      roomKey?: string | null;
+    }
   ): Promise<void> => {
     setDownloadProgress(0);
     setDownloadStatusMsg(`Checking cache / preparing ${modelId}...`);
@@ -533,10 +543,24 @@ export const Dashboard: React.FC = () => {
     if (filename) {
       params.set("filename", filename);
     }
+    if (roomContext?.roomId) {
+      params.set("room_id", roomContext.roomId);
+      params.set("network_mode", roomContext.networkMode);
+      if (roomContext.roomKey) {
+        params.set("room_key", roomContext.roomKey);
+      }
+    }
 
     const response = await fetch(
       `${LOCAL_ENGINE_ROOT}/models/download-stream?${params.toString()}`
     );
+    if (response.status === 403 || response.status === 409) {
+      const detail = await extractApiErrorDetail(
+        response,
+        `Cannot join room '${roomContext?.roomId ?? roomId}' (HTTP ${response.status}).`
+      );
+      throw new RoomJoinRejectedError(response.status, detail);
+    }
     if (!response.ok || !response.body) {
       throw new Error(`Failed to stream model download: HTTP ${response.status}`);
     }
@@ -667,13 +691,37 @@ export const Dashboard: React.FC = () => {
 
     setIsBusy(true);
     setErrorMessage(null);
+    setDownloadProgress(null);
+    setDownloadStatusMsg("");
 
     try {
       setStatusMessage("Starting local Python core engine...");
       await invokeTauriCommand<string>("start_python_core");
 
+      // Pre-flight room admission check BEFORE downloading any model weights
+      setStatusMessage(`Checking room '${targetRoom}' availability...`);
+      try {
+        await checkRoomJoin({
+          room_id: targetRoom,
+          model_id: targetModel,
+          network_mode: targetMode,
+          room_key: targetKey || null,
+        });
+      } catch (checkErr: unknown) {
+        if (checkErr instanceof RoomJoinRejectedError) {
+          throw checkErr;
+        }
+        if (isTauriEnvironment()) {
+          throw checkErr;
+        }
+      }
+
       setStatusMessage("Checking and preparing model weights...");
-      await streamModelDownload(targetModel, targetSourceType, targetFilename);
+      await streamModelDownload(targetModel, targetSourceType, targetFilename, {
+        roomId: targetRoom,
+        networkMode: targetMode,
+        roomKey: targetKey || null,
+      });
 
       setStatusMessage(
         `Joining ${targetMode.toUpperCase()} room '${targetRoom}' & allocating ${sharedRamGb} GB RAM...`
@@ -740,8 +788,18 @@ export const Dashboard: React.FC = () => {
           message: "Gateway simulated in browser preview mode",
         };
       } else {
+        if (response.status === 403 || response.status === 409) {
+          const detail = await extractApiErrorDetail(
+            response,
+            `Cannot join room '${targetRoom}' (HTTP ${response.status}).`
+          );
+          throw new RoomJoinRejectedError(response.status, detail);
+        }
         if (!response.ok) {
-          const errText = await response.text();
+          const errText = await extractApiErrorDetail(
+            response,
+            `Python API /start-node failed (${response.status})`
+          );
           throw new Error(`Python API /start-node failed (${response.status}): ${errText}`);
         }
         data = (await response.json()) as NodeStatusResponse;
@@ -781,11 +839,17 @@ export const Dashboard: React.FC = () => {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setErrorMessage(message);
-      setStatusMessage("Failed to start P2P AI Gateway.");
-      try {
-        await invokeTauriCommand<string>("stop_python_core");
-      } catch {
-        // Ignore secondary cleanup error
+      if (err instanceof RoomJoinRejectedError) {
+        setDownloadProgress(null);
+        setDownloadStatusMsg("");
+        setStatusMessage("Room join rejected — model download cancelled.");
+      } else {
+        setStatusMessage("Failed to start P2P AI Gateway.");
+        try {
+          await invokeTauriCommand<string>("stop_python_core");
+        } catch {
+          // Ignore secondary cleanup error
+        }
       }
     } finally {
       setIsBusy(false);
