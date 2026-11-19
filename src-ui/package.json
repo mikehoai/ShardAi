@@ -2,6 +2,17 @@
   "name": "shardai-node-ui",
   "private": true,
   "version": "0.1.0",
+  "description": "ShardAi Node Desktop UI (React + TypeScript + Tauri v2)",
+  "homepage": "https://shardai.online",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikehoai/ShardAi.git",
+    "directory": "src-ui"
+  },
+  "bugs": {
+    "url": "https://github.com/mikehoai/ShardAi/issues"
+  },
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",

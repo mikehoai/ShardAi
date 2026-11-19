@@ -1,0 +1,23 @@
+{
+  "name": "ShardAi",
+  "component": "shardai-node",
+  "visibility": "public",
+  "description": "Open-source P2P distributed LLM inference desktop client & local OpenAI-compatible API gateway (Tauri + Rust + Python/FastAPI).",
+  "homepage": "https://shardai.online",
+  "repository": "https://github.com/mikehoai/ShardAi",
+  "issues_url": "https://github.com/mikehoai/ShardAi/issues",
+  "license": "MIT",
+  "topics": [
+    "llm",
+    "p2p",
+    "distributed-inference",
+    "openai-api",
+    "local-ai",
+    "tauri",
+    "rust",
+    "python",
+    "fastapi",
+    "llama-cpp",
+    "pytorch"
+  ]
+}

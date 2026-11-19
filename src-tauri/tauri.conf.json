@@ -41,6 +41,7 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "ShardAi Distributed P2P AI Gateway",
+    "homepage": "https://shardai.online",
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
