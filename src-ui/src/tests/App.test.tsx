@@ -421,4 +421,210 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       "Unknown server error."
     );
   });
+
+  it("renders frameless color dots with hover tooltips for network status and gateway active/standby", async () => {
+    const scenarios: Array<{
+      network_status: "online" | "lan_only" | "offline_solo";
+      lan_peers_count: number;
+      expectedTone: "green" | "yellow" | "red";
+      expectedTooltipFragment: string;
+    }> = [
+      {
+        network_status: "online",
+        lan_peers_count: 0,
+        expectedTone: "green",
+        expectedTooltipFragment: "Network: Online (Cloud)",
+      },
+      {
+        network_status: "lan_only",
+        lan_peers_count: 3,
+        expectedTone: "yellow",
+        expectedTooltipFragment: "Network: LAN Only (3 LAN peer(s)",
+      },
+      {
+        network_status: "offline_solo",
+        lan_peers_count: 0,
+        expectedTone: "red",
+        expectedTooltipFragment: "Network: Offline (Solo)",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      vi.restoreAllMocks();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/network-status")) {
+          return new Response(
+            JSON.stringify({
+              network_status: scenario.network_status,
+              tracker_reachable: scenario.network_status === "online",
+              tracker_url: "https://network.shardai.online",
+              lan_peers_count: scenario.lan_peers_count,
+              zeroconf_available: true,
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response("{}", { status: 200 });
+      });
+
+      const { unmount } = render(<Dashboard />);
+
+      await waitFor(() => {
+        const netDot = screen.getByTestId("network-status-indicator");
+        expect(netDot.getAttribute("data-tone")).toBe(scenario.expectedTone);
+        expect(netDot.getAttribute("data-status")).toBe(scenario.network_status);
+        expect(netDot.getAttribute("title")).toContain(scenario.expectedTooltipFragment);
+        expect(netDot.getAttribute("data-tooltip")).toContain(scenario.expectedTooltipFragment);
+        expect(netDot.getAttribute("aria-label")).toContain(scenario.expectedTooltipFragment);
+        expect(netDot.classList.contains("titlebar-status-dot")).toBe(true);
+        expect(netDot.textContent?.trim()).toBe("");
+        expect(netDot.querySelector(`.status-dot--${scenario.expectedTone}`)).toBeTruthy();
+      });
+
+      // Gateway starts in frameless yellow Standby dot with tooltip
+      const gatewayStandbyDot = screen.getByTestId("gateway-badge");
+      expect(gatewayStandbyDot.getAttribute("data-status")).toBe("standby");
+      expect(gatewayStandbyDot.getAttribute("data-tone")).toBe("yellow");
+      expect(gatewayStandbyDot.getAttribute("title")).toBe("Gateway: Standby");
+      expect(gatewayStandbyDot.getAttribute("data-tooltip")).toBe("Gateway: Standby");
+      expect(gatewayStandbyDot.textContent?.trim()).toBe("");
+      expect(gatewayStandbyDot.querySelector(".status-dot--yellow")).toBeTruthy();
+
+      unmount();
+    }
+
+    // Active gateway state renders green dot with Gateway: Active tooltip
+    vi.restoreAllMocks();
+    const activeStatus: NodeStatusResponse = {
+      state: "RUNNING",
+      node_id: "node-dot-01",
+      model_id: "meta-llama/Llama-3.1-8B-Instruct",
+      room_id: "public",
+      is_private: false,
+      is_unlisted: false,
+      backend: "llama_cpp",
+      n_layers: 16,
+      allocated_ram_mb: 4096,
+      allocated_vram_mb: 0,
+      p2p_listen_port: 49152,
+      connected_peers_count: 2,
+      peers: [],
+      session_token: "sk-shardai-active-dot",
+      api_base_url: "http://127.0.0.1:8000/v1",
+      coverage_percent: 100,
+      is_swarm_ready: true,
+      message: "Active",
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/status")) {
+        return new Response(JSON.stringify(activeStatus), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      const gatewayActiveDot = screen.getByTestId("gateway-badge");
+      expect(gatewayActiveDot.getAttribute("data-status")).toBe("active");
+      expect(gatewayActiveDot.getAttribute("data-tone")).toBe("green");
+      expect(gatewayActiveDot.getAttribute("title")).toBe("Gateway: Active");
+      expect(gatewayActiveDot.getAttribute("data-tooltip")).toBe("Gateway: Active");
+      expect(gatewayActiveDot.textContent?.trim()).toBe("");
+      expect(gatewayActiveDot.querySelector(".status-dot--green.status-dot--active")).toBeTruthy();
+    });
+  });
+
+  it("toggles frameless Sun/Moon theme icon strictly between light and dark without Auto mode", () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+
+    // Legacy "system" value in localStorage must migrate cleanly to a concrete theme
+    window.localStorage.setItem("shardai_theme", "system");
+
+    const { unmount } = render(<Dashboard />);
+
+    const themeBtn = screen.getByTestId("theme-toggle-btn");
+    expect(themeBtn.classList.contains("titlebar-icon-btn")).toBe(true);
+    expect(themeBtn.classList.contains("native-btn")).toBe(false);
+    expect(themeBtn.textContent?.trim()).toBe("");
+
+    const initialMode = themeBtn.getAttribute("data-theme-mode");
+    expect(initialMode === "light" || initialMode === "dark").toBe(true);
+    expect(window.localStorage.getItem("shardai_theme")).toBe(initialMode);
+    expect(document.documentElement.getAttribute("data-theme")).toBe(initialMode);
+    expect(
+      screen.getByTestId(initialMode === "dark" ? "theme-icon-moon" : "theme-icon-sun")
+    ).toBeTruthy();
+
+    // First click switches directly to the opposite mode (never "system" / "Auto")
+    const secondMode = initialMode === "dark" ? "light" : "dark";
+    fireEvent.click(themeBtn);
+    expect(themeBtn.getAttribute("data-theme-mode")).toBe(secondMode);
+    expect(document.documentElement.getAttribute("data-theme")).toBe(secondMode);
+    expect(window.localStorage.getItem("shardai_theme")).toBe(secondMode);
+    expect(
+      screen.getByTestId(secondMode === "dark" ? "theme-icon-moon" : "theme-icon-sun")
+    ).toBeTruthy();
+    expect(themeBtn.getAttribute("title")).not.toContain("Auto");
+    expect(themeBtn.getAttribute("title")).not.toContain("System");
+
+    // Second click switches directly back to initialMode (pure 2-state cycle)
+    fireEvent.click(themeBtn);
+    expect(themeBtn.getAttribute("data-theme-mode")).toBe(initialMode);
+    expect(window.localStorage.getItem("shardai_theme")).toBe(initialMode);
+
+    unmount();
+  });
+
+  it("renders a frameless cloud icon with tooltip for catalog sync source instead of a text pill", async () => {
+    const sources: Array<{ source: "cloud" | "cache" | "default"; expectedTooltip: string }> = [
+      { source: "cloud", expectedTooltip: "Synced from Cloud" },
+      { source: "cache", expectedTooltip: "Loaded from ~/.shardai/models_cache.json" },
+      { source: "default", expectedTooltip: "Default Offline Catalog" },
+    ];
+
+    for (const entry of sources) {
+      vi.restoreAllMocks();
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/models/catalog")) {
+          return new Response(
+            JSON.stringify({
+              source: entry.source,
+              count: 1,
+              models: [
+                {
+                  id: "llama-3.1-8b",
+                  name: "Llama 3.1 8B",
+                  repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+                  estimated_ram_gb: 6,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response("{}", { status: 200 });
+      });
+
+      const { unmount } = render(<Dashboard />);
+
+      await waitFor(() => {
+        const cloudBadge = screen.getByTestId("catalog-source-badge");
+        expect(cloudBadge.classList.contains("catalog-cloud-indicator")).toBe(true);
+        expect(cloudBadge.classList.contains(`catalog-cloud-indicator--${entry.source}`)).toBe(
+          true
+        );
+        expect(cloudBadge.getAttribute("data-source")).toBe(entry.source);
+        expect(cloudBadge.getAttribute("title")).toBe(entry.expectedTooltip);
+        expect(cloudBadge.getAttribute("data-tooltip")).toBe(entry.expectedTooltip);
+        expect(cloudBadge.getAttribute("aria-label")).toBe(entry.expectedTooltip);
+        expect(cloudBadge.textContent?.trim()).toBe("");
+        expect(screen.getByTestId("catalog-cloud-icon")).toBeTruthy();
+      });
+
+      unmount();
+    }
+  });
 });

@@ -30,10 +30,16 @@
   --info-bg: #eff6ff;
   --info-fg: #1d4ed8;
   --info-border: #93c5fd;
+  --dot-green: #22c55e;
+  --dot-yellow: #eab308;
+  --dot-red: #ef4444;
+  --dot-neutral: #94a3b8;
+  --tooltip-bg: #0f172a;
+  --tooltip-fg: #f8fafc;
+  --tooltip-border: rgba(15, 23, 42, 0.2);
 }
 
 @media (prefers-color-scheme: dark) {
-  :root[data-theme="system"],
   :root:not([data-theme]) {
     --bg-app: #18181b;
     --bg-titlebar: #121215;
@@ -63,6 +69,13 @@
     --info-bg: rgba(59, 130, 246, 0.18);
     --info-fg: #93c5fd;
     --info-border: rgba(59, 130, 246, 0.35);
+    --dot-green: #22c55e;
+    --dot-yellow: #facc15;
+    --dot-red: #f87171;
+    --dot-neutral: #71717a;
+    --tooltip-bg: #27272a;
+    --tooltip-fg: #f4f4f5;
+    --tooltip-border: rgba(255, 255, 255, 0.14);
   }
 }
 
@@ -95,6 +108,13 @@
   --info-bg: rgba(59, 130, 246, 0.18);
   --info-fg: #93c5fd;
   --info-border: rgba(59, 130, 246, 0.35);
+  --dot-green: #22c55e;
+  --dot-yellow: #facc15;
+  --dot-red: #f87171;
+  --dot-neutral: #71717a;
+  --tooltip-bg: #27272a;
+  --tooltip-fg: #f4f4f5;
+  --tooltip-border: rgba(255, 255, 255, 0.14);
 }
 
 *,
@@ -149,6 +169,8 @@ pre {
 
 /* Custom Native Window Titlebar */
 .native-titlebar {
+  position: relative;
+  z-index: 20;
   height: 38px;
   flex-shrink: 0;
   display: flex;
@@ -223,15 +245,196 @@ pre {
 .native-titlebar-right {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   height: 100%;
+  padding-right: 10px;
+}
+
+.native-titlebar-right.has-window-controls {
+  padding-right: 0;
+}
+
+.titlebar-status-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.titlebar-status-dot {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  flex-shrink: 0;
+  transition: background-color 0.12s ease;
+}
+
+.titlebar-status-dot:hover {
+  background: var(--bg-surface-hover);
+}
+
+.titlebar-status-dot:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: block;
+  flex-shrink: 0;
+  transition: background-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.status-dot--green {
+  background-color: var(--dot-green);
+}
+
+.status-dot--yellow {
+  background-color: var(--dot-yellow);
+}
+
+.status-dot--red {
+  background-color: var(--dot-red);
+}
+
+.status-dot--neutral {
+  background-color: var(--dot-neutral);
+}
+
+.status-dot--active {
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.22);
+}
+
+.status-dot--pulse {
+  animation: shardai-dot-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes shardai-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.titlebar-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--border-hairline);
+  margin: 0 3px;
+  flex-shrink: 0;
+}
+
+.titlebar-icon-btn {
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.titlebar-icon-btn:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.titlebar-icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.catalog-cloud-indicator {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  flex-shrink: 0;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.catalog-cloud-indicator:hover {
+  background: var(--bg-surface-hover);
+}
+
+.catalog-cloud-indicator:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.catalog-cloud-indicator--cloud {
+  color: var(--dot-green);
+}
+
+.catalog-cloud-indicator--cache {
+  color: var(--dot-yellow);
+}
+
+.catalog-cloud-indicator--default {
+  color: var(--text-muted);
+}
+
+/* Native Cross-Platform Hover & Focus Tooltip */
+.native-tooltip-trigger {
+  position: relative;
+}
+
+.native-tooltip-trigger::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--tooltip-bg);
+  color: var(--tooltip-fg);
+  border: 1px solid var(--tooltip-border);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  z-index: 60;
+}
+
+.native-tooltip-trigger:hover::after,
+.native-tooltip-trigger:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .window-controls {
   display: flex;
   align-items: stretch;
   height: 100%;
-  margin-left: 6px;
+  margin-left: 4px;
 }
 
 .window-caption-btn {

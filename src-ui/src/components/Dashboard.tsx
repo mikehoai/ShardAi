@@ -27,36 +27,48 @@ const DEFAULT_MAX_RAM_GB = 16;
 const NETWORK_STATUS_POLL_MS = 10000;
 const GITHUB_REPO_URL = "https://github.com/mikehoai/ShardAi";
 
+type StatusDotTone = "green" | "yellow" | "red" | "neutral";
+
 const NETWORK_STATUS_META: Record<
   NetworkStatus,
-  { icon: string; label: string; color: string; background: string; border: string }
+  { tone: Exclude<StatusDotTone, "neutral">; label: string }
 > = {
   online: {
-    icon: "🟢",
+    tone: "green",
     label: "Online (Cloud)",
-    color: "#166534",
-    background: "#f0fdf4",
-    border: "#86efac",
   },
   lan_only: {
-    icon: "🟡",
+    tone: "yellow",
     label: "LAN Only",
-    color: "#854d0e",
-    background: "#fefce8",
-    border: "#fde047",
   },
   offline_solo: {
-    icon: "🔴",
+    tone: "red",
     label: "Offline (Solo)",
-    color: "#991b1b",
-    background: "#fef2f2",
-    border: "#fca5a5",
   },
 };
 
 type ModelTab = "catalog" | "custom" | "local";
-type ThemeMode = "system" | "light" | "dark";
+type ThemeMode = "light" | "dark";
 type NavSection = "overview" | "node" | "rooms" | "credentials";
+
+function resolveInitialTheme(): ThemeMode {
+  try {
+    const saved = window.localStorage.getItem("shardai_theme");
+    if (saved === "light" || saved === "dark") {
+      return saved;
+    }
+  } catch {
+    // Ignore storage access errors in restricted environments
+  }
+  if (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-color-scheme: dark)").matches
+  ) {
+    return "dark";
+  }
+  return "light";
+}
 
 function inferCustomSourceType(rawInput: string): ModelSourceType {
   const lowered = rawInput.trim().toLowerCase();
@@ -124,17 +136,7 @@ export const Dashboard: React.FC = () => {
       return false;
     }
   });
-  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
-    try {
-      const saved = window.localStorage.getItem("shardai_theme");
-      if (saved === "light" || saved === "dark" || saved === "system") {
-        return saved;
-      }
-    } catch {
-      // Ignore storage access errors in restricted environments
-    }
-    return "system";
-  });
+  const [themeMode, setThemeMode] = useState<ThemeMode>(resolveInitialTheme);
   const [isMaximized, setIsMaximized] = useState<boolean>(false);
 
   useEffect(() => {
@@ -189,10 +191,8 @@ export const Dashboard: React.FC = () => {
     }
   }, [themeMode]);
 
-  const cycleThemeMode = (): void => {
-    setThemeMode((prev) =>
-      prev === "system" ? "dark" : prev === "dark" ? "light" : "system"
-    );
+  const toggleThemeMode = (): void => {
+    setThemeMode((prev) => (prev === "dark" ? "light" : "dark"));
   };
 
   // Network Rooms Lobby State
@@ -1002,8 +1002,24 @@ export const Dashboard: React.FC = () => {
   const showCredentials =
     activeSection === "overview" || activeSection === "credentials";
 
-  const themeLabel =
-    themeMode === "system" ? "Auto" : themeMode === "dark" ? "Dark" : "Light";
+  const inTauri = isTauriEnvironment();
+  const netTone: StatusDotTone = networkStatus
+    ? NETWORK_STATUS_META[networkStatus].tone
+    : "neutral";
+  const netTooltip: string =
+    networkStatus === "lan_only"
+      ? `Network: LAN Only (${lanPeersCount} LAN peer(s) discovered via mDNS/zeroconf)`
+      : networkStatus
+        ? `Network: ${NETWORK_STATUS_META[networkStatus].label}`
+        : "Network: Starting Engine...";
+  const gatewayTone: Exclude<StatusDotTone, "red" | "neutral"> = isSharing
+    ? "green"
+    : "yellow";
+  const gatewayTooltip: string = isSharing ? "Gateway: Active" : "Gateway: Standby";
+  const themeTooltip: string =
+    themeMode === "dark"
+      ? "Dark mode — Switch to Light"
+      : "Light mode — Switch to Dark";
 
   return (
     <div className="native-shell" aria-label="ShardAi P2P AI Gateway">
@@ -1015,7 +1031,7 @@ export const Dashboard: React.FC = () => {
         data-tauri-drag-region
         onMouseDown={(e) => {
           if (
-            isTauriEnvironment() &&
+            inTauri &&
             e.button === 0 &&
             !(e.target as HTMLElement).closest("button")
           ) {
@@ -1024,7 +1040,7 @@ export const Dashboard: React.FC = () => {
         }}
         onDoubleClick={(e) => {
           if (
-            isTauriEnvironment() &&
+            inTauri &&
             !(e.target as HTMLElement).closest("button")
           ) {
             void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) =>
@@ -1083,71 +1099,98 @@ export const Dashboard: React.FC = () => {
           <span className="native-titlebar-version">v0.1.0</span>
         </div>
 
-        <div className="native-titlebar-right">
-          {(() => {
-            const meta = networkStatus
-              ? NETWORK_STATUS_META[networkStatus]
-              : {
-                  icon: "⚪",
-                  label: "Starting Engine...",
-                  color: "var(--text-secondary)",
-                  background: "var(--bg-surface-subtle)",
-                  border: "var(--border-strong)",
-                };
-            return (
+        <div className={`native-titlebar-right${inTauri ? " has-window-controls" : ""}`}>
+          <div className="titlebar-status-group">
+            <span
+              role="status"
+              tabIndex={0}
+              data-testid="network-status-indicator"
+              data-status={networkStatus ?? "starting"}
+              data-tone={netTone}
+              data-tooltip={netTooltip}
+              aria-label={netTooltip}
+              title={netTooltip}
+              className="titlebar-status-dot native-tooltip-trigger"
+            >
               <span
-                data-testid="network-status-indicator"
-                title={
-                  networkStatus === "lan_only"
-                    ? `${lanPeersCount} LAN peer(s) discovered via mDNS/zeroconf`
-                    : meta.label
-                }
-                style={{
-                  fontSize: "11.5px",
-                  fontWeight: 600,
-                  padding: "3px 9px",
-                  borderRadius: "999px",
-                  backgroundColor: meta.background,
-                  color: meta.color,
-                  border: `1px solid ${meta.border}`,
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {meta.icon} {meta.label}
-                {networkStatus === "lan_only" && lanPeersCount > 0
-                  ? ` (${lanPeersCount})`
-                  : ""}
-              </span>
-            );
-          })()}
+                className={`status-dot status-dot--${netTone}${networkStatus === null ? " status-dot--pulse" : ""}`}
+                aria-hidden="true"
+              />
+            </span>
 
-          <span
-            data-testid="gateway-badge"
-            style={{
-              fontSize: "11px",
-              fontWeight: 700,
-              padding: "3px 9px",
-              borderRadius: "999px",
-              backgroundColor: isSharing ? "var(--success-bg)" : "var(--bg-surface-hover)",
-              color: isSharing ? "var(--success-fg)" : "var(--text-secondary)",
-              border: `1px solid ${isSharing ? "var(--success-border)" : "var(--border-hairline)"}`,
-            }}
-          >
-            {isSharing ? "ACTIVE" : "STANDBY"}
-          </span>
+            <span
+              role="status"
+              tabIndex={0}
+              data-testid="gateway-badge"
+              data-status={isSharing ? "active" : "standby"}
+              data-tone={gatewayTone}
+              data-tooltip={gatewayTooltip}
+              aria-label={gatewayTooltip}
+              title={gatewayTooltip}
+              className="titlebar-status-dot native-tooltip-trigger"
+            >
+              <span
+                className={`status-dot status-dot--${gatewayTone}${isSharing ? " status-dot--active" : ""}`}
+                aria-hidden="true"
+              />
+            </span>
+          </div>
+
+          <span className="titlebar-divider" aria-hidden="true" />
 
           <button
             type="button"
             data-testid="theme-toggle-btn"
-            className="native-btn"
-            style={{ padding: "3px 8px", fontSize: "11px" }}
-            onClick={cycleThemeMode}
-            title="Switch OS Theme (System / Dark / Light)"
+            data-theme-mode={themeMode}
+            data-theme-icon={themeMode === "dark" ? "moon" : "sun"}
+            data-tooltip={themeTooltip}
+            className="titlebar-icon-btn native-tooltip-trigger"
+            onClick={toggleThemeMode}
+            aria-label={themeTooltip}
+            title={themeTooltip}
           >
-            {themeMode === "dark" ? "🌙" : themeMode === "light" ? "☀️" : "🖥️"} {themeLabel}
+            {themeMode === "dark" ? (
+              <svg
+                data-testid="theme-icon-moon"
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+              </svg>
+            ) : (
+              <svg
+                data-testid="theme-icon-sun"
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="4.5" />
+                <line x1="12" y1="2.5" x2="12" y2="5" />
+                <line x1="12" y1="19" x2="12" y2="21.5" />
+                <line x1="4.93" y1="4.93" x2="6.7" y2="6.7" />
+                <line x1="17.3" y1="17.3" x2="19.07" y2="19.07" />
+                <line x1="2.5" y1="12" x2="5" y2="12" />
+                <line x1="19" y1="12" x2="21.5" y2="12" />
+                <line x1="4.93" y1="19.07" x2="6.7" y2="17.3" />
+                <line x1="17.3" y1="6.7" x2="19.07" y2="4.93" />
+              </svg>
+            )}
           </button>
 
-          {isTauriEnvironment() && (
+          {inTauri && (
             <div className="window-controls">
               <button
                 type="button"
@@ -1155,7 +1198,17 @@ export const Dashboard: React.FC = () => {
                 className="window-caption-btn"
                 onClick={() => void invokeTauriCommand("window_minimize")}
               >
-                ─
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  aria-hidden="true"
+                >
+                  <line x1="2" y1="6" x2="10" y2="6" />
+                </svg>
               </button>
               <button
                 type="button"
@@ -1167,7 +1220,32 @@ export const Dashboard: React.FC = () => {
                   )
                 }
               >
-                {isMaximized ? "❐" : "□"}
+                {isMaximized ? (
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.1"
+                    aria-hidden="true"
+                  >
+                    <rect x="2" y="3.5" width="6.5" height="6.5" rx="0.5" />
+                    <path d="M4 3.5V2h6v6H8.5" />
+                  </svg>
+                ) : (
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.1"
+                    aria-hidden="true"
+                  >
+                    <rect x="2" y="2" width="8" height="8" rx="0.5" />
+                  </svg>
+                )}
               </button>
               <button
                 type="button"
@@ -1175,7 +1253,19 @@ export const Dashboard: React.FC = () => {
                 className="window-caption-btn close"
                 onClick={() => void invokeTauriCommand("window_close")}
               >
-                ✕
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  strokeLinecap="round"
+                  aria-hidden="true"
+                >
+                  <line x1="2.5" y1="2.5" x2="9.5" y2="9.5" />
+                  <line x1="9.5" y1="2.5" x2="2.5" y2="9.5" />
+                </svg>
               </button>
             </div>
           )}
@@ -1199,10 +1289,10 @@ export const Dashboard: React.FC = () => {
               <div className="sidebar-section-label">Workspace</div>
               {(
                 [
-                  { id: "overview", icon: "⊞", label: "Overview" },
-                  { id: "node", icon: "⚙", label: "Node & Model" },
-                  { id: "rooms", icon: "🌐", label: "Rooms Lobby" },
-                  { id: "credentials", icon: "🔑", label: "API Gateway" },
+                  { id: "overview", label: "Overview" },
+                  { id: "node", label: "Node & Model" },
+                  { id: "rooms", label: "Rooms Lobby" },
+                  { id: "credentials", label: "API Gateway" },
                 ] as const
               ).map((item) => (
                 <button
@@ -1212,7 +1302,83 @@ export const Dashboard: React.FC = () => {
                   className={`sidebar-nav-btn${activeSection === item.id ? " active" : ""}`}
                   onClick={() => setActiveSection(item.id)}
                 >
-                  <span>{item.icon}</span>
+                  {item.id === "overview" && (
+                    <svg
+                      width="15"
+                      height="15"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+                      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+                      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+                      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+                    </svg>
+                  )}
+                  {item.id === "node" && (
+                    <svg
+                      width="15"
+                      height="15"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <rect x="4" y="4" width="16" height="16" rx="2" />
+                      <rect x="9" y="9" width="6" height="6" rx="1" />
+                      <line x1="9" y1="1.5" x2="9" y2="4" />
+                      <line x1="15" y1="1.5" x2="15" y2="4" />
+                      <line x1="9" y1="20" x2="9" y2="22.5" />
+                      <line x1="15" y1="20" x2="15" y2="22.5" />
+                      <line x1="1.5" y1="9" x2="4" y2="9" />
+                      <line x1="1.5" y1="15" x2="4" y2="15" />
+                      <line x1="20" y1="9" x2="22.5" y2="9" />
+                      <line x1="20" y1="15" x2="22.5" y2="15" />
+                    </svg>
+                  )}
+                  {item.id === "rooms" && (
+                    <svg
+                      width="15"
+                      height="15"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="12" r="9" />
+                      <line x1="3" y1="12" x2="21" y2="12" />
+                      <path d="M12 3a14.5 14.5 0 0 1 0 18 14.5 14.5 0 0 1 0-18Z" />
+                    </svg>
+                  )}
+                  {item.id === "credentials" && (
+                    <svg
+                      width="15"
+                      height="15"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="8" cy="15" r="4" />
+                      <path d="M11 12l9-9" />
+                      <path d="M16 7l2.5 2.5" />
+                      <path d="M19 4l2.5 2.5" />
+                    </svg>
+                  )}
                   <span>{item.label}</span>
                 </button>
               ))}
@@ -1317,32 +1483,42 @@ export const Dashboard: React.FC = () => {
                     <span className="native-label" style={{ marginBottom: 0 }}>
                       Model Source
                     </span>
-                    {catalogSource !== null && modelTab === "catalog" && (
-                      <span
-                        data-testid="catalog-source-badge"
-                        style={{
-                          fontSize: "11px",
-                          fontWeight: 600,
-                          padding: "2px 8px",
-                          borderRadius: "999px",
-                          backgroundColor:
-                            catalogSource === "cloud" ? "var(--success-bg)" : "var(--warn-bg)",
-                          color:
-                            catalogSource === "cloud" ? "var(--success-fg)" : "var(--warn-fg)",
-                          border: `1px solid ${
-                            catalogSource === "cloud"
-                              ? "var(--success-border)"
-                              : "var(--warn-border)"
-                          }`,
-                        }}
-                      >
-                        {catalogSource === "cloud"
+                    {catalogSource !== null && modelTab === "catalog" && (() => {
+                      const catalogTooltip =
+                        catalogSource === "cloud"
                           ? "Synced from Cloud"
                           : catalogSource === "cache"
                             ? "Loaded from ~/.shardai/models_cache.json"
-                            : "Default Offline Catalog"}
-                      </span>
-                    )}
+                            : "Default Offline Catalog";
+                      return (
+                        <span
+                          role="status"
+                          tabIndex={0}
+                          data-testid="catalog-source-badge"
+                          data-source={catalogSource}
+                          data-tooltip={catalogTooltip}
+                          aria-label={catalogTooltip}
+                          title={catalogTooltip}
+                          className={`catalog-cloud-indicator catalog-cloud-indicator--${catalogSource} native-tooltip-trigger`}
+                        >
+                          <svg
+                            data-testid="catalog-cloud-icon"
+                            width="16"
+                            height="16"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M17.5 19H7a4.5 4.5 0 0 1-.42-8.98A6 6 0 0 1 18.2 8.2 4 4 0 0 1 17.5 19Z" />
+                            {catalogSource === "default" && <line x1="3" y1="3" x2="21" y2="21" />}
+                          </svg>
+                        </span>
+                      );
+                    })()}
                   </div>
 
                   <div
