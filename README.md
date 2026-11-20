@@ -31,13 +31,30 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
 ## ✨ Key Features
 
 * **🔌 Local OpenAI-Compatible API Gateway:** Exposes `POST http://127.0.0.1:8000/v1/chat/completions` (streaming SSE & non-streaming) and `GET /v1/models`, allowing drop-in integration with Cursor, Continue, OpenWebUI, LangChain, and the official OpenAI SDKs.
+* **💬 Built-in AI Chat Window:** Interactive chat interface directly inside the desktop client once swarm RAM coverage reaches 100%, featuring real-time SSE token streaming, markdown rendering, multi-turn history, stop generation, and error surface alerts.
+* **🎛 3-Tab AI Model Selector:** Unified model selection across the main panel and Create Room modal with Online Catalog (~5-8 GB RAM estimates & cloud sync), Custom HuggingFace Repos / Direct URLs, and Local `.gguf` file browsing.
 * **🧠 Dynamic Layer Sharding:** Automatically slices GGUF (`llama-cpp-python` with `mmap` fallback) and Hugging Face `safetensors` (`PyTorch`) models based on the RAM/VRAM budget you allocate in the desktop UI.
-* **🌐 Hybrid Network Modes (Online / LAN / Offline Solo):**
-  * **Internet Swarm:** Connects to public or private rooms via a configurable Signaling REST API (`SHARDAI_TRACKER_URL`).
+* **🌐 Hybrid Network Modes & Smart Lobby:**
+  * **Internet Swarm:** Connects to public or private rooms via Signaling REST API (`SHARDAI_TRACKER_URL`) with session-scoped room randomization and clean frameless colored status indicators.
   * **LAN Only (`zeroconf` mDNS):** Discovers peers automatically on your local network (`_shardai._tcp.local.`) with zero external internet dependency.
   * **Offline Solo Fallback:** Runs all model layers locally on a single machine when offline or unassisted.
-* **⚡ Lightweight Native Desktop Shell:** Built with **Tauri v2 (Rust)** and **React 18 + TypeScript**, providing system tray controls, hardware telemetry, collapsible workspace navigation, and automatic Python sidecar lifecycle management (zero orphan/zombie processes).
+* **⚡ Standard CLI & Lightweight Tauri Shell:**
+  * **`shardai` CLI:** Rich terminal commands (`create`, `join`, `chat`, `status`, `stop`, `pull`, `models`, `rooms`, `serve`, `network`, `version`) with automated PATH installer scripts.
+  * **Tauri v2 Desktop App:** Lightweight native window with system tray, collapsible sidebar, sun/moon dark theme, hardware telemetry, and automated Python sidecar supervisor (zero zombie processes).
 * **🔒 Binary Tensor Streaming & Loopback Security:** Uses `lz4`-compressed binary tensor framing over P2P sockets (never `pickle` or raw JSON tensors) and binds the local control plane strictly to `127.0.0.1` with IPC token authentication (`X-ShardAi-Local-Token`).
+
+---
+
+## 📦 Release Deliverables & Desktop Binaries
+
+ShardAi packages both a native desktop graphical interface and a standalone command-line suite:
+
+| Deliverable | Format | Build Output Location | Description |
+| :--- | :--- | :--- | :--- |
+| **Windows Desktop Installer** | `.exe` (NSIS) | `src-tauri/target/release/bundle/nsis/ShardAi_0.1.0_x64-setup.exe` | Complete Windows installer bundling the Tauri shell, React UI, and Python AI sidecar engine (~193 MB). |
+| **Portable Desktop App** | `.exe` | `src-tauri/target/release/shardai-node.exe` | Standalone portable executable for instant testing without system installation. |
+| **Standalone CLI Binary** | `.exe` / ELF / Mach-O | `dist/cli/shardai.exe` (`shardai`) | Headless terminal utility compiled via PyInstaller for servers, background services, and scripts. |
+| **macOS Universal App** | `.dmg` | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg` | macOS Universal bundle supporting both Apple Silicon (`arm64`) and Intel (`x86_64`). |
 
 ---
 
