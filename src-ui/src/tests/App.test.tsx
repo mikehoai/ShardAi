@@ -1,7 +1,12 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Dashboard } from "../components/Dashboard";
+import {
+  Dashboard,
+  formatCompactModelName,
+  formatCompactRoomName,
+  orderRoomsForSession,
+} from "../components/Dashboard";
 import {
   extractApiErrorDetail,
   normalizeNoticeToEnglish,
@@ -1311,6 +1316,182 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       source_type: "catalog",
       filename: "qwen2.5-7b-q4_k_m.gguf",
       room_id: "qwen-room",
+    });
+  });
+
+  it("randomizes lobby rooms per session, hides network scope tags, compacts names, and renders frameless colored status text", async () => {
+    // 1. Compact formatting helpers
+    expect(formatCompactRoomName("deepseek-r1-vn-01")).toBe("vn-01");
+    expect(formatCompactRoomName("qwen-coder-32b-pro")).toBe("pro");
+    expect(formatCompactRoomName("llama3-8b-asia")).toBe("asia");
+    expect(formatCompactRoomName("vn-01")).toBe("vn-01");
+    expect(formatCompactRoomName("public")).toBe("public");
+    expect(formatCompactRoomName("very-long-custom-room-identifier-99").length).toBeLessThanOrEqual(
+      18
+    );
+
+    expect(formatCompactModelName("bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF")).toBe(
+      "DeepSeek-R1-Qwen-14B"
+    );
+    expect(formatCompactModelName("Qwen/Qwen2.5-Coder-32B-Instruct-GGUF")).toBe(
+      "Qwen2.5-Coder-32B"
+    );
+    expect(formatCompactModelName("meta-llama/Llama-3.1-8B-Instruct")).toBe("Llama-3.1-8B");
+
+    // 2. Session-scoped randomization varies across seeds and is deterministic per seed
+    const mockRooms: RoomLobbyItem[] = [
+      {
+        room_id: "deepseek-r1-vn-01",
+        model: "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
+        nodes_online: 3,
+        total_shared_ram_gb: 12,
+        is_private: false,
+        network_scope: "internet",
+        coverage_percent: 100,
+        redundancy_factor: 2,
+      },
+      {
+        room_id: "qwen-coder-7b-dev",
+        model: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        nodes_online: 2,
+        total_shared_ram_gb: 6,
+        is_private: true,
+        network_scope: "lan",
+        coverage_percent: 72,
+        redundancy_factor: 1,
+      },
+      {
+        room_id: "sg-02",
+        model: "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        nodes_online: 4,
+        total_shared_ram_gb: 24,
+        is_private: false,
+        network_scope: "hybrid",
+        coverage_percent: 100,
+        redundancy_factor: 1,
+      },
+      {
+        room_id: "jp-03",
+        model: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        nodes_online: 2,
+        total_shared_ram_gb: 8,
+        is_private: false,
+        network_scope: "internet",
+        coverage_percent: 85,
+        redundancy_factor: 1,
+      },
+      {
+        room_id: "eu-05",
+        model: "bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF",
+        nodes_online: 3,
+        total_shared_ram_gb: 10,
+        is_private: false,
+        network_scope: "internet",
+        coverage_percent: 100,
+        redundancy_factor: 1,
+      },
+    ];
+
+    const orders = new Set<string>();
+    for (let seed = 1; seed <= 10; seed += 1) {
+      orders.add(
+        orderRoomsForSession(mockRooms, seed)
+          .map((r) => r.room_id)
+          .join(",")
+      );
+    }
+    expect(orders.size).toBeGreaterThan(1);
+    expect(orderRoomsForSession(mockRooms, 42).map((r) => r.room_id)).toEqual(
+      orderRoomsForSession(mockRooms, 42).map((r) => r.room_id)
+    );
+
+    // 3. Rendered table checks (no INTERNET/LAN/HYBRID tag, compact names, frameless colored text, no icons)
+    const checkJoinPayloads: Array<{ room_id?: string; model_id?: string }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify(mockRooms), { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        if (init?.body && typeof init.body === "string") {
+          checkJoinPayloads.push(JSON.parse(init.body) as { room_id?: string; model_id?: string });
+        }
+        return new Response(JSON.stringify({ detail: "Room is full." }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("room-name-deepseek-r1-vn-01")).toBeTruthy();
+      expect(screen.getByTestId("room-name-qwen-coder-7b-dev")).toBeTruthy();
+    });
+
+    const readyNameCell = screen.getByTestId("room-name-deepseek-r1-vn-01");
+    expect(readyNameCell.textContent?.trim()).toBe("vn-01");
+    expect(readyNameCell.getAttribute("title")).toBe("deepseek-r1-vn-01");
+    expect(readyNameCell.textContent).not.toContain("INTERNET");
+    expect(readyNameCell.textContent).not.toContain("LAN");
+    expect(readyNameCell.textContent).not.toContain("HYBRID");
+
+    const lanNameCell = screen.getByTestId("room-name-qwen-coder-7b-dev");
+    expect(lanNameCell.textContent?.trim()).toBe("dev");
+    expect(lanNameCell.getAttribute("title")).toBe("qwen-coder-7b-dev");
+    expect(lanNameCell.textContent).not.toContain("LAN");
+
+    const modelCell = screen.getByTestId("room-model-deepseek-r1-vn-01");
+    expect(modelCell.textContent?.trim()).toBe("DeepSeek-R1-Qwen-14B");
+    expect(modelCell.getAttribute("title")).toBe("bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF");
+
+    // Resources column: frameless colored text, zero border/box inline style, zero emojis
+    const readyResource = screen.getByTestId("room-coverage-deepseek-r1-vn-01");
+    expect(readyResource.classList.contains("room-resource-text")).toBe(true);
+    expect(readyResource.classList.contains("room-resource-text--ready")).toBe(true);
+    expect(readyResource.textContent?.trim()).toBe("Ready (Redundancy: 2x)");
+    expect(readyResource.textContent).not.toContain("✅");
+    expect(readyResource.getAttribute("style")).toBeNull();
+
+    const poolingResource = screen.getByTestId("room-coverage-qwen-coder-7b-dev");
+    expect(poolingResource.classList.contains("room-resource-text")).toBe(true);
+    expect(poolingResource.classList.contains("room-resource-text--pooling")).toBe(true);
+    expect(poolingResource.textContent?.trim()).toBe("Pooling RAM: 72%");
+    expect(poolingResource.textContent).not.toContain("⚠️");
+    expect(poolingResource.getAttribute("style")).toBeNull();
+
+    // Status column: frameless colored text, zero lock emoji
+    const publicStatus = screen.getByTestId("room-status-deepseek-r1-vn-01");
+    expect(publicStatus.classList.contains("room-status-text--public")).toBe(true);
+    expect(publicStatus.textContent?.trim()).toBe("Public");
+
+    const privateStatus = screen.getByTestId("room-status-qwen-coder-7b-dev");
+    expect(privateStatus.classList.contains("room-status-text--private")).toBe(true);
+    expect(privateStatus.textContent?.trim()).toBe("Private");
+    expect(privateStatus.textContent).not.toContain("🔒");
+
+    // Clicking Join still sends the exact underlying room_id and full model_id
+    fireEvent.click(screen.getByTestId("join-room-deepseek-r1-vn-01"));
+    await waitFor(() => {
+      expect(checkJoinPayloads).toHaveLength(1);
+    });
+    expect(checkJoinPayloads[0]).toMatchObject({
+      room_id: "deepseek-r1-vn-01",
+      model_id: "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
     });
   });
 });
