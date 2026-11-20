@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -97,6 +98,97 @@ SUPPORTED_MODELS: dict[str, GgufModelSpec] = {
 }
 
 FINGERPRINT_HEAD_BYTES: int = 10 * 1024 * 1024  # 10 MB prefix for fast fingerprint hashing
+GGUF_MAGIC: bytes = b"GGUF"
+MIN_ONLINE_GGUF_BYTES: int = 1_048_576
+
+
+def has_gguf_magic(file_path: Path) -> bool:
+    """Return True iff `file_path` exists and begins with the 4-byte `GGUF` magic header."""
+    if not file_path.is_file():
+        return False
+    try:
+        with file_path.open("rb") as handle:
+            return handle.read(len(GGUF_MAGIC)) == GGUF_MAGIC
+    except OSError:
+        return False
+
+
+def is_valid_gguf_file(file_path: Path, min_bytes: int = MIN_ONLINE_GGUF_BYTES) -> bool:
+    """Return True iff `file_path` meets `min_bytes` and begins with the `GGUF` magic header."""
+    if not file_path.is_file():
+        return False
+    try:
+        required_bytes = max(len(GGUF_MAGIC), min_bytes)
+        if file_path.stat().st_size < required_bytes:
+            return False
+    except OSError:
+        return False
+    return has_gguf_magic(file_path)
+
+
+def parse_estimated_ram_gb(value: Any, default: float = 5.0) -> float:
+    """Parse `estimated_ram_gb` defensively, falling back to `default` on malformed input."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return default
+        try:
+            parsed = float(cleaned)
+        except ValueError:
+            return default
+    else:
+        return default
+
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return default
+    return max(0.1, parsed)
+
+
+def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
+    """Normalize a raw catalog dictionary, returning `None` when disabled or missing `repo_id`."""
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("enabled", True) is not True:
+        return None
+
+    raw_repo_id = entry.get("repo_id")
+    if not isinstance(raw_repo_id, str) or not raw_repo_id.strip():
+        return None
+    repo_id = raw_repo_id.strip()
+
+    raw_id = entry.get("id")
+    entry_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else repo_id
+
+    raw_name = entry.get("name")
+    name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else repo_id
+
+    raw_filename = entry.get("filename")
+    filename = raw_filename.strip() if isinstance(raw_filename, str) and raw_filename.strip() else None
+
+    return {
+        "id": entry_id,
+        "name": name,
+        "repo_id": repo_id,
+        "filename": filename,
+        "estimated_ram_gb": parse_estimated_ram_gb(entry.get("estimated_ram_gb"), default=5.0),
+        "enabled": True,
+    }
+
+
+def sanitize_catalog_entries(entries: Any) -> list[dict[str, Any]]:
+    """Filter and normalize a raw catalog sequence into valid enabled model entries."""
+    if not isinstance(entries, list):
+        return []
+    sanitized: list[dict[str, Any]] = []
+    for entry in entries:
+        cleaned = sanitize_catalog_entry(entry)
+        if cleaned is not None:
+            sanitized.append(cleaned)
+    return sanitized
 
 DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
     {
@@ -488,13 +580,7 @@ class ModelDownloader:
         try:
             raw = json.loads(self.catalog_cache_path.read_text(encoding="utf-8"))
             items = raw.get("models", []) if isinstance(raw, dict) else raw
-            if not isinstance(items, list):
-                return []
-            return [
-                dict(item)
-                for item in items
-                if isinstance(item, dict) and item.get("enabled", True) is True
-            ]
+            return sanitize_catalog_entries(items)
         except Exception as exc:
             logger.warning("Failed to read models cache %s: %s", self.catalog_cache_path, exc)
             return []
@@ -502,8 +588,14 @@ class ModelDownloader:
     def lookup_catalog_entry(self, model_id: str) -> dict[str, Any] | None:
         """Match a catalog `id` or `repo_id` from `~/.shardai/models_cache.json` or fallback defaults."""
         cleaned = model_id.strip()
+        if not cleaned:
+            return None
+        normalized = normalize_hf_repo_id(cleaned)
         for entry in [*self.load_catalog_cache(), *DEFAULT_CATALOG_MODELS]:
-            if entry.get("id") == cleaned or entry.get("repo_id") == cleaned:
+            if entry.get("id") in (cleaned, normalized) or entry.get("repo_id") in (
+                cleaned,
+                normalized,
+            ):
                 return entry
         return None
 
@@ -614,13 +706,10 @@ class ModelDownloader:
         return custom_spec, candidate_path
 
     def is_model_cached(self, model_id: str) -> tuple[bool, Path]:
-        """Check whether a real `.gguf` (>1 MB or offline stub) exists in local cache."""
+        """Check whether a real `.gguf` (>= 1 MB or offline stub) with `GGUF` magic exists locally."""
         _, target_path = self.resolve_safe_gguf_path(model_id)
-        if not target_path.is_file():
-            return False, target_path
-        min_bytes = 1 if is_offline_mode() else 1_048_576
-        exists = target_path.stat().st_size >= min_bytes
-        return exists, target_path
+        min_bytes = len(GGUF_MAGIC) if is_offline_mode() else MIN_ONLINE_GGUF_BYTES
+        return is_valid_gguf_file(target_path, min_bytes=min_bytes), target_path
 
     def _find_cached_pytorch_shard_files(
         self,
@@ -855,14 +944,43 @@ class ModelDownloader:
 
     def resolve_gguf_in_models_dir(self, repo_id: str, filename: str | None) -> Path:
         """Resolve a safe `.gguf` target inside `~/.shardai/models/` (or `cache_dir` fallback)."""
-        if filename:
-            safe_rel = Path(*[re.sub(r"[^A-Za-z0-9._-]+", "_", p) for p in Path(filename).parts if p not in ("", ".", "..")])
-            if safe_rel.name:
-                in_models = (self.models_dir / safe_rel).resolve()
-                if in_models.is_relative_to(self.models_dir):
+        effective_repo_id: str = repo_id.strip()
+        effective_filename: str | None = (
+            filename.strip() if filename and filename.strip() else None
+        )
+        if effective_filename is None:
+            catalog_entry = self.lookup_catalog_entry(effective_repo_id)
+            if catalog_entry is not None:
+                entry_filename = catalog_entry.get("filename")
+                if isinstance(entry_filename, str) and entry_filename.strip():
+                    effective_filename = entry_filename.strip()
+                entry_repo_id = catalog_entry.get("repo_id")
+                if isinstance(entry_repo_id, str) and entry_repo_id.strip():
+                    effective_repo_id = entry_repo_id.strip()
+
+        if effective_filename:
+            raw_parts = [
+                part
+                for part in effective_filename.replace("\\", "/").split("/")
+                if part not in ("", ".", "..")
+            ]
+            safe_parts = [
+                cleaned
+                for cleaned in (
+                    re.sub(r"[^A-Za-z0-9._-]+", "_", part).strip(".") for part in raw_parts
+                )
+                if cleaned
+            ]
+            if safe_parts:
+                in_models = (self.models_dir / Path(*safe_parts)).resolve()
+                if in_models.is_relative_to(self.models_dir) and in_models.suffix.lower() == ".gguf":
                     return in_models
-        _, legacy_path = self.resolve_safe_gguf_path(repo_id)
-        return (self.models_dir / legacy_path.name).resolve()
+
+        _, legacy_path = self.resolve_safe_gguf_path(effective_repo_id)
+        fallback_target = (self.models_dir / legacy_path.name).resolve()
+        if not fallback_target.is_relative_to(self.models_dir):
+            raise PermissionError("Rejected model destination outside ~/.shardai/models.")
+        return fallback_target
 
     def _emit_helper(
         self,
@@ -919,7 +1037,11 @@ class ModelDownloader:
     ) -> Path:
         """Stream a `.gguf` file from any external HTTP/HTTPS URL into `~/.shardai/models/`."""
         target_path = self.resolve_direct_url_path(url, filename=filename)
-        min_bytes = 1 if (is_offline_mode() and self._http_transport is None) else 1_048_576
+        min_bytes = (
+            len(GGUF_MAGIC)
+            if (is_offline_mode() and self._http_transport is None)
+            else MIN_ONLINE_GGUF_BYTES
+        )
 
         _emit(
             DownloadProgressEvent(
@@ -930,7 +1052,7 @@ class ModelDownloader:
             )
         )
 
-        if target_path.is_file() and target_path.stat().st_size >= min_bytes:
+        if is_valid_gguf_file(target_path, min_bytes=min_bytes):
             size_bytes = target_path.stat().st_size
             _emit(
                 DownloadProgressEvent(
@@ -944,6 +1066,13 @@ class ModelDownloader:
                 )
             )
             return target_path
+
+        if target_path.is_file():
+            logger.warning(
+                "Cached file '%s' failed GGUF validation (size=%d); re-downloading.",
+                target_path.name,
+                target_path.stat().st_size,
+            )
 
         if is_offline_mode() and self._http_transport is None:
             return await self._simulate_offline_gguf(url, target_path, _emit)
@@ -962,7 +1091,14 @@ class ModelDownloader:
             ) as client:
                 async with client.stream("GET", url) as response:
                     response.raise_for_status()
-                    total_bytes = int(response.headers.get("content-length") or 0)
+                    raw_content_length = response.headers.get("content-length")
+                    if raw_content_length:
+                        try:
+                            parsed_len = int(raw_content_length)
+                            if parsed_len > 0:
+                                total_bytes = parsed_len
+                        except ValueError:
+                            total_bytes = 0
                     with part_path.open("wb") as handle:
                         async for chunk in response.aiter_bytes(chunk_size=1_048_576):
                             if not chunk:
@@ -987,6 +1123,16 @@ class ModelDownloader:
                                         message=f"Downloading {target_path.name} ({pct:.1f}%)...",
                                     )
                                 )
+            if total_bytes > 0 and downloaded != total_bytes:
+                raise RuntimeError(
+                    f"Incomplete GGUF download for '{target_path.name}': "
+                    f"received {downloaded} of {total_bytes} bytes."
+                )
+            if not has_gguf_magic(part_path):
+                raise ValueError(
+                    f"Downloaded file '{target_path.name}' is not a valid GGUF binary "
+                    "(missing 4-byte GGUF magic header)."
+                )
             os.replace(part_path, target_path)
         except Exception:
             if part_path.exists():
@@ -1041,7 +1187,7 @@ class ModelDownloader:
                     message=f"Checking local cache for {target_path.name}...",
                 )
             )
-            if target_path.is_file() and target_path.stat().st_size >= 1:
+            if is_valid_gguf_file(target_path, min_bytes=len(GGUF_MAGIC)):
                 size_bytes = target_path.stat().st_size
                 _emit(
                     DownloadProgressEvent(
@@ -1055,6 +1201,13 @@ class ModelDownloader:
                     )
                 )
                 return target_path
+            if target_path.is_file():
+                logger.warning(
+                    "Offline cached GGUF '%s' failed validation (size=%d); regenerating stub.",
+                    target_path.name,
+                    target_path.stat().st_size,
+                )
+                target_path.unlink(missing_ok=True)
             cached, existing_path = self.is_model_cached(model_id)
             if cached:
                 size_bytes = existing_path.stat().st_size
@@ -1111,7 +1264,7 @@ class ModelDownloader:
                 message=f"Checking ~/.shardai/models for {target_path.name}...",
             )
         )
-        if target_path.is_file() and target_path.stat().st_size >= 1_048_576:
+        if is_valid_gguf_file(target_path, min_bytes=MIN_ONLINE_GGUF_BYTES):
             size_bytes = target_path.stat().st_size
             _emit(
                 DownloadProgressEvent(
@@ -1125,6 +1278,14 @@ class ModelDownloader:
                 )
             )
             return target_path
+
+        if target_path.is_file():
+            logger.warning(
+                "Cached GGUF file '%s' failed validation (size=%d); removing and re-downloading.",
+                target_path.name,
+                target_path.stat().st_size,
+            )
+            target_path.unlink(missing_ok=True)
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         loop = asyncio.get_running_loop()
@@ -1150,6 +1311,13 @@ class ModelDownloader:
             tqdm_class=tqdm_bridge_cls,
         )
         final_path = Path(downloaded_str).resolve()
+        if not has_gguf_magic(final_path):
+            if final_path.is_file() and final_path.is_relative_to(self.models_dir):
+                final_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Downloaded file '{final_path.name}' is not a valid GGUF binary "
+                "(missing 4-byte GGUF magic header)."
+            )
         final_size = final_path.stat().st_size if final_path.is_file() else 0
         _emit(
             DownloadProgressEvent(

@@ -33,12 +33,17 @@ import uvicorn
 
 from models.downloader import (
     DEFAULT_CATALOG_MODELS,
+    GGUF_MAGIC,
+    MIN_ONLINE_GGUF_BYTES,
     SUPPORTED_MODELS,
     DownloadProgressEvent,
     ModelDownloader,
     compute_model_fingerprint,
     is_offline_mode,
+    is_valid_gguf_file,
+    parse_estimated_ram_gb,
     read_hf_config_summary,
+    sanitize_catalog_entries,
 )
 from models.shard_runner import ShardModelRunner
 from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
@@ -1388,9 +1393,10 @@ async def get_model_catalog() -> ModelCatalogResponse:
     if _is_tracker_enabled():
         try:
             cloud_models = await runtime.tracker_client.fetch_model_catalog()
-            if cloud_models:
-                runtime.model_downloader.save_catalog_cache(cloud_models)
-                raw_models = cloud_models
+            sanitized_cloud = sanitize_catalog_entries(cloud_models)
+            if sanitized_cloud:
+                runtime.model_downloader.save_catalog_cache(sanitized_cloud)
+                raw_models = sanitized_cloud
                 source = "cloud"
                 runtime.last_tracker_reachable = True
         except Exception as exc:
@@ -1402,21 +1408,51 @@ async def get_model_catalog() -> ModelCatalogResponse:
             raw_models = cached
             source = "cache"
         else:
-            raw_models = list(DEFAULT_CATALOG_MODELS)
+            raw_models = sanitize_catalog_entries(DEFAULT_CATALOG_MODELS)
             source = "default"
 
-    items = [
-        CatalogModelItem(
-            id=str(m.get("id") or m.get("repo_id") or "custom-model"),
-            name=str(m.get("name") or m.get("repo_id") or m.get("id") or "Unnamed Model"),
-            repo_id=str(m.get("repo_id") or m.get("id") or ""),
-            filename=str(m["filename"]) if m.get("filename") else None,
-            estimated_ram_gb=max(0.1, float(m.get("estimated_ram_gb") or 5.0)),
-            enabled=bool(m.get("enabled", True)),
-        )
-        for m in raw_models
-        if m.get("repo_id") and m.get("enabled", True) is True
-    ]
+    def _build_catalog_items(entries: list[dict[str, Any]]) -> list[CatalogModelItem]:
+        built: list[CatalogModelItem] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("enabled", True) is not True:
+                continue
+            raw_repo_id = entry.get("repo_id")
+            if not isinstance(raw_repo_id, str) or not raw_repo_id.strip():
+                continue
+            repo_id = raw_repo_id.strip()
+            raw_id = entry.get("id")
+            entry_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else repo_id
+            raw_name = entry.get("name")
+            entry_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else repo_id
+            raw_filename = entry.get("filename")
+            entry_filename = (
+                raw_filename.strip()
+                if isinstance(raw_filename, str) and raw_filename.strip()
+                else None
+            )
+            try:
+                built.append(
+                    CatalogModelItem(
+                        id=entry_id,
+                        name=entry_name,
+                        repo_id=repo_id,
+                        filename=entry_filename,
+                        estimated_ram_gb=parse_estimated_ram_gb(
+                            entry.get("estimated_ram_gb"),
+                            default=5.0,
+                        ),
+                        enabled=True,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Skipping malformed catalog entry '%s': %s", repo_id, exc)
+        return built
+
+    items = _build_catalog_items(raw_models)
+    if not items:
+        items = _build_catalog_items(sanitize_catalog_entries(DEFAULT_CATALOG_MODELS))
+        source = "default"
+
     return ModelCatalogResponse(source=source, count=len(items), models=items)
 
 
@@ -1592,23 +1628,26 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                 )
         else:
             try:
+                min_gguf_bytes = (
+                    len(GGUF_MAGIC) if is_offline_mode() else MIN_ONLINE_GGUF_BYTES
+                )
                 if request.source_type == ModelSourceType.DIRECT_URL:
                     direct_target = runtime.model_downloader.resolve_direct_url_path(
                         request.model_id, filename=request.filename
                     )
-                    if direct_target.is_file():
+                    if is_valid_gguf_file(direct_target, min_bytes=min_gguf_bytes):
                         probe_path = direct_target
                 else:
                     in_models = runtime.model_downloader.resolve_gguf_in_models_dir(
                         request.model_id, request.filename
                     )
-                    if in_models.is_file():
+                    if is_valid_gguf_file(in_models, min_bytes=min_gguf_bytes):
                         probe_path = in_models
                     else:
                         _, candidate_gguf = runtime.model_downloader.resolve_safe_gguf_path(
                             request.model_id
                         )
-                        if candidate_gguf.is_file():
+                        if is_valid_gguf_file(candidate_gguf, min_bytes=min_gguf_bytes):
                             probe_path = candidate_gguf
                         else:
                             _, candidate_dir = runtime.model_downloader.resolve_safe_model_dir(
