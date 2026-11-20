@@ -229,6 +229,7 @@ def test_openai_sse_emits_structured_error_and_done_on_mid_stream_peer_failure(
         byte_stream: bytes,
         peer_port: int = 49152,
         timeout_seconds: float = 5.0,
+        ack_timeout_seconds: float | None = None,
     ) -> float:
         nonlocal call_count
         call_count += 1
@@ -308,6 +309,7 @@ def test_generate_sse_emits_structured_error_and_done_on_mid_stream_peer_failure
         byte_stream: bytes,
         peer_port: int = 49152,
         timeout_seconds: float = 5.0,
+        ack_timeout_seconds: float | None = None,
     ) -> float:
         raise OSError("Connection reset by peer")
 
@@ -355,6 +357,7 @@ def test_non_streaming_chat_completions_returns_503_on_downstream_peer_failure(
         byte_stream: bytes,
         peer_port: int = 49152,
         timeout_seconds: float = 5.0,
+        ack_timeout_seconds: float | None = None,
     ) -> float:
         raise TimeoutError("Tail peer unreachable")
 
