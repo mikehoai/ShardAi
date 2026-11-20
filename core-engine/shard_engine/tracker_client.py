@@ -75,6 +75,18 @@ def hash_room_key(room_key: str | None) -> str | None:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
 
 
+def _resolve_room_key_hash(
+    room_key: str | None = None,
+    room_key_hash: str | None = None,
+) -> str | None:
+    """Resolve an explicit SHA-256 room key hash or compute one from plaintext `room_key`."""
+    if isinstance(room_key_hash, str):
+        cleaned_hash = room_key_hash.strip()
+        if cleaned_hash:
+            return cleaned_hash
+    return hash_room_key(room_key)
+
+
 _VIETNAMESE_DIACRITICS_RE: re.Pattern[str] = re.compile(
     r"[\u00C0-\u00C3\u00C8-\u00CA\u00CC-\u00CD\u00D2-\u00D5\u00D9-\u00DA\u00DD"
     r"\u00E0-\u00E3\u00E8-\u00EA\u00EC-\u00ED\u00F2-\u00F5\u00F9-\u00FA\u00FD"
@@ -185,8 +197,9 @@ class SignalingTrackerClient:
         endpoint: str,
         json_payload: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Execute an HTTP request against the Cloudflare Tracker with timeout and retry."""
+        """Execute an HTTP request against the Signaling Tracker with timeout and retry."""
         url: str = f"{self.base_url}/{endpoint.lstrip('/')}"
         last_error: Exception | None = None
 
@@ -201,6 +214,7 @@ class SignalingTrackerClient:
                         url=url,
                         json=json_payload,
                         params=params,
+                        headers=headers,
                     )
                     if response.status_code in RETRYABLE_STATUS_CODES:
                         raise httpx.HTTPStatusError(
@@ -287,14 +301,23 @@ class SignalingTrackerClient:
         total_model_layers: int | None = None,
         max_layers_can_hold: int | None = None,
         model_fingerprint: str | None = None,
+        room_key_hash: str | None = None,
     ) -> AnnounceAssignment:
         """Announce node capacity to `POST /announce` and receive Cloud layer assignment & role."""
         resolved_total_layers: int = total_model_layers or config.total_layers
         resolved_max_layers: int = max_layers_can_hold or max(
             1, config.shard_layer_end - config.shard_layer_start + 1
         )
-        room_key_hash: str | None = hash_room_key(config.room_key)
-        is_private: bool = room_key_hash is not None
+        effective_room_key_hash: str | None = _resolve_room_key_hash(
+            room_key=config.room_key,
+            room_key_hash=room_key_hash,
+        )
+        is_private: bool = effective_room_key_hash is not None
+        headers: dict[str, str] | None = (
+            {"X-Room-Key-Hash": effective_room_key_hash}
+            if effective_room_key_hash is not None
+            else None
+        )
 
         payload: dict[str, Any] = {
             "node_id": config.node_id,
@@ -303,7 +326,7 @@ class SignalingTrackerClient:
             "network_mode": config.network_mode.value,
             "room_id": config.room_id,
             "is_private": is_private,
-            "room_key_hash": room_key_hash,
+            "room_key_hash": effective_room_key_hash,
             "unlisted": config.is_unlisted,
             "is_unlisted": config.is_unlisted,
             "available_ram_gb": float(config.ram_gb),
@@ -323,6 +346,7 @@ class SignalingTrackerClient:
             method="POST",
             endpoint="/announce",
             json_payload=payload,
+            headers=headers,
         )
         inner_data: dict[str, Any] = (
             response_data["data"]
@@ -349,12 +373,17 @@ class SignalingTrackerClient:
             assigned_start, min(int(raw_end), resolved_total_layers - 1)
         )
 
-        raw_peers: list[dict[str, Any]] = inner_data.get(
-            "peers", response_data.get("peers", [])
+        raw_peers_obj: Any = inner_data.get("peers", response_data.get("peers", []))
+        raw_peers: list[dict[str, Any]] = (
+            [item for item in raw_peers_obj if isinstance(item, dict)]
+            if isinstance(raw_peers_obj, list)
+            else []
         )
         normalized: list[PeerNodeInfo] = [
-            _normalize_peer(raw, config.room_id, resolved_total_layers - 1)
+            peer
             for raw in raw_peers
+            if (peer := _normalize_peer(raw, config.room_id, resolved_total_layers - 1)).peer_id
+            != config.node_id
         ]
 
         # If /announce didn't embed peers, query GET /peers/:room_id/:model
@@ -364,6 +393,8 @@ class SignalingTrackerClient:
                     model_id=config.model_id,
                     room_id=config.room_id,
                     room_key=config.room_key,
+                    room_key_hash=effective_room_key_hash,
+                    node_id=config.node_id,
                 )
             except Exception as exc:
                 logger.debug("Optional follow-up fetch_peers skipped: %s", exc)
@@ -441,21 +472,72 @@ class SignalingTrackerClient:
         room_id: str = "public",
         room_key: str | None = None,
         room_key_hash: str | None = None,
+        node_id: str | None = None,
     ) -> list[PeerNodeInfo]:
         """Query the Signaling Server via HTTP GET for active peers in a room."""
-        params: dict[str, Any] = {"room_id": room_id}
-        effective_hash = room_key_hash or hash_room_key(room_key)
+        clean_room_id: str = room_id.strip() or "public"
+        clean_model_id: str = model_id.strip()
+        clean_node_id: str | None = (
+            node_id.strip() if isinstance(node_id, str) and node_id.strip() else None
+        )
+        effective_hash: str | None = _resolve_room_key_hash(
+            room_key=room_key,
+            room_key_hash=room_key_hash,
+        )
+
+        params: dict[str, Any] = {
+            "room_id": clean_room_id,
+            "model": clean_model_id,
+        }
         if effective_hash is not None:
             params["room_key_hash"] = effective_hash
-        safe_room = quote(room_id, safe="")
-        safe_model = quote(model_id, safe="")
-        response_data: dict[str, Any] = await self._request_with_retry(
-            method="GET",
-            endpoint=f"/peers/{safe_room}/{safe_model}",
-            params=params,
+        if clean_node_id is not None:
+            params["node_id"] = clean_node_id
+
+        headers: dict[str, str] | None = (
+            {"X-Room-Key-Hash": effective_hash} if effective_hash is not None else None
         )
-        raw_peers: list[dict[str, Any]] = response_data.get("peers", [])
-        return [_normalize_peer(raw, room_id) for raw in raw_peers]
+
+        safe_room = quote(clean_room_id, safe="")
+        safe_model = quote(clean_model_id, safe="")
+        try:
+            response_data: dict[str, Any] = await self._request_with_retry(
+                method="GET",
+                endpoint=f"/peers/{safe_room}/{safe_model}",
+                params=params,
+                headers=headers,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+            logger.debug(
+                "Path-based peer discovery returned 404 for model '%s'; falling back to GET /peers.",
+                clean_model_id,
+            )
+            response_data = await self._request_with_retry(
+                method="GET",
+                endpoint="/peers",
+                params=params,
+                headers=headers,
+            )
+
+        inner_data: dict[str, Any] = (
+            response_data["data"]
+            if isinstance(response_data.get("data"), dict)
+            else response_data
+        )
+        raw_peers_obj: Any = inner_data.get("peers", response_data.get("peers", []))
+        if not isinstance(raw_peers_obj, list):
+            return []
+
+        peers: list[PeerNodeInfo] = [
+            _normalize_peer(raw, clean_room_id)
+            for raw in raw_peers_obj
+            if isinstance(raw, dict)
+        ]
+        if clean_node_id is not None:
+            peers = [peer for peer in peers if peer.peer_id != clean_node_id]
+        return peers
 
     async def check_room_join(
         self,
@@ -463,6 +545,7 @@ class SignalingTrackerClient:
         room_id: str = "public",
         room_key: str | None = None,
         room_key_hash: str | None = None,
+        node_id: str | None = None,
     ) -> list[PeerNodeInfo]:
         """Pre-flight check against `GET /peers/:room_id/:model` without mutating tracker state.
 
@@ -474,17 +557,36 @@ class SignalingTrackerClient:
             room_id=room_id,
             room_key=room_key,
             room_key_hash=room_key_hash,
+            node_id=node_id,
         )
 
     async def unregister_node(
-        self, node_id: str, room_id: str | None = None
+        self,
+        node_id: str,
+        room_id: str | None = None,
+        model_id: str | None = None,
+        room_key: str | None = None,
+        room_key_hash: str | None = None,
     ) -> None:
         """Notify the Signaling Server that this node is going offline."""
         payload: dict[str, Any] = {"node_id": node_id}
-        if room_id is not None:
-            payload["room_id"] = room_id
+        if isinstance(room_id, str) and room_id.strip():
+            payload["room_id"] = room_id.strip()
+        if isinstance(model_id, str) and model_id.strip():
+            payload["model"] = model_id.strip()
+
+        effective_hash: str | None = _resolve_room_key_hash(
+            room_key=room_key,
+            room_key_hash=room_key_hash,
+        )
+        headers: dict[str, str] | None = None
+        if effective_hash is not None:
+            payload["room_key_hash"] = effective_hash
+            headers = {"X-Room-Key-Hash": effective_hash}
+
         await self._request_with_retry(
             method="POST",
             endpoint="/nodes/leave",
             json_payload=payload,
+            headers=headers,
         )

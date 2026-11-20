@@ -694,6 +694,7 @@ class LocalNodeRuntime:
                         model_id=self.model_id,
                         room_id=self.room_id,
                         room_key_hash=self.room_key_hash,
+                        node_id=self.node_id,
                     )
                     if refreshed_peers:
                         self.peers = [
@@ -1392,7 +1393,9 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                     )
                 )
                 cloud_online = True
-                discovered_peers = assignment.peers
+                discovered_peers = [
+                    peer for peer in assignment.peers if peer.peer_id != request.node_id
+                ]
                 assigned_role = assignment.role
                 if not request.exact_shard_range:
                     target_start = assignment.assigned_start_layer
@@ -1716,6 +1719,8 @@ async def stop_node() -> NodeStatusResponse:
     runtime.state = NodeState.STOPPING
     active_node_id: str | None = runtime.node_id
     active_room_id: str | None = runtime.room_id
+    active_model_id: str | None = runtime.model_id
+    active_room_key_hash: str | None = runtime.room_key_hash
 
     try:
         if (
@@ -1725,6 +1730,8 @@ async def stop_node() -> NodeStatusResponse:
             await runtime.tracker_client.unregister_node(
                 active_node_id,
                 room_id=active_room_id,
+                model_id=active_model_id,
+                room_key_hash=active_room_key_hash,
             )
     except Exception as exc:
         logger.warning("Could not unregister node from signaling tracker: %s", exc)
