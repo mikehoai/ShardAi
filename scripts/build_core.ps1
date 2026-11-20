@@ -104,10 +104,14 @@ if (-not (Test-Path $BuiltBinary)) {
 }
 
 $SidecarTarget = Join-Path $BinariesDir "core-engine-$TargetTriple.exe"
-$CliTarget = Join-Path $CliDistDir "shardai-core-$TargetTriple.exe"
+$CliTargetTriple = Join-Path $CliDistDir "shardai-$TargetTriple.exe"
+$CliTargetShort = Join-Path $CliDistDir "shardai.exe"
 
 Copy-Item -Force -Path $BuiltBinary -Destination $SidecarTarget
-Copy-Item -Force -Path $BuiltBinary -Destination $CliTarget
+Copy-Item -Force -Path $BuiltBinary -Destination $CliTargetTriple
+Copy-Item -Force -Path $BuiltBinary -Destination $CliTargetShort
 
-Write-Host "==> Tauri Sidecar binary ready : $SidecarTarget"
-Write-Host "==> Standalone CLI binary ready: $CliTarget"
+Write-Host "==> Tauri Sidecar binary ready   : $SidecarTarget"
+Write-Host "==> Standalone CLI binary ready  : $CliTargetShort"
+Write-Host "==> Target-triple CLI binary     : $CliTargetTriple"
+Write-Host "==> Usage: shardai --help | shardai create --model llama-3.1-8b --ram 4"

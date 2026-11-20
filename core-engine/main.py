@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import sys
 import time
 from typing import Any, Literal
 import uuid
@@ -28,8 +29,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
-import typer
-import uvicorn
 
 from models.downloader import (
     DEFAULT_CATALOG_MODELS,
@@ -2455,169 +2454,16 @@ async def generate_stream(
     )
 
 
-cli_app = typer.Typer(
-    name="core-engine",
-    help="ShardAi Core Engine — P2P AI Gateway (Daemon sidecar for Tauri UI or standalone CLI).",
-    add_completion=False,
-)
-
-
-async def _serve_cli_mode(
-    host: str,
-    port: int,
-    request: StartNodeRequest,
-) -> None:
-    """Boot Uvicorn and immediately join the configured ShardAi room in headless CLI mode."""
-    config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        reload=False,
-        log_level="info",
-    )
-    server = uvicorn.Server(config)
-
-    async def _bootstrap_cli_node() -> None:
-        while not server.started:
-            await asyncio.sleep(0.05)
-        try:
-            status_resp = await start_node(request)
-            readiness = "API READY" if status_resp.is_swarm_ready else f"STANDBY ({status_resp.coverage_percent:.0f}%)"
-            typer.echo("\n" + "=" * 68)
-            typer.echo(f" ShardAi Headless CLI Gateway — {readiness}")
-            typer.echo(f" Model        : {status_resp.model_id}")
-            typer.echo(f" Room         : {status_resp.room_id} ({status_resp.network_status or request.network_mode.value})")
-            typer.echo(f" Role / Layers: {status_resp.role.value.upper()} ({status_resp.shard_layer_start}..{status_resp.shard_layer_end}/{status_resp.total_layers})")
-            typer.echo(f" OpenAI URL   : {status_resp.api_base_url}")
-            typer.echo(f" API Key      : {status_resp.session_token}")
-            typer.echo(f" Use mmap SSD : {status_resp.ssd_offload_active}")
-            typer.echo("=" * 68 + "\n")
-        except Exception as exc:
-            typer.echo(f"[ShardAi CLI] Failed to join room: {exc}", err=True)
-            server.should_exit = True
-
-    bootstrap_task = asyncio.create_task(_bootstrap_cli_node())
-    try:
-        await server.serve()
-    finally:
-        if not bootstrap_task.done():
-            bootstrap_task.cancel()
-
-
-@cli_app.callback(invoke_without_command=True)
-def run_entrypoint(
-    mode: str = typer.Option(
-        os.getenv("SHARDAI_RUN_MODE", "daemon"),
-        "--mode",
-        "-m",
-        help="Execution mode: 'daemon' (Tauri UI sidecar) or 'cli' (headless node).",
-    ),
-    host: str = typer.Option(
-        "127.0.0.1",
-        "--host",
-        help="HTTP API bind host (loopback 127.0.0.1 recommended for security).",
-    ),
-    port: int = typer.Option(
-        int(os.getenv("SHARDAI_ENGINE_PORT", "8000")),
-        "--port",
-        "-p",
-        min=1024,
-        max=65535,
-        help="Local HTTP OpenAI Gateway port.",
-    ),
-    ram: int = typer.Option(
-        4,
-        "--ram",
-        min=2,
-        max=256,
-        help="[cli mode] RAM contribution in GB.",
-    ),
-    model: str = typer.Option(
-        "meta-llama/Llama-3.1-8B-Instruct",
-        "--model",
-        help="[cli mode] Model Repo ID, Direct .gguf URL, or Local .gguf path.",
-    ),
-    source_type: ModelSourceType = typer.Option(
-        ModelSourceType.CATALOG,
-        "--source-type",
-        help="[cli mode] Model source: catalog, huggingface, direct_url, or local_file.",
-    ),
-    filename: str | None = typer.Option(
-        None,
-        "--filename",
-        help="[cli mode] Optional specific .gguf filename in HF repo.",
-    ),
-    room: str = typer.Option(
-        "public",
-        "--room",
-        help="[cli mode] Room ID to create or join.",
-    ),
-    room_key: str | None = typer.Option(
-        None,
-        "--room-key",
-        help="[cli mode] Optional secret passphrase for private rooms.",
-    ),
-    network: NetworkMode = typer.Option(
-        NetworkMode.INTERNET,
-        "--network",
-        help="[cli mode] Network scope: internet or lan.",
-    ),
-    p2p_port: int = typer.Option(
-        49152,
-        "--p2p-port",
-        min=1024,
-        max=65535,
-        help="[cli mode] P2P tensor listener port.",
-    ),
-    ssd_offload: bool = typer.Option(
-        False,
-        "--ssd-offload/--no-ssd-offload",
-        help="[cli mode] Enable llama_cpp use_mmap=True SSD offloading in Solo Mode.",
-    ),
-    offline: bool | None = typer.Option(
-        None,
-        "--offline/--online",
-        help="Override SHARDAI_OFFLINE_MODE environment setting.",
-    ),
-) -> None:
-    """Launch ShardAi Core Engine as a Tauri daemon sidecar or standalone CLI node."""
-    normalized_mode = mode.strip().lower()
-    if normalized_mode not in ("daemon", "cli"):
-        raise typer.BadParameter("mode must be either 'daemon' or 'cli'.")
-
-    if offline is not None:
-        os.environ["SHARDAI_OFFLINE_MODE"] = "true" if offline else "false"
-    os.environ["SHARDAI_ENGINE_PORT"] = str(port)
-
-    if normalized_mode == "cli":
-        cli_request = StartNodeRequest(
-            node_id="shardai-cli-node",
-            model_id=model,
-            source_type=source_type,
-            filename=filename,
-            network_mode=network,
-            room_id=room,
-            room_key=room_key,
-            ram_gb=ram,
-            shared_ram_gb=ram,
-            max_ram_mb=ram * 1024,
-            p2p_listen_port=p2p_port,
-            allow_ssd_offload=ssd_offload,
-        )
-        asyncio.run(_serve_cli_mode(host=host, port=port, request=cli_request))
-        return
-
-    # Daemon mode (default when launched with no arguments or by Tauri sidecar)
-    # Pass `app` object directly rather than `"main:app"` so PyInstaller --onefile works cleanly.
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        reload=False,
-        log_level="info",
-    )
+from shard_engine.cli import cli_app, run_cli
 
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    cli_app()
+    prog_stem = Path(sys.argv[0]).stem.lower()
+    default_action: Literal["help", "daemon"] = (
+        "help" if prog_stem.startswith("shardai") else "daemon"
+    )
+    run_cli(
+        default_no_subcommand=default_action,
+        engine_module=sys.modules[__name__],
+    )

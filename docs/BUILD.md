@@ -2,7 +2,7 @@
 
 ShardAi produces three release deliverables using a **Tauri Sidecar** architecture:
 
-1. **Standalone CLI Binary** (`shardai-core-<target>`): Headless OpenAI Gateway & P2P Node built with PyInstaller + Typer.
+1. **Standalone CLI Binary** (`shardai` / `shardai.exe` and `shardai-<target>`): Headless OpenAI Gateway & P2P Node built with PyInstaller + Typer.
 2. **Windows Desktop Installer** (`.exe` NSIS / `.msi` WiX): Tauri desktop shell with bundled Python sidecar.
 3. **macOS Universal Desktop App** (`.dmg`): Tauri `universal-apple-darwin` bundle supporting both **Apple Silicon (`arm64`)** and **Intel (`x86_64`)**.
 
@@ -24,28 +24,57 @@ ShardAi produces three release deliverables using a **Tauri Sidecar** architectu
 
 The build scripts compile `core-engine/main.py` as a single executable (`--onefile`) and copy it to:
 - `src-tauri/binaries/core-engine-<target-triple>` (for Tauri `bundle.externalBin`)
-- `dist/cli/shardai-core-<target-triple>` (standalone CLI distribution)
+- `dist/cli/shardai-<target-triple>` and `dist/cli/shardai` (standalone CLI distribution)
 
 ### Windows
 ```powershell
 .\scripts\build_core.ps1
 # Output:
 #   src-tauri\binaries\core-engine-x86_64-pc-windows-msvc.exe
-#   dist\cli\shardai-core-x86_64-pc-windows-msvc.exe
+#   dist\cli\shardai-x86_64-pc-windows-msvc.exe
+#   dist\cli\shardai.exe
 ```
 
 ### Linux / Single-Arch macOS
 ```bash
 chmod +x scripts/build_core.sh
 ./scripts/build_core.sh
+# Output:
+#   src-tauri/binaries/core-engine-<target-triple>
+#   dist/cli/shardai-<target-triple>
+#   dist/cli/shardai
 ```
 
-Running the CLI standalone:
-```bash
-# Headless node joining public/private room with 4 GB RAM
-./dist/cli/shardai-core-x86_64-pc-windows-msvc.exe --mode cli --ram 4
+### Running the CLI Standalone or Installing to PATH
 
-# Tauri sidecar daemon mode (default when no flags passed)
+You can install the CLI directly onto your user PATH:
+```powershell
+# Windows PATH installer (editable package or -UseBinary for dist\cli\shardai.exe):
+.\scripts\install_cli.ps1
+```
+```bash
+# macOS / Linux PATH installer:
+./scripts/install_cli.sh
+```
+
+Example CLI commands:
+```bash
+# View all commands
+shardai --help
+
+# Create a new room with 4 GB shared RAM
+shardai create --model llama-3.1-8b --ram 4
+
+# Join an existing room
+shardai join my-room
+
+# Inspect node status, active model, and session API key
+shardai status
+
+# Chat with the active model via the local OpenAI-compatible gateway
+shardai chat "Hello from ShardAi P2P pipeline!"
+
+# Tauri sidecar daemon mode (default when no subcommands passed to core-engine binary)
 ./src-tauri/binaries/core-engine-x86_64-pc-windows-msvc.exe --mode daemon --port 8000
 ```
 
