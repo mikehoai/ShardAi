@@ -376,6 +376,20 @@ export const Dashboard: React.FC = () => {
     setConnectedPeersCount(statusData.connected_peers_count ?? 0);
   };
 
+  const resetSharingState = useCallback((): void => {
+    setIsSharing(false);
+    setSessionToken(null);
+    setAssignedRole("primary");
+    setAssignedLayerRange(null);
+    setCoveragePercent(0);
+    setIsSwarmReady(false);
+    setSsdOffloadActive(false);
+    setModelFingerprint(null);
+    setConnectedPeersCount(0);
+    setDownloadProgress(null);
+    setDownloadStatusMsg("");
+  }, []);
+
   // Public/Cloud rooms cannot be fetched while offline: hide the Lobby list in LAN/Solo mode
   const isCloudOffline = networkStatus === "lan_only" || networkStatus === "offline_solo";
 
@@ -477,6 +491,28 @@ export const Dashboard: React.FC = () => {
               statusData.shard_layer_end,
             ]);
           }
+        } else if (
+          !cancelled &&
+          (statusData.state === "STOPPED" || statusData.state === "ERROR")
+        ) {
+          resetSharingState();
+          if (statusData.network_status) {
+            setNetworkStatus(statusData.network_status);
+          }
+          if (statusData.state === "ERROR") {
+            const errMsg =
+              statusData.message?.trim() || "Core engine entered ERROR state.";
+            setErrorMessage(errMsg);
+            setStatusMessage(`Error — ${errMsg}`);
+          } else {
+            const stopMsg = statusData.message?.trim();
+            setStatusMessage(
+              stopMsg
+                ? `Stopped — ${stopMsg}`
+                : "Stopped — Node was stopped by core engine."
+            );
+          }
+          void Promise.all([fetchAvailableRooms(), fetchNetworkStatus()]);
         }
       } catch {
         // Ignore transient poll errors while engine restarts
@@ -491,7 +527,7 @@ export const Dashboard: React.FC = () => {
       cancelled = true;
       window.clearInterval(timerId);
     };
-  }, [isSharing]);
+  }, [isSharing, resetSharingState, fetchAvailableRooms, fetchNetworkStatus]);
 
   const handleCopy = async (field: string, text: string): Promise<void> => {
     try {
@@ -562,7 +598,13 @@ export const Dashboard: React.FC = () => {
       throw new RoomJoinRejectedError(response.status, detail);
     }
     if (!response.ok || !response.body) {
-      throw new Error(`Failed to stream model download: HTTP ${response.status}`);
+      const detail = !response.ok
+        ? await extractApiErrorDetail(
+            response,
+            `Failed to stream model download: HTTP ${response.status}`
+          )
+        : `Failed to stream model download: HTTP ${response.status}`;
+      throw new Error(detail);
     }
 
     const reader = response.body.getReader();
@@ -633,6 +675,37 @@ export const Dashboard: React.FC = () => {
       model: customModel,
       sourceType: detectedType,
       filename: detectedType === "huggingface" ? customFilename.trim() || null : null,
+    };
+  };
+
+  const syncModelSelectionState = (
+    targetModel: string
+  ): {
+    model: string;
+    sourceType: ModelSourceType;
+    filename: string | null;
+  } => {
+    const trimmed = targetModel.trim();
+    const matchedCatalog = catalogModels.find(
+      (m) => m.repo_id === trimmed || m.id === trimmed
+    );
+    if (matchedCatalog) {
+      setModelTab("catalog");
+      setSelectedCatalogId(matchedCatalog.id);
+      setModelInput(matchedCatalog.repo_id);
+      return {
+        model: matchedCatalog.repo_id,
+        sourceType: "catalog",
+        filename: matchedCatalog.filename ?? null,
+      };
+    }
+    setModelTab("custom");
+    setModelInput(trimmed);
+    setCustomFilename("");
+    return {
+      model: trimmed,
+      sourceType: inferCustomSourceType(trimmed),
+      filename: null,
     };
   };
 
@@ -839,17 +912,12 @@ export const Dashboard: React.FC = () => {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setErrorMessage(message);
+      setDownloadProgress(null);
+      setDownloadStatusMsg("");
       if (err instanceof RoomJoinRejectedError) {
-        setDownloadProgress(null);
-        setDownloadStatusMsg("");
         setStatusMessage("Room join rejected — model download cancelled.");
       } else {
         setStatusMessage("Failed to start P2P AI Gateway.");
-        try {
-          await invokeTauriCommand<string>("stop_python_core");
-        } catch {
-          // Ignore secondary cleanup error
-        }
       }
     } finally {
       setIsBusy(false);
@@ -875,17 +943,7 @@ export const Dashboard: React.FC = () => {
       const stopMsg = stoppedViaApi
         ? "Node stopped & shards released (Core Engine ready)."
         : await invokeTauriCommand<string>("stop_python_core");
-      setIsSharing(false);
-      setSessionToken(null);
-      setAssignedRole("primary");
-      setAssignedLayerRange(null);
-      setCoveragePercent(0);
-      setIsSwarmReady(false);
-      setSsdOffloadActive(false);
-      setModelFingerprint(null);
-      setConnectedPeersCount(0);
-      setDownloadProgress(null);
-      setDownloadStatusMsg("");
+      resetSharingState();
       setStatusMessage(`Stopped — ${stopMsg}`);
       await Promise.all([fetchAvailableRooms(), fetchNetworkStatus()]);
     } catch (err: unknown) {
@@ -905,13 +963,15 @@ export const Dashboard: React.FC = () => {
     }
 
     const mode: NetworkMode = room.network_scope === "lan" ? "lan" : "internet";
-    setModelInput(room.model);
+    const syncedModel = syncModelSelectionState(room.model);
     setRoomId(room.room_id);
     setRoomKey("");
     setIsUnlisted(false);
     setNetworkMode(mode);
     void startSharingWithConfig({
-      model: room.model,
+      model: syncedModel.model,
+      sourceType: syncedModel.sourceType,
+      filename: syncedModel.filename,
       room: room.room_id,
       key: "",
       unlisted: false,
@@ -927,15 +987,17 @@ export const Dashboard: React.FC = () => {
     const target = pendingPrivateRoom;
     const secret = privateKeyInput.trim();
     const mode: NetworkMode = target.network_scope === "lan" ? "lan" : "internet";
+    const syncedModel = syncModelSelectionState(target.model);
 
     setPendingPrivateRoom(null);
-    setModelInput(target.model);
     setRoomId(target.room_id);
     setRoomKey(secret);
     setIsUnlisted(false);
     setNetworkMode(mode);
     void startSharingWithConfig({
-      model: target.model,
+      model: syncedModel.model,
+      sourceType: syncedModel.sourceType,
+      filename: syncedModel.filename,
       room: target.room_id,
       key: secret,
       unlisted: false,
@@ -948,14 +1010,16 @@ export const Dashboard: React.FC = () => {
     const cleanRoom = modalRoomId.trim() || "private-room";
     const cleanModel = modalModel.trim() || "meta-llama/Llama-3.1-8B-Instruct";
     const cleanKey = modalRoomKey.trim();
+    const syncedModel = syncModelSelectionState(cleanModel);
 
     setShowRoomModal(false);
-    setModelInput(cleanModel);
     setRoomId(cleanRoom);
     setRoomKey(cleanKey);
     setIsUnlisted(modalUnlisted);
     void startSharingWithConfig({
-      model: cleanModel,
+      model: syncedModel.model,
+      sourceType: syncedModel.sourceType,
+      filename: syncedModel.filename,
       room: cleanRoom,
       key: cleanKey,
       unlisted: modalUnlisted,
@@ -969,12 +1033,15 @@ export const Dashboard: React.FC = () => {
     const [parsedRoom, parsedKey] = raw.split("|").map((part) => part.trim());
     if (!parsedRoom) return;
 
+    const activeSelection = resolveActiveModelSelection();
     setShowRoomModal(false);
     setRoomId(parsedRoom);
     setRoomKey(parsedKey ?? "");
     setIsUnlisted(true);
     void startSharingWithConfig({
-      model: modelInput,
+      model: activeSelection.model,
+      sourceType: activeSelection.sourceType,
+      filename: activeSelection.filename,
       room: parsedRoom,
       key: parsedKey ?? "",
       unlisted: true,
@@ -2155,6 +2222,7 @@ export const Dashboard: React.FC = () => {
                         />
                         <button
                           type="button"
+                          data-testid="join-by-invite-btn"
                           className="native-btn"
                           onClick={handleJoinByInviteString}
                         >
