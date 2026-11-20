@@ -286,9 +286,6 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                   className={`chat-bubble-row ${msg.role}`}
                 >
                   <div className={`chat-bubble ${msg.role}`}>
-                    <div className="chat-bubble-role">
-                      {msg.role === "user" ? "You" : "AI Assistant"}
-                    </div>
                     <div className="chat-bubble-content">
                       {isLastStreamingAssistant && !msg.content ? (
                         <span

@@ -606,6 +606,46 @@ class LocalNodeRuntime:
                 ),
             )
 
+    async def _stream_native_async(
+        self,
+        prompt: str,
+        messages: list[dict[str, str]] | None,
+        max_tokens: int,
+        temperature: float,
+    ) -> AsyncIterator[tuple[int, str, bool]]:
+        """Stream native llama_cpp tokens asynchronously on worker thread without blocking event loop."""
+        queue: asyncio.Queue[tuple[int, str, bool] | None | Exception] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def _worker() -> None:
+            try:
+                assert self.model_runner is not None
+                for step, text, is_eos in self.model_runner.stream_native(
+                    prompt=prompt,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, (step, text, is_eos))
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+
+        worker_task = asyncio.to_thread(_worker)
+        fut = asyncio.create_task(worker_task)
+
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            if not fut.done():
+                fut.cancel()
+
     async def stream_p2p_pipeline_tokens(
         self,
         prompt: str,
@@ -622,6 +662,28 @@ class LocalNodeRuntime:
         token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue(maxsize=64)
         self.pending_token_queues[request_id] = token_queue
         self.active_request_steps[request_id] = 0
+
+        next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
+            self.shard_layer_end
+        )
+        if self.model_runner.has_native_llama and next_peer_initial is None:
+            try:
+                async for step_idx, token_text, is_eos in self._stream_native_async(
+                    prompt=prompt,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ):
+                    self.active_request_steps[request_id] = step_idx
+                    yield request_id, step_idx, 0, token_text, is_eos
+                    if is_eos:
+                        break
+            finally:
+                self.pending_token_queues.pop(request_id, None)
+                self.active_request_steps.pop(request_id, None)
+                if self.model_runner is not None:
+                    self.model_runner.release_request_cache(request_id)
+            return
 
         try:
             if messages and self.model_runner.is_real_model:
