@@ -290,7 +290,30 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                       {msg.role === "user" ? "You" : "AI Assistant"}
                     </div>
                     <div className="chat-bubble-content">
-                      {msg.content || (isLastStreamingAssistant ? "Thinking..." : "")}
+                      {isLastStreamingAssistant && !msg.content ? (
+                        <span
+                          className="chat-thinking-indicator"
+                          data-testid="chat-thinking-indicator"
+                          aria-label="AI is thinking"
+                        >
+                          <span className="chat-thinking-dot" />
+                          <span className="chat-thinking-dot" />
+                          <span className="chat-thinking-dot" />
+                        </span>
+                      ) : (
+                        <>
+                          {msg.content}
+                          {isLastStreamingAssistant && msg.content.length > 0 && (
+                            <span
+                              className="chat-streaming-cursor"
+                              data-testid="chat-streaming-cursor"
+                              aria-hidden="true"
+                            >
+                              ▍
+                            </span>
+                          )}
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -308,12 +331,15 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             rows={2}
             value={inputValue}
             disabled={!isModelReady || isStreaming}
+            style={{ opacity: isStreaming ? 0.6 : 1 }}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleTextareaKeyDown}
             placeholder={
-              isModelReady
-                ? `Message ${modelId}... (Enter to send, Shift+Enter for new line)`
-                : "Model not ready — waiting for 100% RAM coverage..."
+              isStreaming
+                ? "AI is generating a response..."
+                : isModelReady
+                  ? `Message ${modelId}... (Enter to send, Shift+Enter for new line)`
+                  : "Model not ready — waiting for 100% RAM coverage..."
             }
           />
           <div className="chat-composer-actions">
@@ -323,8 +349,18 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 data-testid="chat-stop-btn"
                 className="native-btn native-btn-danger"
                 onClick={handleStopGeneration}
+                style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}
               >
-                Stop
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  aria-hidden="true"
+                >
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                </svg>
+                <span>Stop</span>
               </button>
             ) : (
               <button
@@ -332,8 +368,23 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 data-testid="chat-send-btn"
                 className="native-btn native-btn-primary"
                 disabled={!isModelReady || !inputValue.trim()}
+                style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}
               >
-                Send
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <line x1="12" y1="19" x2="12" y2="5" />
+                  <polyline points="5 12 12 5 19 12" />
+                </svg>
+                <span>Send</span>
               </button>
             )}
           </div>

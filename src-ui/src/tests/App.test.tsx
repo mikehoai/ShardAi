@@ -7,6 +7,7 @@ import {
   formatCompactRoomName,
   orderRoomsForSession,
 } from "../components/Dashboard";
+import { ChatWindow } from "../components/ChatWindow";
 import {
   extractApiErrorDetail,
   normalizeNoticeToEnglish,
@@ -2341,6 +2342,132 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       expect(screen.getByTestId("chat-error-banner").textContent).toContain(
         "Swarm is not ready"
       );
+    });
+  });
+
+  it("ChatWindow displays animated thinking indicator, toggles Stop button with icons, and streams cursor", async () => {
+    let sseController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/chat/completions")) {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            sseController = controller;
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-test-token"
+        modelId="meta-llama/Llama-3.1-8B-Instruct"
+        onClose={vi.fn()}
+      />
+    );
+
+    // Initial state: Send button has SVG icon and Send text
+    const sendBtn = screen.getByTestId("chat-send-btn");
+    expect(sendBtn.textContent).toContain("Send");
+    expect(sendBtn.querySelector("svg")).toBeTruthy();
+    expect(screen.queryByTestId("chat-stop-btn")).toBeNull();
+
+    const input = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+    expect(input.disabled).toBe(false);
+
+    // Type a prompt and submit
+    fireEvent.change(input, { target: { value: "Hello, model!" } });
+    fireEvent.click(sendBtn);
+
+    // During streaming: Send button transforms to Stop button with SVG square icon
+    await waitFor(() => {
+      const stopBtn = screen.getByTestId("chat-stop-btn");
+      expect(stopBtn).toBeTruthy();
+      expect(stopBtn.textContent).toContain("Stop");
+      expect(stopBtn.querySelector("svg")).toBeTruthy();
+    });
+
+    // Textarea is disabled with streaming placeholder and reduced opacity
+    expect(input.disabled).toBe(true);
+    expect(input.placeholder).toBe("AI is generating a response...");
+    expect(input.style.opacity).toBe("0.6");
+
+    // Before tokens arrive, assistant bubble shows thinking indicator with 3 dots
+    expect(screen.getByTestId("chat-thinking-indicator")).toBeTruthy();
+    expect(screen.getByTestId("chat-thinking-indicator").getAttribute("aria-label")).toBe(
+      "AI is thinking"
+    );
+    const dots = screen
+      .getByTestId("chat-thinking-indicator")
+      .querySelectorAll(".chat-thinking-dot");
+    expect(dots.length).toBe(3);
+    expect(screen.queryByTestId("chat-streaming-cursor")).toBeNull();
+
+    // Enqueue first token chunk
+    act(() => {
+      if (sseController) {
+        sseController.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              choices: [{ delta: { content: "Hello " } }],
+            })}\n\n`
+          )
+        );
+      }
+    });
+
+    // Thinking indicator disappears; streaming cursor appears
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-thinking-indicator")).toBeNull();
+      expect(screen.getByTestId("chat-streaming-cursor")).toBeTruthy();
+      expect(screen.getByTestId("chat-streaming-cursor").textContent).toBe("▍");
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain("Hello ");
+    });
+
+    // Enqueue second token chunk
+    act(() => {
+      if (sseController) {
+        sseController.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              choices: [{ delta: { content: "world!" } }],
+            })}\n\n`
+          )
+        );
+      }
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Hello world!"
+      );
+    });
+
+    // Click Stop button to abort generation
+    const stopBtn = screen.getByTestId("chat-stop-btn");
+    fireEvent.click(stopBtn);
+
+    // Stop button turns back into Send button, cursor disappears, content preserved
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-stop-btn")).toBeNull();
+      expect(screen.getByTestId("chat-send-btn")).toBeTruthy();
+      expect(screen.queryByTestId("chat-streaming-cursor")).toBeNull();
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Hello world!"
+      );
+      expect(input.disabled).toBe(false);
+      expect(input.style.opacity).toBe("1");
     });
   });
 });
