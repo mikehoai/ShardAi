@@ -36,9 +36,44 @@ impl Default for PythonCoreState {
     }
 }
 
-/// Resolves the `core-engine` directory whether running from `src-tauri/` or the workspace root.
+/// Resolves the `core-engine` directory whether running from `src-tauri/`, `target/release/`, or workspace root.
 fn resolve_core_engine_dir() -> Result<PathBuf, String> {
-    let candidates = [PathBuf::from("../core-engine"), PathBuf::from("core-engine")];
+    if let Ok(env_dir) = std::env::var("SHARDAI_CORE_DIR") {
+        let p = PathBuf::from(env_dir);
+        if p.join("main.py").exists() {
+            return p.canonicalize().map_err(|e| e.to_string());
+        }
+    }
+
+    let mut candidates = vec![
+        PathBuf::from("../core-engine"),
+        PathBuf::from("core-engine"),
+        PathBuf::from("../../core-engine"),
+        PathBuf::from("../../../core-engine"),
+        PathBuf::from("../../../../core-engine"),
+        PathBuf::from("d:\\ShardAi-Workspace\\shardai-node\\core-engine"),
+    ];
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        let mut cur = exe_path.parent();
+        while let Some(dir) = cur {
+            candidates.push(dir.join("core-engine"));
+            candidates.push(dir.join("shardai-node").join("core-engine"));
+            candidates.push(dir.join("..").join("core-engine"));
+            cur = dir.parent();
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur = Some(cwd.as_path());
+        while let Some(dir) = cur {
+            candidates.push(dir.join("core-engine"));
+            candidates.push(dir.join("shardai-node").join("core-engine"));
+            candidates.push(dir.join("..").join("core-engine"));
+            cur = dir.parent();
+        }
+    }
+
     for candidate in candidates {
         if candidate.join("main.py").exists() {
             return candidate
@@ -55,6 +90,7 @@ fn resolve_python_executable(engine_dir: &PathBuf) -> PathBuf {
     let venv_candidates = [
         engine_dir.join(".venv").join("Scripts").join("python.exe"),
         engine_dir.join("..").join(".venv").join("Scripts").join("python.exe"),
+        PathBuf::from("d:\\ShardAi-Workspace\\shardai-node\\core-engine\\.venv\\Scripts\\python.exe"),
     ];
 
     #[cfg(not(target_os = "windows"))]
@@ -157,16 +193,7 @@ fn ensure_core_spawned(state: &PythonCoreState) -> Result<String, String> {
         }
     }
 
-    let (mut cmd, launch_label) = if let Some(sidecar_bin) = resolve_sidecar_executable() {
-        let mut c = Command::new(&sidecar_bin);
-        c.args(["--mode", "daemon", "--port", "8000"])
-            .env("SHARDAI_ENGINE_PORT", "8000")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        (c, format!("{:?}", sidecar_bin))
-    } else {
-        let engine_dir = resolve_core_engine_dir()?;
+    let (mut cmd, launch_label) = if let Ok(engine_dir) = resolve_core_engine_dir() {
         let python_bin = resolve_python_executable(&engine_dir);
         let mut c = Command::new(&python_bin);
         c.current_dir(&engine_dir)
@@ -176,6 +203,16 @@ fn ensure_core_spawned(state: &PythonCoreState) -> Result<String, String> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         (c, format!("{:?}", python_bin))
+    } else if let Some(sidecar_bin) = resolve_sidecar_executable() {
+        let mut c = Command::new(&sidecar_bin);
+        c.args(["--mode", "daemon", "--port", "8000"])
+            .env("SHARDAI_ENGINE_PORT", "8000")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        (c, format!("{:?}", sidecar_bin))
+    } else {
+        return Err("Neither Python environment nor sidecar binary could be located.".to_string());
     };
 
     #[cfg(target_os = "windows")]
