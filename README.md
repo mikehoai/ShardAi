@@ -45,19 +45,6 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
 
 ---
 
-## 📦 Release Deliverables & Desktop Binaries
-
-ShardAi packages both a native desktop graphical interface and a standalone command-line suite:
-
-| Deliverable | Format | Build Output Location | Description |
-| :--- | :--- | :--- | :--- |
-| **Windows Desktop Installer** | `.exe` (NSIS) | `src-tauri/target/release/bundle/nsis/ShardAi_0.1.0_x64-setup.exe` | Complete Windows installer bundling the Tauri shell, React UI, and Python AI sidecar engine (~193 MB). |
-| **Portable Desktop App** | `.exe` | `src-tauri/target/release/shardai-node.exe` | Standalone portable executable for instant testing without system installation. |
-| **Standalone CLI Binary** | `.exe` / ELF / Mach-O | `dist/cli/shardai.exe` (`shardai`) | Headless terminal utility compiled via PyInstaller for servers, background services, and scripts. |
-| **macOS Universal App** | `.dmg` | `src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg` | macOS Universal bundle supporting both Apple Silicon (`arm64`) and Intel (`x86_64`). |
-
----
-
 ## 🏗 Client Architecture
 
 `shardai-node` is structured into three decoupled client layers:
