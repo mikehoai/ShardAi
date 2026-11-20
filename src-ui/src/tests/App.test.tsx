@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { invoke } from "@tauri-apps/api/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "../components/Dashboard";
 import {
@@ -6,15 +7,23 @@ import {
   normalizeNoticeToEnglish,
 } from "../services/engineApi";
 import type {
+  CatalogModelItem,
   NodeStatusResponse,
   RoomLobbyItem,
   StartNodeRequest,
 } from "../types/node";
 
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
+
 describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
   afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
     vi.restoreAllMocks();
     window.localStorage.clear();
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   });
 
   it("renders Network Rooms Lobby table, Refresh button, and Create/Unlisted Room modal", async () => {
@@ -626,5 +635,682 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
 
       unmount();
     }
+  });
+
+
+  it("never kills Python sidecar and clears download progress on HTTP 404 and SSE download errors", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const mockedInvoke = vi.mocked(invoke);
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_available_ram_gb") return 12;
+      if (cmd === "start_python_core") return "ready";
+      if (cmd === "stop_python_core") return "stopped";
+      return "";
+    });
+
+    let downloadScenario: "http_404" | "sse_error" = "http_404";
+    let sseController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "llama3",
+                name: "Llama 3.1 8B",
+                repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+                filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                estimated_ram_gb: 6,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        if (downloadScenario === "http_404") {
+          return new Response(
+            JSON.stringify({ detail: "Local GGUF file not found." }),
+            { status: 404, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            sseController = controller;
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  model_id: "meta-llama/Llama-3.1-8B-Instruct",
+                  status: "downloading",
+                  progress: 40,
+                  downloaded_bytes: 40,
+                  total_bytes: 100,
+                  local_path: null,
+                  message: "Downloading 40%",
+                })}\n\n`
+              )
+            );
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    // Sub-case A: HTTP 404 from /models/download-stream
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Local GGUF file not found."
+      );
+    });
+    expect(screen.queryByTestId("model-download-progress-bar")).toBeNull();
+    expect(
+      (screen.getByTestId("toggle-sharing-btn") as HTMLButtonElement).disabled
+    ).toBe(false);
+    expect(mockedInvoke).toHaveBeenCalledWith("start_python_core", undefined);
+    expect(mockedInvoke).not.toHaveBeenCalledWith("stop_python_core", undefined);
+
+    // Sub-case B: SSE stream emits progress (40%) followed by an error event
+    downloadScenario = "sse_error";
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("model-download-progress-bar")).toBeTruthy();
+      expect(screen.getByTestId("model-download-percent").textContent).toBe("40%");
+    });
+
+    const activeController = sseController as ReadableStreamDefaultController<Uint8Array> | null;
+    if (activeController) {
+      activeController.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            model_id: "meta-llama/Llama-3.1-8B-Instruct",
+            status: "error",
+            progress: 40,
+            downloaded_bytes: 40,
+            total_bytes: 100,
+            local_path: null,
+            message: "Network download interrupted",
+          })}\n\n`
+        )
+      );
+      activeController.close();
+    }
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Network download interrupted"
+      );
+      expect(screen.queryByTestId("model-download-progress-bar")).toBeNull();
+    });
+    expect(screen.getByTestId("gateway-badge").getAttribute("data-status")).toBe("standby");
+    expect(mockedInvoke).not.toHaveBeenCalledWith("stop_python_core", undefined);
+  });
+
+  it("syncs UI to standby when 5-second /status poll observes STOPPED or ERROR transitions", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    const runningStatus: NodeStatusResponse = {
+      state: "RUNNING",
+      node_id: "node-sync-01",
+      model_id: "meta-llama/Llama-3.1-8B-Instruct",
+      room_id: "public",
+      is_private: false,
+      is_unlisted: false,
+      backend: "llama_cpp",
+      n_layers: 32,
+      total_layers: 32,
+      allocated_ram_mb: 4096,
+      allocated_vram_mb: 0,
+      p2p_listen_port: 49152,
+      connected_peers_count: 1,
+      peers: [],
+      session_token: "sk-live-token",
+      api_base_url: "http://127.0.0.1:8000/v1",
+      coverage_percent: 100,
+      is_swarm_ready: true,
+      network_status: "online",
+      message: "Gateway Active",
+    };
+
+    let currentStatus: NodeStatusResponse = runningStatus;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/status")) {
+        return new Response(JSON.stringify(currentStatus), { status: 200 });
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    // Sub-case A: RUNNING -> STOPPED
+    const firstRender = render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
+      expect(screen.getByTestId("gateway-badge").getAttribute("data-status")).toBe("active");
+      expect(
+        (screen.getByTestId("room-id-input") as HTMLInputElement).disabled
+      ).toBe(true);
+    });
+
+    currentStatus = {
+      ...runningStatus,
+      state: "STOPPED",
+      session_token: null,
+      allocated_ram_mb: 0,
+      allocated_vram_mb: 0,
+      connected_peers_count: 0,
+      coverage_percent: 0,
+      is_swarm_ready: false,
+      message: "Stopped via CLI",
+    };
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("session-credentials-panel")).toBeNull();
+      expect(screen.getByTestId("gateway-badge").getAttribute("data-status")).toBe("standby");
+      expect(
+        (screen.getByTestId("room-id-input") as HTMLInputElement).disabled
+      ).toBe(false);
+      expect(screen.getByTestId("status-message").textContent).toContain(
+        "Stopped — Stopped via CLI"
+      );
+    });
+
+    firstRender.unmount();
+
+    // Sub-case B: RUNNING -> ERROR
+    currentStatus = runningStatus;
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
+    });
+
+    currentStatus = {
+      ...runningStatus,
+      state: "ERROR",
+      session_token: null,
+      allocated_ram_mb: 0,
+      allocated_vram_mb: 0,
+      connected_peers_count: 0,
+      coverage_percent: 0,
+      is_swarm_ready: false,
+      message: "Worker crashed",
+    };
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("session-credentials-panel")).toBeNull();
+      expect(screen.getByTestId("gateway-badge").getAttribute("data-status")).toBe("standby");
+      expect(
+        (screen.getByTestId("room-id-input") as HTMLInputElement).disabled
+      ).toBe(false);
+      expect(screen.getByRole("alert").textContent).toContain("Worker crashed");
+      expect(screen.getByTestId("status-message").textContent).toContain(
+        "Error — Worker crashed"
+      );
+    });
+  });
+
+  it("uses resolveActiveModelSelection for handleJoinByInviteString across Local File and Online Catalog tabs", async () => {
+    const catalogItems: CatalogModelItem[] = [
+      {
+        id: "llama3",
+        name: "Llama 3.1 8B",
+        repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        estimated_ram_gb: 6,
+        enabled: true,
+      },
+      {
+        id: "qwen7b",
+        name: "Qwen 2.5 7B",
+        repo_id: "Qwen/Qwen2.5-7B-Instruct",
+        filename: "qwen2.5-7b-q4_k_m.gguf",
+        estimated_ram_gb: 5,
+        enabled: true,
+      },
+    ];
+
+    const startPayloads: StartNodeRequest[] = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: catalogItems.length,
+            models: catalogItems,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "secret-lab", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        const doneStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(doneStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        const statusResp: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: parsed.node_id,
+          model_id: parsed.model_id,
+          network_mode: parsed.network_mode,
+          room_id: parsed.room_id,
+          is_private: Boolean(parsed.room_key),
+          is_unlisted: Boolean(parsed.is_unlisted),
+          backend: parsed.backend,
+          n_layers: 32,
+          total_layers: 32,
+          allocated_ram_mb: parsed.max_ram_mb,
+          allocated_vram_mb: parsed.max_vram_mb,
+          p2p_listen_port: parsed.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-invite-test",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Active",
+        };
+        return new Response(JSON.stringify(statusResp), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    // Sub-case A: Local File tab active when joining via invite string
+    const localRender = render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("tab-local"));
+    fireEvent.change(screen.getByTestId("local-file-input"), {
+      target: { value: "C:/models/qwen-local.gguf" },
+    });
+
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    fireEvent.change(screen.getByTestId("paste-invite-input"), {
+      target: { value: "secret-lab | key-42" },
+    });
+    fireEvent.click(screen.getByTestId("join-by-invite-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+    expect(startPayloads[0]).toMatchObject({
+      model_id: "C:/models/qwen-local.gguf",
+      source_type: "local_file",
+      filename: null,
+      room_id: "secret-lab",
+      room_key: "key-42",
+      is_unlisted: true,
+    });
+    localRender.unmount();
+
+    // Sub-case B: Online Catalog tab with second catalog item selected
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.change(screen.getByTestId("catalog-model-select"), {
+      target: { value: "qwen7b" },
+    });
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    fireEvent.change(screen.getByTestId("paste-invite-input"), {
+      target: { value: "team-alpha | pass99" },
+    });
+    fireEvent.click(screen.getByTestId("join-by-invite-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(2);
+    });
+    expect(startPayloads[1]).toMatchObject({
+      model_id: "Qwen/Qwen2.5-7B-Instruct",
+      source_type: "catalog",
+      filename: "qwen2.5-7b-q4_k_m.gguf",
+      room_id: "team-alpha",
+      room_key: "pass99",
+      is_unlisted: true,
+    });
+  });
+
+  it("synchronizes modelTab and selectedCatalogId when joining a lobby room so retries after 409 use room.model", async () => {
+    const catalogItems: CatalogModelItem[] = [
+      {
+        id: "llama3",
+        name: "Llama 3.1 8B",
+        repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        estimated_ram_gb: 6,
+        enabled: true,
+      },
+      {
+        id: "qwen7b",
+        name: "Qwen 2.5 7B",
+        repo_id: "Qwen/Qwen2.5-7B-Instruct",
+        filename: "qwen2.5-7b-q4_k_m.gguf",
+        estimated_ram_gb: 5,
+        enabled: true,
+      },
+    ];
+
+    const mockRooms: RoomLobbyItem[] = [
+      {
+        room_id: "custom-room",
+        model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+        nodes_online: 1,
+        total_shared_ram_gb: 8,
+        is_private: false,
+        network_scope: "internet",
+        coverage_percent: 50,
+        redundancy_factor: 1,
+      },
+      {
+        room_id: "qwen-room",
+        model: "Qwen/Qwen2.5-7B-Instruct",
+        nodes_online: 1,
+        total_shared_ram_gb: 6,
+        is_private: false,
+        network_scope: "internet",
+        coverage_percent: 75,
+        redundancy_factor: 1,
+      },
+    ];
+
+    let rejectRoomJoin = true;
+    const startPayloads: StartNodeRequest[] = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: catalogItems.length,
+            models: catalogItems,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify(mockRooms), { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        if (rejectRoomJoin) {
+          return new Response(
+            JSON.stringify({ detail: "Room is busy right now." }),
+            { status: 409, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "ok", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        const doneStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(doneStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        const statusResp: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: parsed.node_id,
+          model_id: parsed.model_id,
+          network_mode: parsed.network_mode,
+          room_id: parsed.room_id,
+          is_private: false,
+          is_unlisted: false,
+          backend: parsed.backend,
+          n_layers: 32,
+          total_layers: 32,
+          allocated_ram_mb: parsed.max_ram_mb,
+          allocated_vram_mb: parsed.max_vram_mb,
+          p2p_listen_port: parsed.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-retry-test",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Active",
+        };
+        return new Response(JSON.stringify(statusResp), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    // Sub-case A: Custom model room (not in catalog)
+    const firstRender = render(<Dashboard />);
+    await waitFor(() => {
+      expect(screen.getByTestId("join-room-custom-room")).toBeTruthy();
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("join-room-custom-room"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Room is busy right now."
+      );
+      expect(screen.getByTestId("panel-custom")).toBeTruthy();
+      expect((screen.getByTestId("model-input") as HTMLInputElement).value).toBe(
+        "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+      );
+    });
+
+    rejectRoomJoin = false;
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+    expect(startPayloads[0]).toMatchObject({
+      model_id: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+      source_type: "huggingface",
+      room_id: "custom-room",
+    });
+    firstRender.unmount();
+
+    // Sub-case B: Catalog model room (second catalog item)
+    rejectRoomJoin = true;
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(screen.getByTestId("join-room-qwen-room")).toBeTruthy();
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("join-room-qwen-room"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Room is busy right now."
+      );
+      expect(screen.getByTestId("panel-catalog")).toBeTruthy();
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).value
+      ).toBe("qwen7b");
+    });
+
+    rejectRoomJoin = false;
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(2);
+    });
+    expect(startPayloads[1]).toMatchObject({
+      model_id: "Qwen/Qwen2.5-7B-Instruct",
+      source_type: "catalog",
+      filename: "qwen2.5-7b-q4_k_m.gguf",
+      room_id: "qwen-room",
+    });
   });
 });
