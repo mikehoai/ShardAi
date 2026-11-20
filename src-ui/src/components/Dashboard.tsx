@@ -26,6 +26,7 @@ import {
   type CatalogSource,
   type ModelTab,
 } from "./ModelSelector";
+import { ChatWindow } from "./ChatWindow";
 
 const LOCAL_ENGINE_ROOT = "http://127.0.0.1:8000";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000/v1";
@@ -326,9 +327,16 @@ export const Dashboard: React.FC = () => {
   const [coveragePercent, setCoveragePercent] = useState<number>(0);
   const [isSwarmReady, setIsSwarmReady] = useState<boolean>(false);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
+  const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>(
     "Idle — Select a room from the Lobby or configure your own node below."
   );
+
+  useEffect(() => {
+    if (!isSharing || !sessionToken) {
+      setIsChatOpen(false);
+    }
+  }, [isSharing, sessionToken]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Model Download Progress Bar State
@@ -2612,6 +2620,51 @@ export const Dashboard: React.FC = () => {
                         <code>{curlExample}</code>
                       </pre>
                     </div>
+
+                    {/* Built-in AI Chat Launcher (gated on 100% RAM readiness) */}
+                    <div
+                      data-testid="chat-launcher-section"
+                      className="chat-launcher-section"
+                    >
+                      {isSwarmReady && coveragePercent >= 100 ? (
+                        <>
+                          <span className="chat-launcher-hint">
+                            Chat directly with <strong>{activeModelId}</strong> using your
+                            active session API key.
+                          </span>
+                          <button
+                            type="button"
+                            data-testid="open-chat-window-btn"
+                            className="native-btn native-btn-primary chat-launcher-btn"
+                            onClick={() => setIsChatOpen(true)}
+                          >
+                            <svg
+                              width="14"
+                              height="14"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                            </svg>
+                            <span>Open AI Chat</span>
+                          </button>
+                        </>
+                      ) : (
+                        <div
+                          role="status"
+                          data-testid="chat-not-ready-notice"
+                          className="chat-not-ready-notice"
+                        >
+                          Model not ready — Waiting for 100% RAM coverage (
+                          {Math.round(coveragePercent)}%) before AI Chat is available.
+                        </div>
+                      )}
+                    </div>
                   </section>
                 ) : (
                   activeSection === "credentials" && (
@@ -2632,6 +2685,18 @@ export const Dashboard: React.FC = () => {
           </div>
         </main>
       </div>
+
+      {isSharing && sessionToken && (
+        <ChatWindow
+          isOpen={isChatOpen}
+          isModelReady={isSwarmReady && coveragePercent >= 100}
+          coveragePercent={coveragePercent}
+          apiBaseUrl={apiBaseUrl}
+          sessionToken={sessionToken}
+          modelId={activeModelId}
+          onClose={() => setIsChatOpen(false)}
+        />
+      )}
 
       {/* =================================================================== */}
       {/* Bottom Native OS Statusbar                                          */}

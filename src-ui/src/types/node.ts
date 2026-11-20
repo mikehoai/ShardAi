@@ -132,3 +132,17 @@ export interface NodeStatusResponse {
   model_fingerprint?: string | null;
   message: string;
 }
+
+export type ChatRole = "system" | "user" | "assistant";
+
+export interface OpenAIChatMessagePayload {
+  role: ChatRole;
+  content: string;
+}
+
+export interface ChatMessageItem {
+  id: string;
+  role: Exclude<ChatRole, "system">;
+  content: string;
+  createdAt: number;
+}
