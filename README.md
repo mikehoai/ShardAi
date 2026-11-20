@@ -150,6 +150,49 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
 
 ---
 
+## 💻 Command-Line Interface (`shardai` CLI)
+
+ShardAi includes a developer-friendly command-line interface that allows you to operate nodes, manage rooms, pre-download models, and chat directly from any terminal.
+
+### CLI Installation
+
+Install the `shardai` command onto your system PATH:
+
+* **Windows:**
+  ```powershell
+  .\scripts\install_cli.ps1
+  ```
+* **macOS / Linux:**
+  ```bash
+  chmod +x ./scripts/install_cli.sh
+  ./scripts/install_cli.sh
+  ```
+* **Or install as an editable package inside your Python virtual environment:**
+  ```bash
+  pip install -e ./core-engine
+  ```
+
+### CLI Commands Overview
+
+| Command | Description | Example |
+| :--- | :--- | :--- |
+| `shardai create` | Host a room & share RAM/model | `shardai create --model llama-3.1-8b --ram 4` |
+| `shardai join` | Join an existing room | `shardai join my-room` |
+| `shardai serve` | Run background local daemon | `shardai serve --port 8000` |
+| `shardai status` | Show node state & masked API key | `shardai status --show-key` |
+| `shardai stop` | Stop active node & free memory | `shardai stop` |
+| `shardai rooms` | List available rooms | `shardai rooms` |
+| `shardai models` | List catalog models & RAM estimates | `shardai models` |
+| `shardai pull` | Pre-download model weights | `shardai pull llama-3.1-8b` |
+| `shardai peers` | List direct P2P connections | `shardai peers` |
+| `shardai chat` | Interactive REPL or one-shot prompt | `shardai chat "Why is distributed inference fast?"` |
+| `shardai network` | Telemetry & host RAM headroom | `shardai network` |
+| `shardai version` | Display installed CLI version | `shardai version` |
+
+> **Flag Ergonomics:** All commands support standard POSIX double-dash flags (`--model`, `--room`), short flags (`-m`, `-r`, `-k`), and single-dash flags (`-model`, `-room`, `-ram`). Use `--json` for machine-readable output.
+
+---
+
 ## ⚙️ Environment Variables
 
 `shardai-node` never hardcodes private keys or non-configurable endpoints. You can customize client behavior via environment variables:
@@ -193,13 +236,13 @@ ShardAi/
 ├── core-engine/         # Python AI sharding & P2P background engine (FastAPI)
 │   ├── models/          # Hugging Face downloader, GGUF reader & shard runner
 │   ├── p2p/             # Peer discovery, mDNS (zeroconf), LZ4 binary serializer & transport
-│   ├── shard_engine/    # Memory manager, Pydantic v2 schemas & signaling REST client
+│   ├── shard_engine/    # CLI entrypoint, memory manager, Pydantic schemas & signaling client
 │   ├── tests/           # Pytest unit and integration test suites
-│   ├── main.py          # FastAPI control plane, /v1/chat/completions gateway & CLI entry
-│   ├── pyproject.toml   # Python project metadata & tool configuration
+│   ├── main.py          # FastAPI control plane, /v1/chat/completions gateway & sidecar entry
+│   ├── pyproject.toml   # Python project metadata, [project.scripts], & build config
 │   └── requirements.txt # Pinned runtime and test dependencies
 ├── docs/                # Build and cross-platform packaging documentation (BUILD.md)
-├── scripts/             # PyInstaller sidecar & standalone CLI build scripts (.ps1 / .sh)
+├── scripts/             # PyInstaller sidecar, CLI builders & PATH installers (.ps1 / .sh)
 ├── src-tauri/           # Rust native shell (windowing, system tray, Python process guard)
 ├── src-ui/              # React 18 + TypeScript desktop UI dashboard
 ├── package.json         # Root Tauri CLI & UI workspace scripts

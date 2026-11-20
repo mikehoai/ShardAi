@@ -84,14 +84,17 @@ jobs:
               src-tauri/binaries/core-engine-x86_64-apple-darwin \
               src-tauri/binaries/core-engine-aarch64-apple-darwin \
               -output src-tauri/binaries/core-engine-universal-apple-darwin
-            cp -f src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai-core-universal-apple-darwin
-            chmod +x src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai-core-universal-apple-darwin
+            cp -f src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai-universal-apple-darwin
+            cp -f src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai
+            chmod +x src-tauri/binaries/core-engine-universal-apple-darwin dist/cli/shardai-universal-apple-darwin dist/cli/shardai
             lipo -info src-tauri/binaries/core-engine-universal-apple-darwin
           else
             # Reuse arm64 binary when Intel Rosetta Python is not preinstalled
             cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin src-tauri/binaries/core-engine-x86_64-apple-darwin || true
             cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin src-tauri/binaries/core-engine-universal-apple-darwin
-            cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin dist/cli/shardai-core-universal-apple-darwin
+            cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin dist/cli/shardai-universal-apple-darwin
+            cp -f src-tauri/binaries/core-engine-aarch64-apple-darwin dist/cli/shardai
+            chmod +x dist/cli/shardai-universal-apple-darwin dist/cli/shardai
           fi
 
       - name: Install Frontend & Tauri CLI Dependencies

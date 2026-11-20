@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "shardai-core-engine"
 version = "0.1.0"
@@ -21,11 +25,18 @@ dependencies = [
     "zeroconf>=0.132.0",
 ]
 
+[project.scripts]
+shardai = "shard_engine.cli:run_cli"
+
 [project.urls]
 Homepage = "https://shardai.online"
 Website = "https://shardai.online"
 Repository = "https://github.com/mikehoai/ShardAi"
 Issues = "https://github.com/mikehoai/ShardAi/issues"
+
+[tool.setuptools]
+packages = ["shard_engine", "models", "p2p"]
+py-modules = ["main"]
 
 [project.optional-dependencies]
 gguf = [

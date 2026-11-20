@@ -129,11 +129,15 @@ if [[ ! -f "${BUILT_BINARY}" ]]; then
 fi
 
 SIDECAR_TARGET="${BINARIES_DIR}/core-engine-${TARGET_TRIPLE}${EXT}"
-CLI_TARGET="${CLI_DIST_DIR}/shardai-core-${TARGET_TRIPLE}${EXT}"
+CLI_TARGET_TRIPLE="${CLI_DIST_DIR}/shardai-${TARGET_TRIPLE}${EXT}"
+CLI_TARGET_SHORT="${CLI_DIST_DIR}/shardai${EXT}"
 
 cp -f "${BUILT_BINARY}" "${SIDECAR_TARGET}"
-cp -f "${BUILT_BINARY}" "${CLI_TARGET}"
-chmod +x "${SIDECAR_TARGET}" "${CLI_TARGET}"
+cp -f "${BUILT_BINARY}" "${CLI_TARGET_TRIPLE}"
+cp -f "${BUILT_BINARY}" "${CLI_TARGET_SHORT}"
+chmod +x "${SIDECAR_TARGET}" "${CLI_TARGET_TRIPLE}" "${CLI_TARGET_SHORT}"
 
-echo "==> Tauri Sidecar binary ready : ${SIDECAR_TARGET}"
-echo "==> Standalone CLI binary ready: ${CLI_TARGET}"
+echo "==> Tauri Sidecar binary ready   : ${SIDECAR_TARGET}"
+echo "==> Standalone CLI binary ready  : ${CLI_TARGET_SHORT}"
+echo "==> Target-triple CLI binary     : ${CLI_TARGET_TRIPLE}"
+echo "==> Usage: shardai --help | shardai create --model llama-3.1-8b --ram 4"
