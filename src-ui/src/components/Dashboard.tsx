@@ -19,6 +19,13 @@ import {
   extractApiErrorDetail,
   RoomJoinRejectedError,
 } from "../services/engineApi";
+import {
+  inferCustomSourceType,
+  ModelSelector,
+  resolveModelSelection,
+  type CatalogSource,
+  type ModelTab,
+} from "./ModelSelector";
 
 const LOCAL_ENGINE_ROOT = "http://127.0.0.1:8000";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000/v1";
@@ -47,7 +54,6 @@ const NETWORK_STATUS_META: Record<
   },
 };
 
-type ModelTab = "catalog" | "custom" | "local";
 type ThemeMode = "light" | "dark";
 type NavSection = "overview" | "node" | "rooms" | "credentials";
 
@@ -68,19 +74,6 @@ function resolveInitialTheme(): ThemeMode {
     return "dark";
   }
   return "light";
-}
-
-function inferCustomSourceType(rawInput: string): ModelSourceType {
-  const lowered = rawInput.trim().toLowerCase();
-  if (
-    (lowered.startsWith("http://") || lowered.startsWith("https://")) &&
-    (!lowered.includes("huggingface.co/") ||
-      lowered.includes("/resolve/") ||
-      lowered.endsWith(".gguf"))
-  ) {
-    return "direct_url";
-  }
-  return "huggingface";
 }
 
 interface SseDownloadEvent {
@@ -206,7 +199,11 @@ export const Dashboard: React.FC = () => {
   // Create New Room / Join Unlisted Modal State
   const [showRoomModal, setShowRoomModal] = useState<boolean>(false);
   const [modalRoomId, setModalRoomId] = useState<string>("studio-room-1");
+  const [modalModelTab, setModalModelTab] = useState<ModelTab>("catalog");
+  const [modalSelectedCatalogId, setModalSelectedCatalogId] = useState<string>("");
   const [modalModel, setModalModel] = useState<string>("meta-llama/Llama-3.1-8B-Instruct");
+  const [modalCustomFilename, setModalCustomFilename] = useState<string>("");
+  const [modalLocalFilePath, setModalLocalFilePath] = useState<string>("");
   const [modalRoomKey, setModalRoomKey] = useState<string>("");
   const [modalUnlisted, setModalUnlisted] = useState<boolean>(false);
   const [invitePasteInput, setInvitePasteInput] = useState<string>("");
@@ -214,9 +211,7 @@ export const Dashboard: React.FC = () => {
   // 3-Tab Model Selection State (Online Catalog / Custom HF or URL / Local File)
   const [modelTab, setModelTab] = useState<ModelTab>("catalog");
   const [catalogModels, setCatalogModels] = useState<CatalogModelItem[]>([]);
-  const [catalogSource, setCatalogSource] = useState<"cloud" | "cache" | "default" | null>(
-    null
-  );
+  const [catalogSource, setCatalogSource] = useState<CatalogSource | null>(null);
   const [isLoadingCatalog, setIsLoadingCatalog] = useState<boolean>(false);
   const [selectedCatalogId, setSelectedCatalogId] = useState<string>("");
   const [modelInput, setModelInput] = useState<string>(
@@ -224,7 +219,6 @@ export const Dashboard: React.FC = () => {
   );
   const [customFilename, setCustomFilename] = useState<string>("");
   const [localFilePath, setLocalFilePath] = useState<string>("");
-  const localFileInputRef = useRef<HTMLInputElement | null>(null);
   const [networkMode, setNetworkMode] = useState<NetworkMode>("internet");
   const [roomId, setRoomId] = useState<string>("public");
   const [roomKey, setRoomKey] = useState<string>("");
@@ -331,6 +325,17 @@ export const Dashboard: React.FC = () => {
             const first = data.models?.[0];
             if (first) {
               setModelInput(first.repo_id);
+              return first.id;
+            }
+            return prev;
+          });
+          setModalSelectedCatalogId((prev) => {
+            if (prev && data.models?.some((m) => m.id === prev)) {
+              return prev;
+            }
+            const first = data.models?.[0];
+            if (first) {
+              setModalModel(first.repo_id);
               return first.id;
             }
             return prev;
@@ -642,41 +647,15 @@ export const Dashboard: React.FC = () => {
     }
   };
 
-  const resolveActiveModelSelection = (): {
-    model: string;
-    sourceType: ModelSourceType;
-    filename: string | null;
-  } => {
-    if (modelTab === "catalog") {
-      const selected = catalogModels.find((m) => m.id === selectedCatalogId) ?? catalogModels[0];
-      if (selected) {
-        return {
-          model: selected.repo_id,
-          sourceType: "catalog",
-          filename: selected.filename ?? null,
-        };
-      }
-      return {
-        model: modelInput.trim(),
-        sourceType: "catalog",
-        filename: null,
-      };
-    }
-    if (modelTab === "local") {
-      return {
-        model: localFilePath.trim(),
-        sourceType: "local_file",
-        filename: null,
-      };
-    }
-    const customModel = modelInput.trim();
-    const detectedType = inferCustomSourceType(customModel);
-    return {
-      model: customModel,
-      sourceType: detectedType,
-      filename: detectedType === "huggingface" ? customFilename.trim() || null : null,
-    };
-  };
+  const resolveActiveModelSelection = () =>
+    resolveModelSelection({
+      modelTab,
+      catalogModels,
+      selectedCatalogId,
+      modelInput,
+      customFilename,
+      localFilePath,
+    });
 
   const syncModelSelectionState = (
     targetModel: string
@@ -709,7 +688,10 @@ export const Dashboard: React.FC = () => {
     };
   };
 
-  const handleBrowseGgufFile = async (): Promise<void> => {
+  const handleBrowseGgufFile = async (
+    onPicked: (filePath: string) => void,
+    triggerFallbackInput: () => void
+  ): Promise<void> => {
     setErrorMessage(null);
     if (isTauriEnvironment()) {
       try {
@@ -719,9 +701,7 @@ export const Dashboard: React.FC = () => {
           filters: [{ name: "GGUF Model", extensions: ["gguf"] }],
         });
         if (typeof picked === "string" && picked.trim()) {
-          setLocalFilePath(picked.trim());
-          setDownloadProgress(null);
-          setDownloadStatusMsg("");
+          onPicked(picked.trim());
           return;
         }
         if (picked === null) {
@@ -731,7 +711,17 @@ export const Dashboard: React.FC = () => {
         // Fallback to native HTML file picker if dialog plugin is unavailable
       }
     }
-    localFileInputRef.current?.click();
+    triggerFallbackInput();
+  };
+
+  const openCreateRoomModal = (): void => {
+    setModalModelTab(modelTab);
+    setModalSelectedCatalogId(selectedCatalogId);
+    setModalModel(modelInput);
+    setModalCustomFilename(customFilename);
+    setModalLocalFilePath(localFilePath);
+    setErrorMessage(null);
+    setShowRoomModal(true);
   };
 
   const startSharingWithConfig = async (
@@ -1008,18 +998,53 @@ export const Dashboard: React.FC = () => {
   const handleCreateOrJoinUnlisted = (event: React.FormEvent): void => {
     event.preventDefault();
     const cleanRoom = modalRoomId.trim() || "private-room";
-    const cleanModel = modalModel.trim() || "meta-llama/Llama-3.1-8B-Instruct";
     const cleanKey = modalRoomKey.trim();
-    const syncedModel = syncModelSelectionState(cleanModel);
+    const resolvedModel = resolveModelSelection({
+      modelTab: modalModelTab,
+      catalogModels,
+      selectedCatalogId: modalSelectedCatalogId,
+      modelInput: modalModel,
+      customFilename: modalCustomFilename,
+      localFilePath: modalLocalFilePath,
+    });
 
+    if (!resolvedModel.model) {
+      setErrorMessage(
+        modalModelTab === "local"
+          ? "Please browse or enter a valid local .gguf file path."
+          : "Please select a catalog model or enter a HuggingFace Repo ID / Direct URL."
+      );
+      return;
+    }
+
+    // Sync chosen room model configuration back to main Node & Model Configuration panel
+    setModelTab(modalModelTab);
+    if (modalModelTab === "catalog") {
+      const matchedCatalog =
+        catalogModels.find((m) => m.id === modalSelectedCatalogId) ??
+        catalogModels.find((m) => m.repo_id === resolvedModel.model);
+      if (matchedCatalog) {
+        setSelectedCatalogId(matchedCatalog.id);
+        setModelInput(matchedCatalog.repo_id);
+      } else {
+        setModelInput(resolvedModel.model);
+      }
+    } else if (modalModelTab === "local") {
+      setLocalFilePath(resolvedModel.model);
+    } else {
+      setModelInput(resolvedModel.model);
+      setCustomFilename(modalCustomFilename.trim());
+    }
+
+    setErrorMessage(null);
     setShowRoomModal(false);
     setRoomId(cleanRoom);
     setRoomKey(cleanKey);
     setIsUnlisted(modalUnlisted);
     void startSharingWithConfig({
-      model: syncedModel.model,
-      sourceType: syncedModel.sourceType,
-      filename: syncedModel.filename,
+      model: resolvedModel.model,
+      sourceType: resolvedModel.sourceType,
+      filename: resolvedModel.filename,
       room: cleanRoom,
       key: cleanKey,
       unlisted: modalUnlisted,
@@ -1536,226 +1561,51 @@ export const Dashboard: React.FC = () => {
                 </div>
 
                 {/* 3-Tab Model Selector */}
-                <div style={{ marginBottom: "16px" }}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      flexWrap: "wrap",
-                      gap: "6px",
-                      marginBottom: "6px",
-                    }}
-                  >
-                    <span className="native-label" style={{ marginBottom: 0 }}>
-                      Model Source
-                    </span>
-                    {catalogSource !== null && modelTab === "catalog" && (() => {
-                      const catalogTooltip =
-                        catalogSource === "cloud"
-                          ? "Synced from Cloud"
-                          : catalogSource === "cache"
-                            ? "Loaded from ~/.shardai/models_cache.json"
-                            : "Default Offline Catalog";
-                      return (
-                        <span
-                          role="status"
-                          tabIndex={0}
-                          data-testid="catalog-source-badge"
-                          data-source={catalogSource}
-                          data-tooltip={catalogTooltip}
-                          aria-label={catalogTooltip}
-                          title={catalogTooltip}
-                          className={`catalog-cloud-indicator catalog-cloud-indicator--${catalogSource} native-tooltip-trigger`}
-                        >
-                          <svg
-                            data-testid="catalog-cloud-icon"
-                            width="16"
-                            height="16"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.8"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            aria-hidden="true"
-                          >
-                            <path d="M17.5 19H7a4.5 4.5 0 0 1-.42-8.98A6 6 0 0 1 18.2 8.2 4 4 0 0 1 17.5 19Z" />
-                            {catalogSource === "default" && <line x1="3" y1="3" x2="21" y2="21" />}
-                          </svg>
-                        </span>
-                      );
-                    })()}
-                  </div>
-
-                  <div
-                    role="tablist"
-                    aria-label="Model Source Tabs"
-                    className="native-segmented"
-                  >
-                    {(
-                      [
-                        { id: "catalog", label: "Online Catalog" },
-                        { id: "custom", label: "Custom HF / URL" },
-                        { id: "local", label: "Local File" },
-                      ] as const
-                    ).map((tab) => {
-                      const active = modelTab === tab.id;
-                      return (
-                        <button
-                          key={tab.id}
-                          type="button"
-                          role="tab"
-                          aria-selected={active}
-                          data-testid={`tab-${tab.id}`}
-                          disabled={isSharing || isBusy}
-                          className={`native-seg-btn${active ? " active" : ""}`}
-                          onClick={() => {
-                            setModelTab(tab.id);
-                            setDownloadProgress(null);
-                            setDownloadStatusMsg("");
-                          }}
-                        >
-                          {tab.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {/* Tab 1: Online Catalog */}
-                  {modelTab === "catalog" && (
-                    <div
-                      data-testid="panel-catalog"
-                      style={{ display: "flex", gap: "6px", alignItems: "center" }}
-                    >
-                      <select
-                        aria-label="Online Model Catalog"
-                        data-testid="catalog-model-select"
-                        className="native-select"
-                        value={selectedCatalogId}
-                        disabled={isSharing || isBusy || catalogModels.length === 0}
-                        onChange={(e) => {
-                          const chosenId = e.target.value;
-                          setSelectedCatalogId(chosenId);
-                          const found = catalogModels.find((m) => m.id === chosenId);
-                          if (found) {
-                            setModelInput(found.repo_id);
-                          }
-                          setDownloadProgress(null);
-                          setDownloadStatusMsg("");
-                        }}
-                        style={{ flex: 1 }}
-                      >
-                        {catalogModels.length === 0 ? (
-                          <option value="">
-                            {isLoadingCatalog
-                              ? "Loading model catalog..."
-                              : "No catalog models loaded yet — click Refresh"}
-                          </option>
-                        ) : (
-                          catalogModels.map((item) => (
-                            <option key={item.id} value={item.id}>
-                              {item.name} (~{item.estimated_ram_gb} GB)
-                            </option>
-                          ))
-                        )}
-                      </select>
-                      <button
-                        type="button"
-                        data-testid="refresh-catalog-btn"
-                        className="native-btn"
-                        onClick={() => void fetchModelCatalog()}
-                        disabled={isLoadingCatalog || isSharing || isBusy}
-                      >
-                        {isLoadingCatalog ? "Syncing..." : "Refresh"}
-                      </button>
-                    </div>
-                  )}
-
-                  {/* Tab 2: Custom HF Repo / External Direct URL */}
-                  {modelTab === "custom" && (
-                    <div
-                      data-testid="panel-custom"
-                      style={{ display: "flex", flexDirection: "column", gap: "6px" }}
-                    >
-                      <input
-                        id="model-input"
-                        data-testid="model-input"
-                        type="text"
-                        className="native-input"
-                        value={modelInput}
-                        disabled={isSharing || isBusy}
-                        onChange={(e) => {
-                          setModelInput(e.target.value);
-                          setDownloadProgress(null);
-                          setDownloadStatusMsg("");
-                        }}
-                        placeholder="HuggingFace Repo (e.g. bartowski/Meta-Llama-3.1-8B-Instruct-GGUF) or Direct .gguf URL"
-                      />
-                      {inferCustomSourceType(modelInput) === "huggingface" && (
-                        <input
-                          type="text"
-                          data-testid="custom-filename-input"
-                          className="native-input"
-                          value={customFilename}
-                          disabled={isSharing || isBusy}
-                          onChange={(e) => setCustomFilename(e.target.value)}
-                          placeholder="Optional .gguf filename (leave blank to auto-pick Q4_K_M)"
-                          style={{ fontSize: "12px" }}
-                        />
-                      )}
-                    </div>
-                  )}
-
-                  {/* Tab 3: Local File (.gguf via Tauri File Dialog) */}
-                  {modelTab === "local" && (
-                    <div
-                      data-testid="panel-local"
-                      style={{ display: "flex", gap: "6px", alignItems: "center" }}
-                    >
-                      <input
-                        type="text"
-                        data-testid="local-file-input"
-                        className="native-input"
-                        value={localFilePath}
-                        disabled={isSharing || isBusy}
-                        onChange={(e) => {
-                          setLocalFilePath(e.target.value);
-                          setDownloadProgress(null);
-                          setDownloadStatusMsg("");
-                        }}
-                        placeholder="Select or paste absolute path to local .gguf file..."
-                        style={{ flex: 1 }}
-                      />
-                      <input
-                        ref={localFileInputRef}
-                        type="file"
-                        accept=".gguf"
-                        aria-hidden="true"
-                        tabIndex={-1}
-                        style={{ display: "none" }}
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) {
-                            const fileWithPath = file as File & { path?: string };
-                            setLocalFilePath(fileWithPath.path ?? file.name);
-                            setDownloadProgress(null);
-                            setDownloadStatusMsg("");
-                          }
-                        }}
-                      />
-                      <button
-                        type="button"
-                        data-testid="browse-gguf-btn"
-                        className="native-btn"
-                        disabled={isSharing || isBusy}
-                        onClick={() => void handleBrowseGgufFile()}
-                      >
-                        Browse (.gguf)
-                      </button>
-                    </div>
-                  )}
-                </div>
+                <ModelSelector
+                  label="Model Source"
+                  testIdPrefix=""
+                  modelTab={modelTab}
+                  catalogModels={catalogModels}
+                  catalogSource={catalogSource}
+                  isLoadingCatalog={isLoadingCatalog}
+                  selectedCatalogId={selectedCatalogId}
+                  modelInput={modelInput}
+                  customFilename={customFilename}
+                  localFilePath={localFilePath}
+                  disabled={isSharing || isBusy}
+                  onTabChange={(tab) => {
+                    setModelTab(tab);
+                    setDownloadProgress(null);
+                    setDownloadStatusMsg("");
+                  }}
+                  onSelectCatalogModel={(chosenId, found) => {
+                    setSelectedCatalogId(chosenId);
+                    if (found) {
+                      setModelInput(found.repo_id);
+                    }
+                    setDownloadProgress(null);
+                    setDownloadStatusMsg("");
+                  }}
+                  onRefreshCatalog={() => void fetchModelCatalog()}
+                  onModelInputChange={(value) => {
+                    setModelInput(value);
+                    setDownloadProgress(null);
+                    setDownloadStatusMsg("");
+                  }}
+                  onCustomFilenameChange={setCustomFilename}
+                  onLocalFilePathChange={(value) => {
+                    setLocalFilePath(value);
+                    setDownloadProgress(null);
+                    setDownloadStatusMsg("");
+                  }}
+                  onBrowseLocalFile={(triggerFallback) =>
+                    void handleBrowseGgufFile((pickedPath) => {
+                      setLocalFilePath(pickedPath);
+                      setDownloadProgress(null);
+                      setDownloadStatusMsg("");
+                    }, triggerFallback)
+                  }
+                />
 
                 {/* RAM Slider */}
                 <div style={{ marginBottom: "16px" }}>
@@ -2017,7 +1867,7 @@ export const Dashboard: React.FC = () => {
                           data-testid="create-room-modal-btn"
                           className="native-btn native-btn-primary"
                           disabled={isSharing || isBusy}
-                          onClick={() => setShowRoomModal(true)}
+                          onClick={openCreateRoomModal}
                         >
                           Create New Room / Join Unlisted
                         </button>
@@ -2315,15 +2165,47 @@ export const Dashboard: React.FC = () => {
                         </div>
                       </div>
 
-                      <div style={{ marginBottom: "10px" }}>
-                        <label className="native-label">Model</label>
-                        <input
-                          type="text"
-                          className="native-input"
-                          value={modalModel}
-                          onChange={(e) => setModalModel(e.target.value)}
-                        />
-                      </div>
+                      <ModelSelector
+                        label="AI Model"
+                        testIdPrefix="modal-"
+                        marginBottom="12px"
+                        modelTab={modalModelTab}
+                        catalogModels={catalogModels}
+                        catalogSource={catalogSource}
+                        isLoadingCatalog={isLoadingCatalog}
+                        selectedCatalogId={modalSelectedCatalogId}
+                        modelInput={modalModel}
+                        customFilename={modalCustomFilename}
+                        localFilePath={modalLocalFilePath}
+                        disabled={isSharing || isBusy}
+                        onTabChange={(tab) => {
+                          setModalModelTab(tab);
+                          setErrorMessage(null);
+                        }}
+                        onSelectCatalogModel={(chosenId, found) => {
+                          setModalSelectedCatalogId(chosenId);
+                          if (found) {
+                            setModalModel(found.repo_id);
+                          }
+                          setErrorMessage(null);
+                        }}
+                        onRefreshCatalog={() => void fetchModelCatalog()}
+                        onModelInputChange={(value) => {
+                          setModalModel(value);
+                          setErrorMessage(null);
+                        }}
+                        onCustomFilenameChange={setModalCustomFilename}
+                        onLocalFilePathChange={(value) => {
+                          setModalLocalFilePath(value);
+                          setErrorMessage(null);
+                        }}
+                        onBrowseLocalFile={(triggerFallback) =>
+                          void handleBrowseGgufFile((pickedPath) => {
+                            setModalLocalFilePath(pickedPath);
+                            setErrorMessage(null);
+                          }, triggerFallback)
+                        }
+                      />
 
                       <label
                         style={{

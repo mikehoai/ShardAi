@@ -1313,4 +1313,386 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       room_id: "qwen-room",
     });
   });
+
+  it("allows selecting and refreshing an Online Catalog model inside Create New Room modal", async () => {
+    const encoder = new TextEncoder();
+    const mockCatalog: CatalogModelItem[] = [
+      {
+        id: "llama3",
+        name: "Llama 3.1 8B",
+        repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        estimated_ram_gb: 6,
+        enabled: true,
+      },
+      {
+        id: "qwen7b",
+        name: "Qwen 2.5 7B",
+        repo_id: "Qwen/Qwen2.5-7B-Instruct",
+        filename: "qwen2.5-7b-q4_k_m.gguf",
+        estimated_ram_gb: 5,
+        enabled: true,
+      },
+    ];
+
+    let catalogFetchCount = 0;
+    const downloadUrls: string[] = [];
+    const startPayloads: StartNodeRequest[] = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/models/catalog")) {
+        catalogFetchCount += 1;
+        return new Response(
+          JSON.stringify({ source: "cloud", count: mockCatalog.length, models: mockCatalog }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "qwen-studio", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        downloadUrls.push(url);
+        const doneStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(doneStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        const statusResp: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: parsed.node_id,
+          model_id: parsed.model_id,
+          network_mode: parsed.network_mode,
+          room_id: parsed.room_id,
+          is_private: Boolean(parsed.room_key),
+          is_unlisted: Boolean(parsed.is_unlisted),
+          backend: parsed.backend,
+          n_layers: 32,
+          total_layers: 32,
+          allocated_ram_mb: parsed.max_ram_mb,
+          allocated_vram_mb: parsed.max_vram_mb,
+          p2p_listen_port: parsed.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-room-modal-catalog",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Active",
+        };
+        return new Response(JSON.stringify(statusResp), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    expect(screen.getByTestId("create-room-modal")).toBeTruthy();
+    expect(screen.getByTestId("modal-tab-catalog").getAttribute("aria-selected")).toBe("true");
+    expect(
+      (screen.getByTestId("modal-catalog-model-select") as HTMLSelectElement).value
+    ).toBe("llama3");
+
+    // Refresh catalog from inside the modal
+    const countBeforeRefresh = catalogFetchCount;
+    fireEvent.click(screen.getByTestId("modal-refresh-catalog-btn"));
+    await waitFor(() => {
+      expect(catalogFetchCount).toBeGreaterThan(countBeforeRefresh);
+    });
+
+    // Select second catalog model and create room
+    fireEvent.change(screen.getByTestId("modal-room-name-input"), {
+      target: { value: "qwen-studio" },
+    });
+    fireEvent.change(screen.getByTestId("modal-room-key-input"), {
+      target: { value: "secret42" },
+    });
+    fireEvent.change(screen.getByTestId("modal-catalog-model-select"), {
+      target: { value: "qwen7b" },
+    });
+    fireEvent.click(screen.getByTestId("modal-create-join-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+
+    expect(startPayloads[0]).toMatchObject({
+      model_id: "Qwen/Qwen2.5-7B-Instruct",
+      source_type: "catalog",
+      filename: "qwen2.5-7b-q4_k_m.gguf",
+      room_id: "qwen-studio",
+      room_key: "secret42",
+    });
+    expect(downloadUrls[0]).toContain("source_type=catalog");
+    expect(downloadUrls[0]).toContain("filename=qwen2.5-7b-q4_k_m.gguf");
+    // Main panel synced to the modal's chosen catalog model
+    expect((screen.getByTestId("catalog-model-select") as HTMLSelectElement).value).toBe(
+      "qwen7b"
+    );
+  });
+
+  it("supports Custom HF Repo (+ filename) and Direct URL selection inside Create New Room modal", async () => {
+    const encoder = new TextEncoder();
+    const startPayloads: StartNodeRequest[] = [];
+
+    const mockFetch = () =>
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/available-rooms")) {
+          return new Response("[]", { status: 200 });
+        }
+        if (url.includes("/rooms/check-join")) {
+          return new Response(
+            JSON.stringify({ allowed: true, room_id: "custom-room", message: "OK" }),
+            { status: 200 }
+          );
+        }
+        if (url.endsWith("/health")) {
+          return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+        }
+        if (url.includes("/models/download-stream")) {
+          const doneStream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            },
+          });
+          return new Response(doneStream, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        }
+        if (url.endsWith("/start-node") && init?.body) {
+          const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+          startPayloads.push(parsed);
+          const statusResp: NodeStatusResponse = {
+            state: "RUNNING",
+            node_id: parsed.node_id,
+            model_id: parsed.model_id,
+            network_mode: parsed.network_mode,
+            room_id: parsed.room_id,
+            is_private: false,
+            is_unlisted: false,
+            backend: parsed.backend,
+            n_layers: 32,
+            total_layers: 32,
+            allocated_ram_mb: parsed.max_ram_mb,
+            allocated_vram_mb: parsed.max_vram_mb,
+            p2p_listen_port: parsed.p2p_listen_port,
+            connected_peers_count: 1,
+            peers: [],
+            session_token: "sk-room-modal-custom",
+            api_base_url: "http://127.0.0.1:8000/v1",
+            coverage_percent: 100,
+            is_swarm_ready: true,
+            network_status: "online",
+            message: "Active",
+          };
+          return new Response(JSON.stringify(statusResp), { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      });
+
+    // Sub-case A: Custom HuggingFace Repo + custom .gguf filename
+    mockFetch();
+    const hfRender = render(<Dashboard />);
+
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    fireEvent.click(screen.getByTestId("modal-tab-custom"));
+    fireEvent.change(screen.getByTestId("modal-room-name-input"), {
+      target: { value: "hf-room" },
+    });
+    fireEvent.change(screen.getByTestId("modal-model-input"), {
+      target: { value: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF" },
+    });
+    fireEvent.change(screen.getByTestId("modal-custom-filename-input"), {
+      target: { value: "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf" },
+    });
+    fireEvent.click(screen.getByTestId("modal-create-join-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+    expect(startPayloads[0]).toMatchObject({
+      model_id: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+      source_type: "huggingface",
+      filename: "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+      room_id: "hf-room",
+    });
+    hfRender.unmount();
+
+    // Sub-case B: Direct .gguf URL
+    vi.restoreAllMocks();
+    mockFetch();
+    render(<Dashboard />);
+
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    fireEvent.click(screen.getByTestId("modal-tab-custom"));
+    fireEvent.change(screen.getByTestId("modal-room-name-input"), {
+      target: { value: "url-room" },
+    });
+    fireEvent.change(screen.getByTestId("modal-model-input"), {
+      target: { value: "https://cdn.example.com/models/phi-3-mini.gguf" },
+    });
+    expect(screen.queryByTestId("modal-custom-filename-input")).toBeNull();
+    fireEvent.click(screen.getByTestId("modal-create-join-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(2);
+    });
+    expect(startPayloads[1]).toMatchObject({
+      model_id: "https://cdn.example.com/models/phi-3-mini.gguf",
+      source_type: "direct_url",
+      filename: null,
+      room_id: "url-room",
+    });
+  });
+
+  it("supports Local File (.gguf) selection and validates empty model paths in Create New Room modal", async () => {
+    const encoder = new TextEncoder();
+    const startPayloads: StartNodeRequest[] = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "local-gguf-room", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        const doneStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(doneStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        const statusResp: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: parsed.node_id,
+          model_id: parsed.model_id,
+          network_mode: parsed.network_mode,
+          room_id: parsed.room_id,
+          is_private: false,
+          is_unlisted: false,
+          backend: parsed.backend,
+          n_layers: 32,
+          total_layers: 32,
+          allocated_ram_mb: parsed.max_ram_mb,
+          allocated_vram_mb: parsed.max_vram_mb,
+          p2p_listen_port: parsed.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-room-modal-local",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Active",
+        };
+        return new Response(JSON.stringify(statusResp), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    fireEvent.change(screen.getByTestId("modal-room-name-input"), {
+      target: { value: "local-gguf-room" },
+    });
+
+    // Empty Custom model blocks submit and keeps modal open
+    fireEvent.click(screen.getByTestId("modal-tab-custom"));
+    fireEvent.change(screen.getByTestId("modal-model-input"), {
+      target: { value: "   " },
+    });
+    fireEvent.click(screen.getByTestId("modal-create-join-btn"));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Please select a catalog model or enter a HuggingFace Repo ID / Direct URL."
+    );
+    expect(screen.getByTestId("create-room-modal")).toBeTruthy();
+    expect(startPayloads).toHaveLength(0);
+
+    // Empty Local File path blocks submit and keeps modal open
+    fireEvent.click(screen.getByTestId("modal-tab-local"));
+    fireEvent.click(screen.getByTestId("modal-create-join-btn"));
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Please browse or enter a valid local .gguf file path."
+    );
+    expect(screen.getByTestId("create-room-modal")).toBeTruthy();
+    expect(startPayloads).toHaveLength(0);
+
+    // Valid Local .gguf file submits with source_type: "local_file" and syncs main panel
+    fireEvent.change(screen.getByTestId("modal-local-file-input"), {
+      target: { value: "D:/models/llama-3.1-8b-q4_k_m.gguf" },
+    });
+    fireEvent.click(screen.getByTestId("modal-create-join-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+    expect(startPayloads[0]).toMatchObject({
+      model_id: "D:/models/llama-3.1-8b-q4_k_m.gguf",
+      source_type: "local_file",
+      filename: null,
+      room_id: "local-gguf-room",
+    });
+    expect(screen.queryByTestId("create-room-modal")).toBeNull();
+    expect((screen.getByTestId("local-file-input") as HTMLInputElement).value).toBe(
+      "D:/models/llama-3.1-8b-q4_k_m.gguf"
+    );
+  });
 });
