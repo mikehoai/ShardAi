@@ -245,6 +245,7 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=16384)
     max_tokens: int = Field(default=16, ge=1, le=2048)
     compress_activations: bool = Field(default=True)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
 
 
 class SystemMemoryResponse(BaseModel):

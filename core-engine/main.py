@@ -409,6 +409,7 @@ class LocalNodeRuntime:
                     step_index=frame.step_index,
                     max_tokens=frame.max_tokens,
                     request_id=frame.request_id,
+                    temperature=frame.temperature,
                 )
             token_packet: bytes = serialize_decoded_token(
                 request_id=frame.request_id,
@@ -435,6 +436,7 @@ class LocalNodeRuntime:
                 max_tokens=frame.max_tokens,
                 network_congested=congestion_monitor.is_congested,
                 force_compression=True,
+                temperature=frame.temperature,
             )
             await self.send_with_failover(
                 completed_layer=completed_layer,
@@ -454,15 +456,12 @@ class LocalNodeRuntime:
         if queue is not None:
             await queue.put(token_frame)
 
-    async def stream_p2p_pipeline_tokens(
-        self,
-        prompt: str,
-        max_tokens: int,
-        compress_activations: bool = True,
-        messages: list[dict[str, str]] | None = None,
-        temperature: float = 0.7,
-    ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
-        """Execute distributed P2P pipeline inference and yield `(request_id, step, token_id, text, is_eos)`."""
+    def validate_pipeline_preflight(self) -> None:
+        """Validate node readiness, Head Node role, and downstream peer availability before streaming.
+
+        Must be called prior to returning a `StreamingResponse` so HTTP 400 / 503 errors
+        are returned with proper HTTP status codes instead of raising after HTTP 200 OK.
+        """
         if self.state != NodeState.RUNNING or self.model_runner is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -481,8 +480,7 @@ class LocalNodeRuntime:
             self.shard_layer_end
         )
         if (
-            self.model_runner.is_real_model
-            and self.shard_layer_end < (self.total_layers - 1)
+            self.shard_layer_end < (self.total_layers - 1)
             and next_peer_initial is None
         ):
             raise HTTPException(
@@ -494,6 +492,18 @@ class LocalNodeRuntime:
                     "allocate enough RAM to host all layers."
                 ),
             )
+
+    async def stream_p2p_pipeline_tokens(
+        self,
+        prompt: str,
+        max_tokens: int,
+        compress_activations: bool = True,
+        messages: list[dict[str, str]] | None = None,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
+        """Execute distributed P2P pipeline inference and yield `(request_id, step, token_id, text, is_eos)`."""
+        self.validate_pipeline_preflight()
+        assert self.model_runner is not None
 
         request_id: str = str(uuid.uuid4())
         token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue()
@@ -550,6 +560,7 @@ class LocalNodeRuntime:
                             max_tokens=max_tokens,
                             network_congested=congestion_monitor.is_congested,
                             force_compression=compress_activations,
+                            temperature=temperature,
                         )
                         try:
                             await send_activations(
@@ -1967,6 +1978,31 @@ async def openai_list_models(
     )
 
 
+def _build_swarm_not_ready_response() -> JSONResponse:
+    """Build standard OpenAI 503 JSON error payload when room RAM/layer coverage < 100%."""
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "error": {
+                "message": (
+                    f"Swarm is not ready (current layer coverage: {runtime.coverage_percent:.0f}%). "
+                    f"Room '{runtime.room_id or 'public'}' needs additional RAM/nodes to cover all "
+                    f"{runtime.total_layers} layers of '{runtime.model_id}'. Invite more nodes to join."
+                    + (
+                        " Running Offline (Solo): restart with 'allow_ssd_offload' enabled to "
+                        "page the remaining layers from SSD (use_mmap)."
+                        if runtime.network_status == NetworkStatus.OFFLINE_SOLO
+                        else ""
+                    )
+                ),
+                "type": "service_unavailable_error",
+                "param": None,
+                "code": "swarm_insufficient_ram",
+            }
+        },
+    )
+
+
 @app.post("/v1/chat/completions", response_model=None)
 async def openai_chat_completions(
     request: OpenAIChatCompletionRequest,
@@ -1975,30 +2011,15 @@ async def openai_chat_completions(
     """OpenAI-compatible Chat Completions endpoint routed through P2P Pipeline Inference.
 
     Rejects inference with standard OpenAI 503 JSON error while `is_swarm_ready == False`
-    (room RAM/layer coverage < 100%).
+    (room RAM/layer coverage < 100%), and runs pre-flight role/peer checks before committing
+    HTTP 200 OK SSE headers.
     """
     if not runtime.is_swarm_ready:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "error": {
-                    "message": (
-                        f"Swarm is not ready (current layer coverage: {runtime.coverage_percent:.0f}%). "
-                        f"Room '{runtime.room_id or 'public'}' needs additional RAM/nodes to cover all "
-                        f"{runtime.total_layers} layers of '{runtime.model_id}'. Invite more nodes to join."
-                        + (
-                            " Running Offline (Solo): restart with 'allow_ssd_offload' enabled to "
-                            "page the remaining layers from SSD (use_mmap)."
-                            if runtime.network_status == NetworkStatus.OFFLINE_SOLO
-                            else ""
-                        )
-                    ),
-                    "type": "service_unavailable_error",
-                    "param": None,
-                    "code": "swarm_insufficient_ram",
-                }
-            },
-        )
+        return _build_swarm_not_ready_response()
+
+    # Validate Head Node role & downstream peer availability BEFORE committing HTTP 200 SSE
+    runtime.validate_pipeline_preflight()
+
     prompt_text: str = _extract_prompt_from_messages(request.messages)
     chat_messages: list[dict[str, str]] = _extract_chat_messages_dicts(request.messages)
     max_tokens: int = request.max_tokens or 256
@@ -2027,33 +2048,72 @@ async def openai_chat_completions(
             )
             yield f"data: {role_chunk}\n\n"
 
-            async for _req_id, _step, _tok_id, token_text, _is_eos in (
-                runtime.stream_p2p_pipeline_tokens(
-                    prompt=prompt_text,
-                    max_tokens=max_tokens,
-                    compress_activations=True,
-                    messages=chat_messages,
-                    temperature=temperature,
+            try:
+                async for _req_id, _step, _tok_id, token_text, _is_eos in (
+                    runtime.stream_p2p_pipeline_tokens(
+                        prompt=prompt_text,
+                        max_tokens=max_tokens,
+                        compress_activations=True,
+                        messages=chat_messages,
+                        temperature=temperature,
+                    )
+                ):
+                    if not token_text:
+                        continue
+                    content_chunk = json.dumps(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": served_model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": token_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                    yield f"data: {content_chunk}\n\n"
+            except asyncio.CancelledError:
+                raise
+            except HTTPException as exc:
+                logger.warning(
+                    "OpenAI SSE stream aborted with HTTP %d: %s",
+                    exc.status_code,
+                    exc.detail,
                 )
-            ):
-                if not token_text:
-                    continue
-                content_chunk = json.dumps(
+                error_chunk = json.dumps(
                     {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_ts,
-                        "model": served_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": token_text},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "error": {
+                            "message": str(exc.detail),
+                            "type": "service_unavailable_error"
+                            if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+                            else "invalid_request_error",
+                            "param": None,
+                            "code": "pipeline_stream_error",
+                        }
                     }
                 )
-                yield f"data: {content_chunk}\n\n"
+                yield f"data: {error_chunk}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            except Exception as exc:
+                logger.error("OpenAI SSE stream failed mid-generation: %s", exc)
+                error_chunk = json.dumps(
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "server_error",
+                            "param": None,
+                            "code": "pipeline_stream_error",
+                        }
+                    }
+                )
+                yield f"data: {error_chunk}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
             stop_chunk = json.dumps(
                 {
@@ -2085,16 +2145,30 @@ async def openai_chat_completions(
 
     # Non-streaming completion: aggregate tokens from P2P pipeline
     collected_tokens: list[str] = []
-    async for _req_id, _step, _tok_id, token_text, _is_eos in (
-        runtime.stream_p2p_pipeline_tokens(
-            prompt=prompt_text,
-            max_tokens=max_tokens,
-            compress_activations=True,
-            messages=chat_messages,
-            temperature=temperature,
+    try:
+        async for _req_id, _step, _tok_id, token_text, _is_eos in (
+            runtime.stream_p2p_pipeline_tokens(
+                prompt=prompt_text,
+                max_tokens=max_tokens,
+                compress_activations=True,
+                messages=chat_messages,
+                temperature=temperature,
+            )
+        ):
+            collected_tokens.append(token_text)
+    except RuntimeError as exc:
+        logger.error("Non-streaming chat completion failed: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "service_unavailable_error",
+                    "param": None,
+                    "code": "pipeline_peer_failure",
+                }
+            },
         )
-    ):
-        collected_tokens.append(token_text)
 
     full_text: str = "".join(collected_tokens).strip()
     prompt_token_count: int = max(1, len(prompt_text.split()))
@@ -2123,28 +2197,74 @@ async def openai_chat_completions(
     }
 
 
-@app.post("/generate")
-async def generate_stream(request: GenerateRequest) -> StreamingResponse:
-    """Internal SSE token stream endpoint backed by the P2P Pipeline Inference runner."""
+@app.post("/generate", response_model=None)
+async def generate_stream(
+    request: GenerateRequest,
+    _token: str = Depends(verify_openai_bearer_token),
+) -> StreamingResponse | JSONResponse:
+    """Internal SSE token stream endpoint backed by the P2P Pipeline Inference runner.
+
+    Enforces Bearer session token authentication, `is_swarm_ready` 503 readiness guard,
+    and Head Node / downstream peer pre-flight checks before committing HTTP 200 OK.
+    """
+    if not runtime.is_swarm_ready:
+        return _build_swarm_not_ready_response()
+
+    # Validate Head Node role & downstream peer availability BEFORE committing HTTP 200 SSE
+    runtime.validate_pipeline_preflight()
 
     async def _sse_token_generator() -> AsyncIterator[str]:
-        async for req_id, step_idx, token_id, token_text, is_eos in (
-            runtime.stream_p2p_pipeline_tokens(
-                prompt=request.prompt,
-                max_tokens=request.max_tokens,
-                compress_activations=request.compress_activations,
+        try:
+            async for req_id, step_idx, token_id, token_text, is_eos in (
+                runtime.stream_p2p_pipeline_tokens(
+                    prompt=request.prompt,
+                    max_tokens=request.max_tokens,
+                    compress_activations=request.compress_activations,
+                    temperature=request.temperature,
+                )
+            ):
+                event_payload: str = json.dumps(
+                    {
+                        "request_id": req_id,
+                        "step": step_idx,
+                        "token_id": token_id,
+                        "token": token_text,
+                        "is_eos": is_eos,
+                    }
+                )
+                yield f"data: {event_payload}\n\n"
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as exc:
+            logger.warning(
+                "/generate SSE stream aborted with HTTP %d: %s",
+                exc.status_code,
+                exc.detail,
             )
-        ):
-            event_payload: str = json.dumps(
+            error_payload: str = json.dumps(
                 {
-                    "request_id": req_id,
-                    "step": step_idx,
-                    "token_id": token_id,
-                    "token": token_text,
-                    "is_eos": is_eos,
+                    "error": {
+                        "message": str(exc.detail),
+                        "type": "service_unavailable_error"
+                        if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+                        else "invalid_request_error",
+                        "code": "pipeline_stream_error",
+                    }
                 }
             )
-            yield f"data: {event_payload}\n\n"
+            yield f"data: {error_payload}\n\n"
+        except Exception as exc:
+            logger.error("/generate SSE stream failed mid-generation: %s", exc)
+            error_payload = json.dumps(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                        "code": "pipeline_stream_error",
+                    }
+                }
+            )
+            yield f"data: {error_payload}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
