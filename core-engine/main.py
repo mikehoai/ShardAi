@@ -279,6 +279,9 @@ class LocalNodeRuntime:
         self.model_runner: ShardModelRunner | None = None
         self.p2p_server: asyncio.AbstractServer | None = None
         self.pending_token_queues: dict[str, asyncio.Queue[DecodedTokenFrame]] = {}
+        self.active_request_steps: dict[str, int] = {}
+        self.single_peer_token_timeout_seconds: float = 60.0
+        self.failover_token_timeout_seconds: float = 10.0
         self._compute_lock: asyncio.Lock = asyncio.Lock()
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
@@ -337,6 +340,7 @@ class LocalNodeRuntime:
         completed_layer: int,
         frame_bytes: bytes,
         timeout_seconds: float = 5.0,
+        ack_timeout_seconds: float | None = None,
     ) -> PeerNodeInfo:
         """Push binary activation tensors to the primary peer, failing over to backup peers on error."""
         candidates = self.find_candidate_peers_for_next_layer(completed_layer)
@@ -353,6 +357,7 @@ class LocalNodeRuntime:
                     byte_stream=frame_bytes,
                     peer_port=candidate.port,
                     timeout_seconds=timeout_seconds,
+                    ack_timeout_seconds=ack_timeout_seconds,
                 )
                 if idx > 0:
                     logger.info(
@@ -383,8 +388,12 @@ class LocalNodeRuntime:
     async def handle_incoming_activation(self, frame: ActivationFrame) -> None:
         """Callback triggered by `receive_activations` when an upstream peer pushes a tensor."""
         if self.model_runner is None or self.state != NodeState.RUNNING:
-            logger.warning("Ignoring incoming activation frame because node is not RUNNING.")
-            return
+            logger.warning(
+                "Rejecting incoming activation frame because node is not RUNNING."
+            )
+            raise RuntimeError(
+                "Node is not RUNNING and cannot process incoming activation frames."
+            )
 
         async with self._compute_lock:
             output_tensor_bytes, output_shape = await asyncio.to_thread(
@@ -441,20 +450,120 @@ class LocalNodeRuntime:
             await self.send_with_failover(
                 completed_layer=completed_layer,
                 frame_bytes=next_frame_bytes,
+                ack_timeout_seconds=self.failover_token_timeout_seconds,
             )
         else:
-            logger.error(
-                "Middle node completed layer %d/%d but no downstream peer is registered for layer %d.",
-                completed_layer,
-                frame.total_layers - 1,
-                completed_layer + 1,
+            err_msg = (
+                f"Middle node completed layer {completed_layer}/{frame.total_layers - 1} "
+                f"but no downstream peer is registered for layer {completed_layer + 1}."
             )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
     async def handle_incoming_decoded_token(self, token_frame: DecodedTokenFrame) -> None:
         """Callback triggered on the Head Node when the Tail Node returns a decoded token."""
         queue = self.pending_token_queues.get(token_frame.request_id)
-        if queue is not None:
-            await queue.put(token_frame)
+        if queue is None:
+            logger.debug(
+                "Dropping decoded token for inactive/unknown request %s (step %d).",
+                token_frame.request_id,
+                token_frame.step_index,
+            )
+            return
+
+        expected_step: int | None = self.active_request_steps.get(token_frame.request_id)
+        if expected_step is not None and token_frame.step_index != expected_step:
+            logger.warning(
+                "Discarding stale/out-of-order decoded token for request %s: "
+                "expected step %d, got step %d.",
+                token_frame.request_id,
+                expected_step,
+                token_frame.step_index,
+            )
+            return
+
+        if queue.full():
+            try:
+                dropped = queue.get_nowait()
+                logger.warning(
+                    "Token queue full for request %s; dropped oldest queued token (step %d).",
+                    token_frame.request_id,
+                    dropped.step_index,
+                )
+            except asyncio.QueueEmpty:
+                pass
+        queue.put_nowait(token_frame)
+
+    @staticmethod
+    def _drain_token_queue_for_step(
+        token_queue: asyncio.Queue[DecodedTokenFrame],
+        request_id: str,
+        expected_step: int,
+        *,
+        discard_all: bool = False,
+    ) -> int:
+        """Drain stale or leftover frames from a request's token queue before sending a hop."""
+        retained: list[DecodedTokenFrame] = []
+        discarded: int = 0
+        while True:
+            try:
+                queued = token_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                not discard_all
+                and queued.request_id == request_id
+                and queued.step_index == expected_step
+            ):
+                retained.append(queued)
+            else:
+                discarded += 1
+                logger.warning(
+                    "Drained stale/leftover token frame for request %s "
+                    "(got step %d, expected step %d).",
+                    request_id,
+                    queued.step_index,
+                    expected_step,
+                )
+        for item in retained:
+            if not token_queue.full():
+                token_queue.put_nowait(item)
+        return discarded
+
+    @staticmethod
+    async def _wait_for_step_token(
+        token_queue: asyncio.Queue[DecodedTokenFrame],
+        request_id: str,
+        expected_step: int,
+        timeout_seconds: float,
+    ) -> DecodedTokenFrame:
+        """Await a `DecodedTokenFrame` matching `(request_id, expected_step)` within a fixed deadline."""
+        deadline: float = time.monotonic() + timeout_seconds
+        while True:
+            remaining: float = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise asyncio.TimeoutError(
+                    f"Timed out waiting for decoded token at step {expected_step} "
+                    f"for request {request_id}."
+                )
+            candidate_frame: DecodedTokenFrame = await asyncio.wait_for(
+                token_queue.get(),
+                timeout=remaining,
+            )
+            if (
+                candidate_frame.request_id != request_id
+                or candidate_frame.step_index != expected_step
+            ):
+                logger.warning(
+                    "Skipped mismatched token frame in queue for request %s: "
+                    "expected step %d, got step %d (req=%s).",
+                    request_id,
+                    expected_step,
+                    candidate_frame.step_index,
+                    candidate_frame.request_id,
+                )
+                continue
+            return candidate_frame
 
     def validate_pipeline_preflight(self) -> None:
         """Validate node readiness, Head Node role, and downstream peer availability before streaming.
@@ -506,8 +615,9 @@ class LocalNodeRuntime:
         assert self.model_runner is not None
 
         request_id: str = str(uuid.uuid4())
-        token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue()
+        token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue(maxsize=64)
         self.pending_token_queues[request_id] = token_queue
+        self.active_request_steps[request_id] = 0
 
         try:
             if messages and self.model_runner.is_real_model:
@@ -517,6 +627,7 @@ class LocalNodeRuntime:
             origin_port: int = self.p2p_listen_port or 49152
 
             for step_idx in range(max_tokens):
+                self.active_request_steps[request_id] = step_idx
                 step_input_ids: list[int] = (
                     token_ids
                     if (step_idx == 0 or not self.model_runner.is_real_model)
@@ -543,6 +654,11 @@ class LocalNodeRuntime:
                     )
                     decoded_frame: DecodedTokenFrame | None = None
                     last_step_err: Exception | None = None
+                    step_timeout: float = (
+                        self.single_peer_token_timeout_seconds
+                        if len(candidates) == 1
+                        else self.failover_token_timeout_seconds
+                    )
 
                     for idx, candidate in enumerate(candidates):
                         advertise_ip: str = _resolve_advertise_ip(
@@ -562,16 +678,25 @@ class LocalNodeRuntime:
                             force_compression=compress_activations,
                             temperature=temperature,
                         )
+                        self._drain_token_queue_for_step(
+                            token_queue,
+                            request_id=request_id,
+                            expected_step=step_idx,
+                            discard_all=(idx > 0),
+                        )
                         try:
                             await send_activations(
                                 peer_ip=candidate.ip_address,
                                 byte_stream=binary_frame,
                                 peer_port=candidate.port,
                                 timeout_seconds=5.0,
+                                ack_timeout_seconds=step_timeout,
                             )
-                            decoded_frame = await asyncio.wait_for(
-                                token_queue.get(),
-                                timeout=60.0 if len(candidates) == 1 else 10.0,
+                            decoded_frame = await self._wait_for_step_token(
+                                token_queue,
+                                request_id=request_id,
+                                expected_step=step_idx,
+                                timeout_seconds=step_timeout,
                             )
                             if idx > 0:
                                 logger.info(
@@ -601,6 +726,7 @@ class LocalNodeRuntime:
                         raise RuntimeError(
                             f"All primary and backup peers failed at step {step_idx}: {last_step_err}"
                         )
+                    self.active_request_steps[request_id] = step_idx + 1
                     token_id = decoded_frame.token_id
                     token_text = decoded_frame.token_text
                     is_eos = decoded_frame.is_eos
@@ -624,6 +750,7 @@ class LocalNodeRuntime:
                     break
         finally:
             self.pending_token_queues.pop(request_id, None)
+            self.active_request_steps.pop(request_id, None)
             if self.model_runner is not None:
                 self.model_runner.release_request_cache(request_id)
 
@@ -660,6 +787,7 @@ class LocalNodeRuntime:
                     if self.p2p_server is not None and self.p2p_server.sockets
                     else candidate_port
                 )
+                self.p2p_listen_port = actual_port
                 if actual_port != port:
                     logger.info(
                         "Requested P2P port %d unavailable; bound P2P listener on %s:%d",
@@ -691,8 +819,10 @@ class LocalNodeRuntime:
             finally:
                 self.p2p_server = None
                 self.p2p_bind_host = None
+                self.p2p_listen_port = None
         else:
             self.p2p_bind_host = None
+            self.p2p_listen_port = None
 
     def recompute_local_coverage(self) -> float:
         """Compute current model layer coverage percentage from this node + known peers."""
@@ -1915,6 +2045,7 @@ async def _stop_node_unlocked() -> NodeStatusResponse:
             runtime.model_runner = None
         runtime.memory_manager.release_all()
         runtime.pending_token_queues.clear()
+        runtime.active_request_steps.clear()
         runtime.peers = []
         runtime.node_id = None
         runtime.model_id = None
