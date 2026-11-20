@@ -287,14 +287,17 @@ class SignalingTrackerClient:
         total_model_layers: int | None = None,
         max_layers_can_hold: int | None = None,
         model_fingerprint: str | None = None,
+        room_key_hash: str | None = None,
     ) -> AnnounceAssignment:
         """Announce node capacity to `POST /announce` and receive Cloud layer assignment & role."""
         resolved_total_layers: int = total_model_layers or config.total_layers
         resolved_max_layers: int = max_layers_can_hold or max(
             1, config.shard_layer_end - config.shard_layer_start + 1
         )
-        room_key_hash: str | None = hash_room_key(config.room_key)
-        is_private: bool = room_key_hash is not None
+        effective_room_key_hash: str | None = (
+            room_key_hash if room_key_hash is not None else hash_room_key(config.room_key)
+        )
+        is_private: bool = effective_room_key_hash is not None
 
         payload: dict[str, Any] = {
             "node_id": config.node_id,
@@ -303,7 +306,7 @@ class SignalingTrackerClient:
             "network_mode": config.network_mode.value,
             "room_id": config.room_id,
             "is_private": is_private,
-            "room_key_hash": room_key_hash,
+            "room_key_hash": effective_room_key_hash,
             "unlisted": config.is_unlisted,
             "is_unlisted": config.is_unlisted,
             "available_ram_gb": float(config.ram_gb),
@@ -364,6 +367,7 @@ class SignalingTrackerClient:
                     model_id=config.model_id,
                     room_id=config.room_id,
                     room_key=config.room_key,
+                    room_key_hash=effective_room_key_hash,
                 )
             except Exception as exc:
                 logger.debug("Optional follow-up fetch_peers skipped: %s", exc)

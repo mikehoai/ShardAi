@@ -229,6 +229,15 @@ def _lan_discovery_wait_seconds() -> float:
         return 1.5
 
 
+def _heartbeat_interval_seconds() -> float:
+    """Return the Signaling Tracker heartbeat re-announce interval (strictly < 60s TTL)."""
+    try:
+        configured = float(os.getenv("SHARDAI_HEARTBEAT_INTERVAL_SECONDS", "25.0"))
+        return max(0.05, min(50.0, configured))
+    except ValueError:
+        return 25.0
+
+
 class LocalNodeRuntime:
     """Encapsulates runtime state, session auth, P2P listener, and model shard pipeline."""
 
@@ -245,6 +254,7 @@ class LocalNodeRuntime:
         self.role: PeerRole = PeerRole.PRIMARY
         self.backend: ComputeBackend | None = None
         self.p2p_listen_port: int | None = None
+        self.p2p_bind_host: str | None = None
         self.n_layers: int = 0
         self.shard_layer_start: int = 0
         self.shard_layer_end: int = 15
@@ -260,6 +270,9 @@ class LocalNodeRuntime:
         self.ssd_offload_active: bool = False
         self.source_type: ModelSourceType | None = None
         self.model_fingerprint: str | None = None
+        self._active_start_request: StartNodeRequest | None = None
+        self._active_max_layers_can_hold: int = 0
+        self._last_heartbeat_at: float = 0.0
         self._coverage_poll_task: asyncio.Task[None] | None = None
         self.memory_manager: ShardMemoryManager = ShardMemoryManager()
         self.model_downloader: ModelDownloader = ModelDownloader()
@@ -267,6 +280,8 @@ class LocalNodeRuntime:
         self.p2p_server: asyncio.AbstractServer | None = None
         self.pending_token_queues: dict[str, asyncio.Queue[DecodedTokenFrame]] = {}
         self._compute_lock: asyncio.Lock = asyncio.Lock()
+        self._lifecycle_lock: asyncio.Lock | None = None
+        self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
         self.tracker_client: SignalingTrackerClient = SignalingTrackerClient(
             base_url=os.getenv(
                 "SHARDAI_TRACKER_URL", "https://network.shardai.online"
@@ -275,6 +290,14 @@ class LocalNodeRuntime:
             connect_timeout_seconds=4.0,
             max_retries=3,
         )
+
+    def get_lifecycle_lock(self) -> asyncio.Lock:
+        """Return the lifecycle serialization lock bound to the active event loop."""
+        running_loop = asyncio.get_running_loop()
+        if self._lifecycle_lock is None or self._lifecycle_lock_loop is not running_loop:
+            self._lifecycle_lock = asyncio.Lock()
+            self._lifecycle_lock_loop = running_loop
+        return self._lifecycle_lock
 
     @property
     def api_base_url(self) -> str:
@@ -600,8 +623,13 @@ class LocalNodeRuntime:
     ) -> int:
         """Start the async TCP P2P listener (`receive_activations`) and return the bound port."""
         await self.stop_p2p_listener()
-        default_bind = "0.0.0.0" if network_mode == NetworkMode.LAN else "127.0.0.1"
-        bind_host: str = os.getenv("SHARDAI_P2P_BIND_HOST", default_bind)
+        default_bind = (
+            "0.0.0.0"
+            if network_mode in (NetworkMode.LAN, NetworkMode.INTERNET)
+            else "127.0.0.1"
+        )
+        env_bind = os.getenv("SHARDAI_P2P_BIND_HOST", "").strip()
+        bind_host: str = env_bind or default_bind
 
         candidates = [port] + [
             port + offset for offset in range(1, 32) if port + offset <= 65535
@@ -615,6 +643,7 @@ class LocalNodeRuntime:
                     on_activation_frame=self.handle_incoming_activation,
                     on_token_frame=self.handle_incoming_decoded_token,
                 )
+                self.p2p_bind_host = bind_host
                 actual_port = (
                     int(self.p2p_server.sockets[0].getsockname()[1])
                     if self.p2p_server is not None and self.p2p_server.sockets
@@ -650,6 +679,9 @@ class LocalNodeRuntime:
                 logger.debug("Error while closing P2P server: %s", exc)
             finally:
                 self.p2p_server = None
+                self.p2p_bind_host = None
+        else:
+            self.p2p_bind_host = None
 
     def recompute_local_coverage(self) -> float:
         """Compute current model layer coverage percentage from this node + known peers."""
@@ -674,16 +706,105 @@ class LocalNodeRuntime:
         self.is_swarm_ready = self.coverage_percent >= 100.0
         return self.coverage_percent
 
+    def _build_heartbeat_request(self) -> StartNodeRequest | None:
+        """Build a sanitized StartNodeRequest snapshot for periodic tracker heartbeats."""
+        if self._active_start_request is not None:
+            return self._active_start_request.model_copy(
+                update={
+                    "node_id": self.node_id or self._active_start_request.node_id,
+                    "model_id": self.model_id or self._active_start_request.model_id,
+                    "room_id": self.room_id or self._active_start_request.room_id,
+                    "room_key": None,
+                    "p2p_listen_port": (
+                        self.p2p_listen_port
+                        or self._active_start_request.p2p_listen_port
+                    ),
+                    "shard_layer_start": self.shard_layer_start,
+                    "shard_layer_end": self.shard_layer_end,
+                    "total_layers": self.total_layers,
+                }
+            )
+        if (
+            self.node_id is None
+            or self.model_id is None
+            or self.room_id is None
+            or self.p2p_listen_port is None
+        ):
+            return None
+        ram_gb = max(1, (self.memory_manager.allocated_ram_mb + 1023) // 1024)
+        return StartNodeRequest(
+            node_id=self.node_id,
+            model_id=self.model_id,
+            source_type=self.source_type or ModelSourceType.CATALOG,
+            network_mode=self.network_mode or NetworkMode.INTERNET,
+            room_id=self.room_id,
+            room_key=None,
+            is_unlisted=self.is_unlisted,
+            ram_gb=ram_gb,
+            shared_ram_gb=ram_gb,
+            max_ram_mb=ram_gb * 1024,
+            max_vram_mb=self.memory_manager.allocated_vram_mb,
+            p2p_listen_port=self.p2p_listen_port,
+            shard_layer_start=self.shard_layer_start,
+            shard_layer_end=self.shard_layer_end,
+            total_layers=self.total_layers,
+        )
+
+    async def maybe_send_tracker_heartbeat(self, force: bool = False) -> bool:
+        """Periodically re-announce this node via `POST /announce` before the 60s TTL expires."""
+        if (
+            self.state != NodeState.RUNNING
+            or self.network_status != NetworkStatus.ONLINE
+            or not _is_tracker_enabled()
+            or self.room_id is None
+        ):
+            return False
+
+        now = time.monotonic()
+        if not force and (now - self._last_heartbeat_at) < _heartbeat_interval_seconds():
+            return False
+
+        heartbeat_req = self._build_heartbeat_request()
+        if heartbeat_req is None:
+            return False
+
+        max_layers = self._active_max_layers_can_hold or max(1, self.n_layers)
+        try:
+            assignment = await self.tracker_client.register_node_with_assignment(
+                heartbeat_req,
+                total_model_layers=self.total_layers,
+                max_layers_can_hold=max_layers,
+                model_fingerprint=self.model_fingerprint,
+                room_key_hash=self.room_key_hash,
+            )
+            if self.state != NodeState.RUNNING:
+                return False
+            self._last_heartbeat_at = time.monotonic()
+            self.last_tracker_reachable = True
+            if assignment.peers:
+                self.peers = [
+                    p for p in assignment.peers if p.peer_id != self.node_id
+                ]
+            return True
+        except Exception as exc:
+            logger.warning("Background tracker heartbeat re-announce failed: %s", exc)
+            return False
+
     async def refresh_room_coverage(self) -> None:
-        """Refresh `coverage_percent` and `is_swarm_ready` from Cloud Tracker and LAN mDNS."""
+        """Refresh heartbeat registration, `coverage_percent`, and `is_swarm_ready`."""
         if self.state != NodeState.RUNNING:
             return
 
         is_online: bool = self.network_status == NetworkStatus.ONLINE
         cloud_coverage: float | None = None
         if is_online and _is_tracker_enabled() and self.room_id is not None:
+            await self.maybe_send_tracker_heartbeat()
+            if self.state != NodeState.RUNNING:
+                return
             try:
                 rooms = await self.tracker_client.fetch_available_rooms()
+                if self.state != NodeState.RUNNING:
+                    return
                 for room in rooms:
                     if room.room_id == self.room_id:
                         cloud_coverage = room.coverage_percent
@@ -695,6 +816,8 @@ class LocalNodeRuntime:
                         room_id=self.room_id,
                         room_key_hash=self.room_key_hash,
                     )
+                    if self.state != NodeState.RUNNING:
+                        return
                     if refreshed_peers:
                         self.peers = [
                             p for p in refreshed_peers if p.peer_id != self.node_id
@@ -703,10 +826,15 @@ class LocalNodeRuntime:
             except Exception as exc:
                 logger.debug("Background coverage poll skipped Cloud Tracker: %s", exc)
 
+        if self.state != NodeState.RUNNING:
+            return
+
         # LAN peers (UDP beacon + zeroconf). Offline nodes rebuild the routing table from the
         # LAN on every tick so peers that left the Wi-Fi are dropped automatically.
         try:
             lan_beacons = await _scan_all_lan_beacons(udp_timeout_seconds=0.15)
+            if self.state != NodeState.RUNNING:
+                return
             lan_peers = _lan_peers_for_room(
                 lan_beacons,
                 room_id=self.room_id or "public",
@@ -729,6 +857,9 @@ class LocalNodeRuntime:
                     self.network_status = new_status
         except Exception as exc:
             logger.debug("Background LAN scan error: %s", exc)
+
+        if self.state != NodeState.RUNNING:
+            return
 
         local_pct = self.recompute_local_coverage()
         if cloud_coverage is not None:
@@ -845,18 +976,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("ShardAi P2P AI Gateway starting up on loopback interface...")
     yield
     logger.info("ShardAi P2P AI Gateway shutting down; releasing RAM/VRAM and session token...")
-    runtime.session_token = None
-    runtime.is_swarm_ready = False
-    runtime.coverage_percent = 0.0
-    await runtime.stop_coverage_monitor()
-    await lan_mdns_service.stop_advertising()
-    await zeroconf_discovery.close()
-    await runtime.stop_p2p_listener()
-    if runtime.model_runner is not None:
-        runtime.model_runner.release()
-        runtime.model_runner = None
-    runtime.memory_manager.release_all()
-    runtime.state = NodeState.STOPPED
+    async with runtime.get_lifecycle_lock():
+        runtime.session_token = None
+        runtime.is_swarm_ready = False
+        runtime.coverage_percent = 0.0
+        runtime._active_start_request = None
+        runtime._active_max_layers_can_hold = 0
+        runtime._last_heartbeat_at = 0.0
+        await runtime.stop_coverage_monitor()
+        await lan_mdns_service.stop_advertising()
+        await zeroconf_discovery.close()
+        await runtime.stop_p2p_listener()
+        if runtime.model_runner is not None:
+            runtime.model_runner.release()
+            runtime.model_runner = None
+        runtime.memory_manager.release_all()
+        runtime.state = NodeState.STOPPED
 
 
 app = FastAPI(
@@ -1273,14 +1408,20 @@ async def stream_model_download(
 )
 async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
     """Load model shard, join LAN/Internet room, and issue an OpenAI Gateway session token."""
-    if runtime.state == NodeState.RUNNING:
-        await stop_node()
-
     if request.shard_layer_end < request.shard_layer_start:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="shard_layer_end must be greater than or equal to shard_layer_start.",
         )
+
+    async with runtime.get_lifecycle_lock():
+        return await _start_node_unlocked(request)
+
+
+async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
+    """Execute node startup while caller holds `runtime.get_lifecycle_lock()`."""
+    if runtime.state != NodeState.STOPPED:
+        await _stop_node_unlocked()
 
     effective_ram_gb: int = request.ram_gb
     request.shared_ram_gb = effective_ram_gb
@@ -1381,6 +1522,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         assigned_role: PeerRole = PeerRole.PRIMARY
         discovered_peers: list[PeerNodeInfo] = []
         cloud_online: bool = False
+        last_announce_monotonic: float = 0.0
         if _is_tracker_enabled() and request.network_mode == NetworkMode.INTERNET:
             try:
                 assignment: AnnounceAssignment = (
@@ -1392,6 +1534,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                     )
                 )
                 cloud_online = True
+                last_announce_monotonic = time.monotonic()
                 discovered_peers = assignment.peers
                 assigned_role = assignment.role
                 if not request.exact_shard_range:
@@ -1441,7 +1584,8 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         use_mmap: bool = False
         ssd_offload_active: bool = False
         if not cloud_online:
-            if request.network_mode != NetworkMode.LAN:
+            env_bind = os.getenv("SHARDAI_P2P_BIND_HOST", "").strip()
+            if not env_bind and runtime.p2p_bind_host != "0.0.0.0":
                 # Re-bind P2P listener on 0.0.0.0 so LAN peers can reach this node.
                 bound_port = await runtime.start_p2p_listener(
                     bound_port, network_mode=NetworkMode.LAN
@@ -1522,6 +1666,7 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
                     max_layers_can_hold=max_layers_can_hold,
                     model_fingerprint=model_fingerprint,
                 )
+                last_announce_monotonic = time.monotonic()
             except Exception as fp_exc:
                 logger.debug("Optional model_fingerprint sync skipped: %s", fp_exc)
 
@@ -1643,6 +1788,9 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.shard_layer_end = final_end
         runtime.total_layers = final_total_layers
         runtime.peers = discovered_peers
+        runtime._active_start_request = request.model_copy(update={"room_key": None})
+        runtime._active_max_layers_can_hold = max_layers_can_hold
+        runtime._last_heartbeat_at = last_announce_monotonic if cloud_online else 0.0
         runtime.state = NodeState.RUNNING
 
         # Compute initial coverage_percent & is_swarm_ready, then monitor every 5s
@@ -1669,6 +1817,9 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.session_token = None
         runtime.is_swarm_ready = False
         runtime.coverage_percent = 0.0
+        runtime._active_start_request = None
+        runtime._active_max_layers_can_hold = 0
+        runtime._last_heartbeat_at = 0.0
         await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.stop_advertising()
@@ -1687,6 +1838,9 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.session_token = None
         runtime.is_swarm_ready = False
         runtime.coverage_percent = 0.0
+        runtime._active_start_request = None
+        runtime._active_max_layers_can_hold = 0
+        runtime._last_heartbeat_at = 0.0
         await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.stop_advertising()
@@ -1710,6 +1864,12 @@ async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
 )
 async def stop_node() -> NodeStatusResponse:
     """Stop P2P listener, invalidate session_token, and release all RAM/VRAM shards."""
+    async with runtime.get_lifecycle_lock():
+        return await _stop_node_unlocked()
+
+
+async def _stop_node_unlocked() -> NodeStatusResponse:
+    """Stop node and release all resources while caller holds `runtime.get_lifecycle_lock()`."""
     if runtime.state == NodeState.STOPPED:
         return runtime.to_status_response(message="Node is already stopped.")
 
@@ -1732,6 +1892,9 @@ async def stop_node() -> NodeStatusResponse:
         runtime.session_token = None
         runtime.is_swarm_ready = False
         runtime.coverage_percent = 0.0
+        runtime._active_start_request = None
+        runtime._active_max_layers_can_hold = 0
+        runtime._last_heartbeat_at = 0.0
         await runtime.stop_coverage_monitor()
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.stop_advertising()
