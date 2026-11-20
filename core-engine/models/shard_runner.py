@@ -159,8 +159,13 @@ class ShardModelRunner:
 
     @property
     def is_real_model(self) -> bool:
-        """Return True when executing real PyTorch sharded weights (not stub simulation)."""
-        return self._is_real_pytorch
+        """Return True when executing real PyTorch sharded weights or native llama_cpp."""
+        return self._is_real_pytorch or (self._native_handle is not None)
+
+    @property
+    def has_native_llama(self) -> bool:
+        """Return True when llama_cpp.Llama native engine is loaded."""
+        return self._native_handle is not None
 
     @property
     def is_head_node(self) -> bool:
@@ -406,6 +411,7 @@ class ShardModelRunner:
             self._native_handle = Llama(
                 model_path=gguf_path,
                 n_gpu_layers=n_layers,
+                n_ctx=2048,
                 embeddings=True,
                 # use_mmap=True -> pages missing weights from SSD (Disk Offload, no OOM);
                 # use_mlock must stay False so the OS is free to evict mapped pages.
@@ -426,6 +432,50 @@ class ShardModelRunner:
                 n_layers,
                 exc,
             )
+
+    def stream_native(
+        self,
+        prompt: str,
+        messages: list[dict[str, str]] | None = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+    ) -> Any:
+        """Stream real tokens directly from native llama_cpp handle."""
+        if self._native_handle is None:
+            return
+        if messages:
+            stream = self._native_handle.create_chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            step = 0
+            for chunk in stream:
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {})
+                content = delta.get("content", "")
+                finish = choice.get("finish_reason")
+                is_eos = finish is not None and finish != ""
+                if content or is_eos:
+                    yield step, content, bool(is_eos)
+                    step += 1
+        else:
+            stream = self._native_handle.create_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            step = 0
+            for chunk in stream:
+                choice = chunk["choices"][0]
+                text = choice.get("text", "")
+                finish = choice.get("finish_reason")
+                is_eos = finish is not None and finish != ""
+                if text or is_eos:
+                    yield step, text, bool(is_eos)
+                    step += 1
 
     def _evict_expired_sessions(self) -> None:
         """Enforce TTL and LRU capacity bounds on cached per-request KV states."""
