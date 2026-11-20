@@ -25,6 +25,7 @@ logger = logging.getLogger("shardai.p2p.transport")
 # 4-byte unsigned big-endian length prefix for TCP stream framing
 FRAME_LEN_STRUCT = struct.Struct("!I")
 ACK_BYTE: bytes = b"\x06"
+NACK_BYTE: bytes = b"\x15"
 DEFAULT_P2P_PORT: int = 49152
 MAX_WIRE_FRAME_BYTES: int = 68 * 1024 * 1024  # 68 MB max wire frame
 CONGESTION_RTT_THRESHOLD_MS: float = 25.0
@@ -64,6 +65,7 @@ async def send_activations(
     byte_stream: bytes,
     peer_port: int = DEFAULT_P2P_PORT,
     timeout_seconds: float = 5.0,
+    ack_timeout_seconds: float | None = None,
 ) -> float:
     """Push a binary activation frame (or decoded token frame) to a peer over a TCP socket.
 
@@ -71,12 +73,17 @@ async def send_activations(
         peer_ip: Destination peer IP address (or `'ip:port'` string).
         byte_stream: Binary frame packed by `p2p.serializer`.
         peer_port: Destination TCP port (used if `peer_ip` does not include `:port`).
-        timeout_seconds: Explicit connect + write + ACK timeout in seconds.
+        timeout_seconds: Explicit connect and write timeout in seconds.
+        ack_timeout_seconds: Optional timeout in seconds for awaiting the peer's post-handler
+            `ACK_BYTE` / `NACK_BYTE` response (defaults to `timeout_seconds`).
 
     Returns:
         float: Measured socket transmission Round-Trip Time (RTT) in milliseconds.
     """
     host, resolved_port = _parse_host_port(peer_ip, peer_port)
+    ack_wait_timeout: float = (
+        timeout_seconds if ack_timeout_seconds is None else ack_timeout_seconds
+    )
     start_ns: int = time.perf_counter_ns()
 
     reader, writer = await asyncio.wait_for(
@@ -93,8 +100,20 @@ async def send_activations(
         writer.write(length_prefix + byte_stream)
         await asyncio.wait_for(writer.drain(), timeout=timeout_seconds)
 
-        # Wait for 1-byte ACK confirming peer received the full tensor frame
-        ack: bytes = await asyncio.wait_for(reader.readexactly(1), timeout=timeout_seconds)
+        # Wait for 1-byte ACK/NACK confirming peer validated and processed the frame
+        try:
+            ack: bytes = await asyncio.wait_for(
+                reader.readexactly(1), timeout=ack_wait_timeout
+            )
+        except asyncio.IncompleteReadError as exc:
+            raise RuntimeError(
+                f"Peer {host}:{resolved_port} closed connection before sending ACK"
+            ) from exc
+
+        if ack == NACK_BYTE:
+            raise RuntimeError(
+                f"Peer {host}:{resolved_port} rejected frame with NACK"
+            )
         if ack != ACK_BYTE:
             raise RuntimeError(f"Peer {host}:{resolved_port} returned invalid ACK: {ack!r}")
 
@@ -116,7 +135,7 @@ async def handle_incoming_p2p_stream(
     on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
     timeout_seconds: float = 10.0,
 ) -> None:
-    """Read a length-prefixed binary P2P frame, deserialize into Tensor/Token, and dispatch."""
+    """Read, validate, deserialize, and process a binary P2P frame before sending ACK/NACK."""
     try:
         raw_sock: socket.SocketType | None = writer.get_extra_info("socket")
         if raw_sock is not None:
@@ -135,10 +154,6 @@ async def handle_incoming_p2p_stream(
             timeout=timeout_seconds,
         )
 
-        # Acknowledge receipt immediately so upstream peer can release its socket
-        writer.write(ACK_BYTE)
-        await writer.drain()
-
         if len(frame_bytes) < 6 or frame_bytes[:4] != MAGIC_HEADER:
             raise ValueError("Received malformed frame with invalid magic bytes.")
 
@@ -147,17 +162,30 @@ async def handle_incoming_p2p_stream(
             activation_frame = deserialize_activation_tensor(frame_bytes)
             await on_activation_frame(activation_frame)
         elif pkt_type == int(PacketType.DECODED_TOKEN):
-            if on_token_frame is not None:
-                token_frame = deserialize_decoded_token(frame_bytes)
-                await on_token_frame(token_frame)
+            if on_token_frame is None:
+                raise ValueError(
+                    "Received DECODED_TOKEN frame but no on_token_frame handler is registered."
+                )
+            token_frame = deserialize_decoded_token(frame_bytes)
+            await on_token_frame(token_frame)
         else:
             raise ValueError(f"Unsupported P2P packet type: {pkt_type}")
+
+        # Acknowledge ONLY after validation, deserialization, and handler execution succeed
+        writer.write(ACK_BYTE)
+        await asyncio.wait_for(writer.drain(), timeout=timeout_seconds)
     except Exception as exc:
         logger.error("Error processing incoming P2P activation stream: %s", exc)
+        try:
+            if not writer.is_closing():
+                writer.write(NACK_BYTE)
+                await asyncio.wait_for(writer.drain(), timeout=1.0)
+        except Exception:
+            pass
     finally:
         writer.close()
         try:
-            await writer.wait_closed()
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
         except Exception:
             pass
 

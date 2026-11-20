@@ -12,16 +12,20 @@ from p2p.serializer import (
     serialize_decoded_token,
 )
 from p2p.transport import (
+    ACK_BYTE,
+    NACK_BYTE,
     congestion_monitor,
     receive_activations,
     send_activations,
 )
 
 __all__ = [
+    "ACK_BYTE",
     "ActivationFrame",
     "CompressionCodec",
     "DecodedTokenFrame",
     "LanRoomBeacon",
+    "NACK_BYTE",
     "PacketType",
     "congestion_monitor",
     "deserialize_activation_tensor",
