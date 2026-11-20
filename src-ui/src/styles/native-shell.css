@@ -733,6 +733,38 @@ pre {
   color: var(--text-primary);
 }
 
+.room-name-cell {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.room-model-cell {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.room-resource-text,
+.room-status-text {
+  display: inline;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.room-resource-text--ready,
+.room-status-text--public {
+  color: var(--success-fg);
+}
+
+.room-resource-text--pooling,
+.room-status-text--private {
+  color: var(--warn-fg);
+}
+
 .native-statusbar {
   height: 28px;
   flex-shrink: 0;

@@ -51,6 +51,82 @@ type ModelTab = "catalog" | "custom" | "local";
 type ThemeMode = "light" | "dark";
 type NavSection = "overview" | "node" | "rooms" | "credentials";
 
+const MAX_COMPACT_ROOM_NAME_LEN = 18;
+const MODEL_PREFIX_PATTERNS: readonly RegExp[] = [
+  /^(?:deepseek[-_](?:r1|v\d+|llama|qwen)(?:[-_]\d+b)?[-_]+)/i,
+  /^(?:qwen(?:\d+(?:\.\d+)?)?[-_](?:coder[-_])?(?:\d+b[-_]+)?)/i,
+  /^(?:(?:meta[-_])?llama(?:\d+(?:\.\d+)?)?[-_](?:\d+b[-_]+)?)/i,
+  /^(?:mistral|mixtral|gemma|phi)(?:\d+(?:\.\d+)?)?[-_](?:\d+b[-_]+)?/i,
+];
+
+export function createRoomSessionSeed(): number {
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    return buf[0] || 1;
+  }
+  return Math.max(1, Math.floor(Math.random() * 0xffffffff));
+}
+
+function hashRoomForSeed(roomId: string, seed: number): number {
+  let hash = (seed ^ 0x811c9dc5) >>> 0;
+  for (let i = 0; i < roomId.length; i += 1) {
+    hash ^= roomId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+export function orderRoomsForSession(
+  rooms: readonly RoomLobbyItem[],
+  sessionSeed: number
+): RoomLobbyItem[] {
+  if (rooms.length <= 1) {
+    return [...rooms];
+  }
+  return [...rooms].sort((a, b) => {
+    const scoreA = hashRoomForSeed(a.room_id, sessionSeed);
+    const scoreB = hashRoomForSeed(b.room_id, sessionSeed);
+    if (scoreA !== scoreB) {
+      return scoreA - scoreB;
+    }
+    return a.room_id.localeCompare(b.room_id);
+  });
+}
+
+export function formatCompactRoomName(roomId: string): string {
+  const trimmed = roomId.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  let compact = trimmed;
+  for (const pattern of MODEL_PREFIX_PATTERNS) {
+    const stripped = compact.replace(pattern, "");
+    if (stripped.length >= 2 && stripped !== compact) {
+      compact = stripped;
+      break;
+    }
+  }
+  if (compact.length > MAX_COMPACT_ROOM_NAME_LEN) {
+    return `${compact.slice(0, MAX_COMPACT_ROOM_NAME_LEN - 1)}…`;
+  }
+  return compact;
+}
+
+export function formatCompactModelName(model: string): string {
+  const trimmed = model.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  const withoutOrg = trimmed.includes("/") ? trimmed.slice(trimmed.lastIndexOf("/") + 1) : trimmed;
+  const cleaned = withoutOrg
+    .replace(/[-_]?gguf$/i, "")
+    .replace(/[-_]?instruct$/i, "")
+    .replace(/[-_]?distill(?=[-_])/i, "")
+    .replace(/^meta[-_]/i, "");
+  return cleaned || withoutOrg;
+}
+
 function resolveInitialTheme(): ThemeMode {
   try {
     const saved = window.localStorage.getItem("shardai_theme");
@@ -196,6 +272,7 @@ export const Dashboard: React.FC = () => {
   };
 
   // Network Rooms Lobby State
+  const roomSessionSeedRef = useRef<number>(createRoomSessionSeed());
   const [availableRooms, setAvailableRooms] = useState<RoomLobbyItem[]>([]);
   const [isLoadingRooms, setIsLoadingRooms] = useState<boolean>(false);
 
@@ -267,22 +344,33 @@ export const Dashboard: React.FC = () => {
   // Clipboard copy feedback
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  const fetchAvailableRooms = useCallback(async (): Promise<void> => {
-    setIsLoadingRooms(true);
-    try {
-      const res = await fetch(`${LOCAL_ENGINE_ROOT}/available-rooms`);
-      if (res.ok) {
-        const rooms = (await res.json()) as unknown;
-        if (Array.isArray(rooms)) {
-          setAvailableRooms(rooms as RoomLobbyItem[]);
-        }
+  const fetchAvailableRooms = useCallback(
+    async (options?: { reseed?: boolean }): Promise<void> => {
+      setIsLoadingRooms(true);
+      if (options?.reseed) {
+        roomSessionSeedRef.current = createRoomSessionSeed();
       }
-    } catch {
-      // Keep existing lobby state if local core engine is not yet running
-    } finally {
-      setIsLoadingRooms(false);
-    }
-  }, []);
+      try {
+        const res = await fetch(`${LOCAL_ENGINE_ROOT}/available-rooms`);
+        if (res.ok) {
+          const rooms = (await res.json()) as unknown;
+          if (Array.isArray(rooms)) {
+            setAvailableRooms(
+              orderRoomsForSession(
+                rooms as RoomLobbyItem[],
+                roomSessionSeedRef.current
+              )
+            );
+          }
+        }
+      } catch {
+        // Keep existing lobby state if local core engine is not yet running
+      } finally {
+        setIsLoadingRooms(false);
+      }
+    },
+    []
+  );
 
   const engineSyncedRef = useRef<boolean>(false);
 
@@ -2005,7 +2093,7 @@ export const Dashboard: React.FC = () => {
                           data-testid="refresh-rooms-btn"
                           className="native-btn"
                           onClick={() => {
-                            void fetchAvailableRooms();
+                            void fetchAvailableRooms({ reseed: true });
                             void fetchNetworkStatus();
                           }}
                           disabled={isLoadingRooms}
@@ -2137,51 +2225,48 @@ export const Dashboard: React.FC = () => {
                                 const isReady = coverage >= 100;
                                 return (
                                   <tr key={room.room_id}>
-                                    <td style={{ fontWeight: 600 }}>
-                                      {room.room_id}{" "}
-                                      <span
-                                        style={{
-                                          fontSize: "10px",
-                                          padding: "1px 5px",
-                                          borderRadius: "4px",
-                                          backgroundColor: "var(--info-bg)",
-                                          color: "var(--info-fg)",
-                                          marginLeft: "4px",
-                                        }}
-                                      >
-                                        {room.network_scope.toUpperCase()}
-                                      </span>
+                                    <td
+                                      data-testid={`room-name-${room.room_id}`}
+                                      className="room-name-cell"
+                                      title={room.room_id}
+                                    >
+                                      {formatCompactRoomName(room.room_id)}
                                     </td>
-                                    <td style={{ color: "var(--text-secondary)" }}>{room.model}</td>
+                                    <td
+                                      data-testid={`room-model-${room.room_id}`}
+                                      className="room-model-cell"
+                                      title={room.model}
+                                    >
+                                      {formatCompactModelName(room.model)}
+                                    </td>
                                     <td>{room.nodes_online}</td>
                                     <td>{room.total_shared_ram_gb} GB</td>
                                     <td>
                                       <span
                                         data-testid={`room-coverage-${room.room_id}`}
-                                        style={{
-                                          display: "inline-block",
-                                          padding: "2px 8px",
-                                          borderRadius: "999px",
-                                          fontSize: "11px",
-                                          fontWeight: 600,
-                                          backgroundColor: isReady
-                                            ? "var(--success-bg)"
-                                            : "var(--warn-bg)",
-                                          color: isReady ? "var(--success-fg)" : "var(--warn-fg)",
-                                          border: `1px solid ${
-                                            isReady
-                                              ? "var(--success-border)"
-                                              : "var(--warn-border)"
-                                          }`,
-                                          whiteSpace: "nowrap",
-                                        }}
+                                        className={`room-resource-text ${
+                                          isReady
+                                            ? "room-resource-text--ready"
+                                            : "room-resource-text--pooling"
+                                        }`}
                                       >
                                         {isReady
-                                          ? `✅ Ready (Redundancy: ${redundancy}x)`
-                                          : `⚠️ Pooling RAM: ${Math.round(coverage)}%`}
+                                          ? `Ready (Redundancy: ${redundancy}x)`
+                                          : `Pooling RAM: ${Math.round(coverage)}%`}
                                       </span>
                                     </td>
-                                    <td>{room.is_private ? "🔒 Private" : "Public"}</td>
+                                    <td>
+                                      <span
+                                        data-testid={`room-status-${room.room_id}`}
+                                        className={`room-status-text ${
+                                          room.is_private
+                                            ? "room-status-text--private"
+                                            : "room-status-text--public"
+                                        }`}
+                                      >
+                                        {room.is_private ? "Private" : "Public"}
+                                      </span>
+                                    </td>
                                     <td style={{ textAlign: "right" }}>
                                       <button
                                         type="button"
