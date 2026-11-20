@@ -10,6 +10,7 @@ Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
 
 from dataclasses import dataclass
 from enum import IntEnum
+import math
 import socket
 import struct
 from typing import Any
@@ -48,7 +49,12 @@ class CompressionCodec(IntEnum):
     LZ4 = 2
 
 
-# 54-byte big-endian binary header for ACTIVATION_TENSOR frames:
+DEFAULT_TEMPERATURE: float = 0.7
+
+# Legacy 52-byte v1 big-endian binary header (no temperature field; kept for backward compatibility)
+LEGACY_ACTIVATION_HEADER_STRUCT = struct.Struct("!4sBB16s4sHHHHHIIII")
+
+# 60-byte v2 big-endian binary header for ACTIVATION_TENSOR frames:
 # - 4s : magic ("SHRD")
 # - B  : packet_type (PacketType.ACTIVATION_TENSOR = 1)
 # - B  : compression_codec (0=NONE, 1=ZLIB, 2=LZ4)
@@ -63,7 +69,8 @@ class CompressionCodec(IntEnum):
 # - I  : shape_dim1 / hidden_dim (uint32)
 # - I  : uncompressed_bytes (uint32)
 # - I  : crc32_checksum (uint32)
-ACTIVATION_HEADER_STRUCT = struct.Struct("!4sBB16s4sHHHHHIIII")
+# - d  : temperature (IEEE-754 float64)
+ACTIVATION_HEADER_STRUCT = struct.Struct("!4sBB16s4sHHHHHIIIId")
 
 # 28-byte big-endian binary header for DECODED_TOKEN return frames:
 # - 4s : magic ("SHRD")
@@ -89,6 +96,7 @@ class ActivationFrame:
     shape: tuple[int, int]
     raw_tensor_bytes: bytes
     compression_used: CompressionCodec
+    temperature: float = DEFAULT_TEMPERATURE
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +179,16 @@ def _decompress_buffer(
     return raw_out
 
 
+def _validate_temperature(temperature: float) -> float:
+    """Ensure sampling temperature is a finite non-negative float before packing or decoding."""
+    temp_float: float = float(temperature)
+    if not math.isfinite(temp_float) or temp_float < 0.0:
+        raise ValueError(
+            f"Invalid sampling temperature in activation frame: {temperature!r}"
+        )
+    return temp_float
+
+
 def serialize_activation_tensor(
     tensor_data: bytes | bytearray | memoryview | Any,
     shape: tuple[int, int],
@@ -183,12 +201,14 @@ def serialize_activation_tensor(
     max_tokens: int = 16,
     network_congested: bool = False,
     force_compression: bool = True,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> bytes:
     """Pack a hidden-state tensor and routing metadata into a compact binary byte stream.
 
     Automatically engages LZ4 or Zlib compression when `force_compression` is True,
     `network_congested` is True, or the raw tensor size >= 32 KB.
     """
+    validated_temperature: float = _validate_temperature(temperature)
     raw_bytes: bytes = extract_contiguous_float32_bytes(tensor_data)
     uncompressed_len: int = len(raw_bytes)
     if uncompressed_len > MAX_UNCOMPRESSED_TENSOR_BYTES:
@@ -231,23 +251,80 @@ def serialize_activation_tensor(
         shape[1],
         uncompressed_len,
         crc,
+        validated_temperature,
     )
     return header + wire_payload
 
 
 def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
-    """Unpack and verify a binary activation tensor frame from an upstream P2P node."""
-    if len(frame_bytes) < ACTIVATION_HEADER_STRUCT.size:
+    """Unpack and verify a binary activation tensor frame from an upstream P2P node.
+
+    Supports both the current 60-byte v2 header (with IEEE-754 float64 `temperature`)
+    and legacy 52-byte v1 headers (defaulting `temperature` to `0.7`) via CRC32 verification.
+    """
+    if len(frame_bytes) < LEGACY_ACTIVATION_HEADER_STRUCT.size:
         raise ValueError(
-            f"Truncated activation frame: expected >= {ACTIVATION_HEADER_STRUCT.size} bytes, got {len(frame_bytes)}"
+            f"Truncated activation frame: expected >= {LEGACY_ACTIVATION_HEADER_STRUCT.size} bytes, "
+            f"got {len(frame_bytes)}"
         )
 
-    header_slice = frame_bytes[: ACTIVATION_HEADER_STRUCT.size]
-    payload_slice = frame_bytes[ACTIVATION_HEADER_STRUCT.size :]
+    magic_prefix: bytes = frame_bytes[:4]
+    if magic_prefix != MAGIC_HEADER:
+        raise ValueError(f"Invalid P2P magic header: {magic_prefix!r}")
+    pkt_type_byte: int = frame_bytes[4]
+    if pkt_type_byte != int(PacketType.ACTIVATION_TENSOR):
+        raise ValueError(
+            f"Unexpected packet type for activation frame: {pkt_type_byte}"
+        )
 
+    v2_crc_mismatch: tuple[int, int] | None = None
+    if len(frame_bytes) >= ACTIVATION_HEADER_STRUCT.size:
+        header_slice = frame_bytes[: ACTIVATION_HEADER_STRUCT.size]
+        payload_slice = frame_bytes[ACTIVATION_HEADER_STRUCT.size :]
+        (
+            _magic,
+            _pkt_type,
+            codec_val,
+            req_uuid_bytes,
+            origin_ip_bytes,
+            origin_port,
+            current_layer,
+            total_layers,
+            step_index,
+            max_tokens,
+            dim0,
+            dim1,
+            uncompressed_len,
+            expected_crc,
+            temperature,
+        ) = ACTIVATION_HEADER_STRUCT.unpack(header_slice)
+
+        actual_crc: int = zlib.crc32(payload_slice) & 0xFFFFFFFF
+        if actual_crc == expected_crc:
+            validated_temperature: float = _validate_temperature(temperature)
+            codec = CompressionCodec(codec_val)
+            raw_tensor = _decompress_buffer(payload_slice, codec, uncompressed_len)
+            return ActivationFrame(
+                request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
+                origin_ip=socket.inet_ntoa(origin_ip_bytes),
+                origin_port=origin_port,
+                current_layer=current_layer,
+                total_layers=total_layers,
+                step_index=step_index,
+                max_tokens=max_tokens,
+                shape=(dim0, dim1),
+                raw_tensor_bytes=raw_tensor,
+                compression_used=codec,
+                temperature=validated_temperature,
+            )
+        v2_crc_mismatch = (expected_crc, actual_crc)
+
+    # Fallback for legacy 52-byte v1 frames without trailing float64 temperature
+    legacy_header_slice = frame_bytes[: LEGACY_ACTIVATION_HEADER_STRUCT.size]
+    legacy_payload_slice = frame_bytes[LEGACY_ACTIVATION_HEADER_STRUCT.size :]
     (
-        magic,
-        pkt_type,
+        _magic,
+        _pkt_type,
         codec_val,
         req_uuid_bytes,
         origin_ip_bytes,
@@ -260,21 +337,22 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         dim1,
         uncompressed_len,
         expected_crc,
-    ) = ACTIVATION_HEADER_STRUCT.unpack(header_slice)
+    ) = LEGACY_ACTIVATION_HEADER_STRUCT.unpack(legacy_header_slice)
 
-    if magic != MAGIC_HEADER:
-        raise ValueError(f"Invalid P2P magic header: {magic!r}")
-    if pkt_type != int(PacketType.ACTIVATION_TENSOR):
-        raise ValueError(f"Unexpected packet type for activation frame: {pkt_type}")
-
-    actual_crc: int = zlib.crc32(payload_slice) & 0xFFFFFFFF
-    if actual_crc != expected_crc:
+    actual_legacy_crc: int = zlib.crc32(legacy_payload_slice) & 0xFFFFFFFF
+    if actual_legacy_crc != expected_crc:
+        reported_expected, reported_actual = (
+            v2_crc_mismatch
+            if v2_crc_mismatch is not None
+            else (expected_crc, actual_legacy_crc)
+        )
         raise ValueError(
-            f"Corrupted P2P tensor payload: CRC32 mismatch (expected {expected_crc:#x}, got {actual_crc:#x})"
+            "Corrupted P2P tensor payload: CRC32 mismatch "
+            f"(expected {reported_expected:#x}, got {reported_actual:#x})"
         )
 
     codec = CompressionCodec(codec_val)
-    raw_tensor = _decompress_buffer(payload_slice, codec, uncompressed_len)
+    raw_tensor = _decompress_buffer(legacy_payload_slice, codec, uncompressed_len)
 
     return ActivationFrame(
         request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
@@ -287,6 +365,7 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         shape=(dim0, dim1),
         raw_tensor_bytes=raw_tensor,
         compression_used=codec,
+        temperature=DEFAULT_TEMPERATURE,
     )
 
 

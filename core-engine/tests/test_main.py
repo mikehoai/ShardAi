@@ -279,9 +279,18 @@ def test_start_generate_sse_and_stop_node_with_private_room() -> None:
     assert start_data["room_id"] == "secret-lab-42"
     assert start_data["n_layers"] == 32
 
-    # Stream tokens via SSE from /generate
+    # Unauthenticated /generate must be rejected with 401
+    unauth_gen_res = client.post(
+        "/generate",
+        json={"prompt": "Hello ShardAi P2P", "max_tokens": 4, "compress_activations": True},
+    )
+    assert unauth_gen_res.status_code == 401
+
+    # Stream tokens via SSE from /generate with valid Bearer session token
+    auth_headers = {"Authorization": f"Bearer {start_data['session_token']}"}
     gen_res = client.post(
         "/generate",
+        headers=auth_headers,
         json={"prompt": "Hello ShardAi P2P", "max_tokens": 4, "compress_activations": True},
     )
     assert gen_res.status_code == 200
@@ -546,7 +555,7 @@ async def test_two_node_pytorch_p2p_pipeline_inference_over_tcp(tmp_path: Path) 
             step_index=frame.step_index,
             max_tokens=frame.max_tokens,
             request_id=frame.request_id,
-            temperature=0.0,
+            temperature=frame.temperature,
         )
         packet = serialize_decoded_token(
             request_id=frame.request_id,
@@ -591,6 +600,7 @@ async def test_two_node_pytorch_p2p_pipeline_inference_over_tcp(tmp_path: Path) 
                 step_index=step_idx,
                 max_tokens=4,
                 force_compression=True,
+                temperature=0.0,
             )
             await send_activations("127.0.0.1", wire_frame, peer_port=49332)
             decoded = await asyncio.wait_for(token_queue.get(), timeout=5.0)
