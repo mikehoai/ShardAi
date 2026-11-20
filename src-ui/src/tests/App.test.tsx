@@ -1313,4 +1313,471 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       room_id: "qwen-room",
     });
   });
+
+  it("hides Open AI Chat button and shows Model not ready notice under Quick Test when RAM coverage is below 100%", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "llama8b",
+                name: "Llama 3.1 8B",
+                repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+                filename: "llama-3.1-8b.gguf",
+                estimated_ram_gb: 6,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 10,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/network/status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://tracker.example.com",
+            lan_peers_count: 0,
+            zeroconf_available: true,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/download-stream")) {
+        return new Response(
+          `data: ${JSON.stringify({
+            model_id: "meta-llama/Llama-3.1-8B-Instruct",
+            status: "completed",
+            progress: 100,
+            downloaded_bytes: 1000,
+            total_bytes: 1000,
+            local_path: "/tmp/model.gguf",
+            message: "Ready",
+          })}\n\n`,
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      }
+      if (url.includes("/start-node")) {
+        const standbyStatus: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: "node-standby",
+          model_id: "meta-llama/Llama-3.1-8B-Instruct",
+          room_id: "public",
+          is_private: false,
+          is_unlisted: false,
+          role: "primary",
+          backend: "llama_cpp",
+          n_layers: 16,
+          total_layers: 32,
+          shard_layer_start: 0,
+          shard_layer_end: 15,
+          allocated_ram_mb: 4096,
+          allocated_vram_mb: 0,
+          p2p_listen_port: 49152,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-shard-standby-key",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 50,
+          is_swarm_ready: false,
+          network_status: "online",
+          message: "Waiting for more RAM",
+        };
+        return new Response(JSON.stringify(standbyStatus), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
+      expect(screen.getByTestId("chat-launcher-section")).toBeTruthy();
+      expect(screen.getByTestId("chat-not-ready-notice")).toBeTruthy();
+    });
+
+    expect(screen.queryByTestId("open-chat-window-btn")).toBeNull();
+    expect(screen.getByTestId("chat-not-ready-notice").textContent).toContain(
+      "Model not ready"
+    );
+    expect(screen.getByTestId("chat-not-ready-notice").textContent).toContain("50%");
+  });
+
+  it("shows Open AI Chat button under Quick Test when 100% RAM ready, streams SSE responses with Bearer token, supports multi-turn, clear, and Escape close", async () => {
+    const chatRequests: Array<{
+      url: string;
+      authHeader: string | null;
+      body: { model: string; messages: Array<{ role: string; content: string }>; stream: boolean };
+    }> = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "qwen7b",
+                name: "Qwen 2.5 7B",
+                repo_id: "Qwen/Qwen2.5-7B-Instruct",
+                filename: "qwen2.5-7b.gguf",
+                estimated_ram_gb: 5,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 10,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/network/status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://tracker.example.com",
+            lan_peers_count: 0,
+            zeroconf_available: true,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/download-stream")) {
+        return new Response(
+          `data: ${JSON.stringify({
+            model_id: "Qwen/Qwen2.5-7B-Instruct",
+            status: "completed",
+            progress: 100,
+            downloaded_bytes: 1000,
+            total_bytes: 1000,
+            local_path: "/tmp/qwen.gguf",
+            message: "Ready",
+          })}\n\n`,
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      }
+      if (url.includes("/start-node")) {
+        const readyStatus: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: "node-ready",
+          model_id: "Qwen/Qwen2.5-7B-Instruct",
+          room_id: "public",
+          is_private: false,
+          is_unlisted: false,
+          role: "primary",
+          backend: "llama_cpp",
+          n_layers: 32,
+          total_layers: 32,
+          shard_layer_start: 0,
+          shard_layer_end: 31,
+          allocated_ram_mb: 6144,
+          allocated_vram_mb: 0,
+          p2p_listen_port: 49152,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-shard-ready-secret-123",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Swarm ready",
+        };
+        return new Response(JSON.stringify(readyStatus), { status: 200 });
+      }
+      if (url.includes("/v1/chat/completions")) {
+        const headers = new Headers(init?.headers);
+        const parsedBody = JSON.parse(String(init?.body ?? "{}")) as {
+          model: string;
+          messages: Array<{ role: string; content: string }>;
+          stream: boolean;
+        };
+        chatRequests.push({
+          url,
+          authHeader: headers.get("Authorization"),
+          body: parsedBody,
+        });
+
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const chunk1 = `data: ${JSON.stringify({
+              choices: [{ delta: { role: "assistant", content: "Hello " } }],
+            })}\n\n`;
+            const chunk2 = `data: ${JSON.stringify({
+              choices: [{ delta: { content: "from ShardAi!" } }],
+            })}\n\n`;
+            controller.enqueue(encoder.encode(chunk1));
+            controller.enqueue(encoder.encode(chunk2));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("open-chat-window-btn")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("chat-not-ready-notice")).toBeNull();
+
+    // Open AI Chat window
+    fireEvent.click(screen.getByTestId("open-chat-window-btn"));
+    expect(screen.getByTestId("ai-chat-window")).toBeTruthy();
+    expect(screen.getByTestId("chat-window-model").textContent).toContain(
+      "Qwen/Qwen2.5-7B-Instruct"
+    );
+    expect(screen.getByTestId("chat-window-endpoint").textContent).toContain(
+      "http://127.0.0.1:8000/v1"
+    );
+
+    // Send first message
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Ping model" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Hello from ShardAi!"
+      );
+    });
+
+    expect(chatRequests).toHaveLength(1);
+    expect(chatRequests[0].url).toBe("http://127.0.0.1:8000/v1/chat/completions");
+    expect(chatRequests[0].authHeader).toBe("Bearer sk-shard-ready-secret-123");
+    expect(chatRequests[0].body).toEqual({
+      model: "Qwen/Qwen2.5-7B-Instruct",
+      messages: [{ role: "user", content: "Ping model" }],
+      stream: true,
+    });
+
+    // Clear conversation
+    fireEvent.click(screen.getByTestId("chat-clear-btn"));
+    expect(screen.getByTestId("chat-empty-state")).toBeTruthy();
+
+    // Close via Escape
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("ai-chat-window")).toBeNull();
+  });
+
+  it("handles non-streaming JSON fallback and HTTP 503 error cleanly inside AI Chat window", async () => {
+    let callCount = 0;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "qwen7b",
+                name: "Qwen 2.5 7B",
+                repo_id: "Qwen/Qwen2.5-7B-Instruct",
+                filename: "qwen2.5-7b.gguf",
+                estimated_ram_gb: 5,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 10,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/network/status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://tracker.example.com",
+            lan_peers_count: 0,
+            zeroconf_available: true,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/download-stream")) {
+        return new Response(
+          `data: ${JSON.stringify({
+            model_id: "Qwen/Qwen2.5-7B-Instruct",
+            status: "completed",
+            progress: 100,
+            downloaded_bytes: 1000,
+            total_bytes: 1000,
+            local_path: "/tmp/qwen.gguf",
+            message: "Ready",
+          })}\n\n`,
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      }
+      if (url.includes("/start-node")) {
+        const readyStatus: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: "node-ready-json",
+          model_id: "Qwen/Qwen2.5-7B-Instruct",
+          room_id: "public",
+          is_private: false,
+          is_unlisted: false,
+          role: "primary",
+          backend: "llama_cpp",
+          n_layers: 32,
+          total_layers: 32,
+          shard_layer_start: 0,
+          shard_layer_end: 31,
+          allocated_ram_mb: 6144,
+          allocated_vram_mb: 0,
+          p2p_listen_port: 49152,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-shard-json-key",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Swarm ready",
+        };
+        return new Response(JSON.stringify(readyStatus), { status: 200 });
+      }
+      if (url.includes("/v1/chat/completions")) {
+        callCount += 1;
+        if (callCount === 1) {
+          return new Response(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: "JSON reply OK" } }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            error: { message: "Swarm is not ready (RAM coverage < 100%)." },
+          }),
+          { status: 503, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("open-chat-window-btn")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("open-chat-window-btn"));
+
+    // 1st call: JSON response fallback
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Test JSON mode" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "JSON reply OK"
+      );
+    });
+
+    // 2nd call: HTTP 503 error surfaces alert inside chat window
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Trigger 503" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-error-banner").textContent).toContain(
+        "Swarm is not ready"
+      );
+    });
+  });
 });

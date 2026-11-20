@@ -2,6 +2,7 @@ import type {
   CheckRoomJoinRequest,
   CheckRoomJoinResponse,
   NodeStatusResponse,
+  OpenAIChatMessagePayload,
   StartNodeRequest,
 } from "../types/node";
 
@@ -149,4 +150,167 @@ export async function stopLocalNode(): Promise<NodeStatusResponse> {
     throw new Error(`Failed to stop local node: HTTP ${response.status}`);
   }
   return (await response.json()) as NodeStatusResponse;
+}
+
+export interface StreamChatCompletionOptions {
+  apiBaseUrl: string;
+  apiKey: string;
+  model: string;
+  messages: OpenAIChatMessagePayload[];
+  onToken: (token: string) => void;
+  signal?: AbortSignal;
+  temperature?: number;
+  maxTokens?: number;
+}
+
+function extractDeltaContent(parsed: unknown): {
+  token: string | null;
+  errorMessage: string | null;
+} {
+  if (typeof parsed !== "object" || parsed === null) {
+    return { token: null, errorMessage: null };
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.error === "object" && record.error !== null) {
+    const errObj = record.error as Record<string, unknown>;
+    if (typeof errObj.message === "string" && errObj.message.trim()) {
+      const code = typeof errObj.code === "string" ? errObj.code : undefined;
+      return {
+        token: null,
+        errorMessage: normalizeNoticeToEnglish(
+          errObj.message,
+          "Chat inference failed on the local gateway.",
+          code
+        ),
+      };
+    }
+  }
+
+  if (Array.isArray(record.choices) && record.choices.length > 0) {
+    const firstChoice = record.choices[0];
+    if (typeof firstChoice === "object" && firstChoice !== null) {
+      const choiceRec = firstChoice as Record<string, unknown>;
+      if (typeof choiceRec.delta === "object" && choiceRec.delta !== null) {
+        const deltaRec = choiceRec.delta as Record<string, unknown>;
+        if (typeof deltaRec.content === "string" && deltaRec.content.length > 0) {
+          return { token: deltaRec.content, errorMessage: null };
+        }
+      }
+      if (typeof choiceRec.message === "object" && choiceRec.message !== null) {
+        const msgRec = choiceRec.message as Record<string, unknown>;
+        if (typeof msgRec.content === "string" && msgRec.content.length > 0) {
+          return { token: msgRec.content, errorMessage: null };
+        }
+      }
+    }
+  }
+  return { token: null, errorMessage: null };
+}
+
+export async function streamChatCompletion(
+  options: StreamChatCompletionOptions
+): Promise<string> {
+  const normalizedBase = options.apiBaseUrl.replace(/\/+$/, "");
+  const endpoint = `${normalizedBase}/chat/completions`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${options.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: options.model,
+      messages: options.messages,
+      stream: true,
+      ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+      ...(options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {}),
+    }),
+    signal: options.signal,
+  });
+
+  if (!response.ok) {
+    const fallback =
+      response.status === 503
+        ? "Model not ready — swarm does not have 100% RAM coverage yet."
+        : response.status === 401
+          ? "Unauthorized — session API key is invalid or expired."
+          : `Chat request failed: HTTP ${response.status}`;
+    const detail = await extractApiErrorDetail(response, fallback);
+    throw new Error(detail);
+  }
+
+  const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+  if (contentType.includes("application/json") || !response.body) {
+    const data: unknown = await response.json();
+    const { token, errorMessage } = extractDeltaContent(data);
+    if (errorMessage) {
+      throw new Error(errorMessage);
+    }
+    if (token) {
+      options.onToken(token);
+      return token;
+    }
+    return "";
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let fullContent = "";
+
+  const processEventBlock = (block: string): boolean => {
+    const lines = block.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith("data:")) {
+        continue;
+      }
+      const payload = line.slice(5).trim();
+      if (!payload) {
+        continue;
+      }
+      if (payload === "[DONE]") {
+        return true;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const { token, errorMessage } = extractDeltaContent(parsed);
+      if (errorMessage) {
+        throw new Error(errorMessage);
+      }
+      if (token) {
+        fullContent += token;
+        options.onToken(token);
+      }
+    }
+    return false;
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        if (buffer.trim()) {
+          processEventBlock(buffer);
+        }
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      for (const block of blocks) {
+        if (processEventBlock(block)) {
+          return fullContent;
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return fullContent;
 }
