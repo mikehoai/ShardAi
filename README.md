@@ -169,9 +169,9 @@ Install the `shardai` command onto your system PATH:
 * **Linux / Ubuntu (headless client, PEP 668 safe, optional `systemd` & completions):**
   ```bash
   chmod +x ./scripts/install_linux.sh
-  ./scripts/install_linux.sh --source --shell-completion
+  ./scripts/install_linux.sh --source --shell-completion --with-systemd
   ```
-  See [`docs/LINUX.md`](docs/LINUX.md) for `.deb` installation, background daemonization, Docker, and Ubuntu firewall setup.
+  See the [Linux & Ubuntu Deployment](#-linux--ubuntu-deployment) section below and [`docs/LINUX.md`](docs/LINUX.md) for background daemonization, `.deb` packages, Docker, and firewall setup.
 * **macOS / Generic Unix:**
   ```bash
   chmod +x ./scripts/install_cli.sh
@@ -203,6 +203,97 @@ Install the `shardai` command onto your system PATH:
 | `shardai version` | Display installed CLI version | `shardai version` |
 
 > **Flag Ergonomics:** All commands support standard POSIX double-dash flags (`--model`, `--room`), short flags (`-m`, `-r`, `-k`), and single-dash flags (`-model`, `-room`, `-ram`). Use `--json` for machine-readable output.
+
+---
+
+## 🐧 Linux & Ubuntu Deployment
+
+ShardAi provides full native support for headless Linux environments (Ubuntu 22.04 LTS, 24.04 LTS, Debian, WSL2, and Linux VPS/container servers). In headless mode, the client operates autonomously via the `shardai` CLI, as a background daemon, or as a managed `systemd` service without requiring a desktop display server or GUI.
+
+### 1. Automated Installation (PEP 668 Safe)
+
+Ubuntu 24.04+ strictly enforces PEP 668 on system Python. The installer creates an isolated virtual environment, links the binary to your PATH, and configures optional completions and services:
+
+```bash
+# Ubuntu / Debian prerequisites
+sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip curl
+
+# One-step user installation with shell completion and systemd integration
+chmod +x ./scripts/install_linux.sh
+./scripts/install_linux.sh --source --shell-completion --with-systemd
+```
+
+For system-wide installation under `/usr/local/bin` and `/opt/shardai/venv`:
+```bash
+sudo ./scripts/install_linux.sh --source --system --shell-completion --with-systemd
+```
+
+Or install from the Debian `.deb` package:
+```bash
+sudo dpkg -i shardai_0.1.0_amd64.deb
+```
+
+### 2. Background Daemon & Service Management
+
+Run the node in headless background mode or configure it to start automatically on system boot:
+
+* **Detached Background Daemon:**
+  ```bash
+  # Launch daemon in the background (persists PID and logs to ~/.shardai)
+  shardai serve --background
+
+  # Join or create a room via the active daemon
+  shardai join my-distributed-room --ram 8
+
+  # Stop node execution and terminate the background daemon cleanly
+  shardai stop --shutdown-daemon
+  ```
+
+* **Hardened `systemd` Service:**
+  The daemon binds strictly to loopback (`127.0.0.1:8000`) for secure local gateway operations:
+  ```bash
+  # Generate and inspect the systemd unit file
+  shardai service unit --scope user
+
+  # Install, enable, and start user service (~/.config/systemd/user/shardai.service)
+  shardai service install --scope user
+  shardai service status --scope user
+  shardai service logs --scope user
+
+  # System-wide service (/etc/systemd/system/shardai.service)
+  sudo shardai service install --scope system
+  ```
+
+### 3. Docker & Container Deployment
+
+ShardAi automatically detects and respects Linux cgroup v1 and cgroup v2 memory limits inside Docker and container environments:
+
+```bash
+# Build the headless Ubuntu container
+docker build -f packaging/linux/Dockerfile -t shardai-node:linux .
+
+# Run containerized node with host networking and persistent cache volume
+docker run -d --name shardai-node --network host -v ~/.shardai:/home/shardai/.shardai shardai-node:linux
+```
+
+### 4. Firewall & Diagnostics
+
+* **Ubuntu UFW Configuration (LAN P2P & mDNS):**
+  ```bash
+  # Local API gateway is bound strictly to 127.0.0.1:8000
+  # Allow direct P2P tensor streaming (default TCP 49152) and LAN discovery (UDP 49535, 5353)
+  sudo ufw allow 49152/tcp comment 'ShardAi P2P Tensor Streaming'
+  sudo ufw allow 49535/udp comment 'ShardAi LAN Discovery'
+  sudo ufw allow 5353/udp comment 'mDNS Zeroconf'
+  ```
+
+* **Environment Diagnostic:**
+  Run the built-in diagnostic tool to verify host Linux environment, RAM/cgroup limits, GPU acceleration, and daemon readiness:
+  ```bash
+  shardai doctor
+  ```
+
+> For advanced packaging, manual virtualenv steps, and headless troubleshooting, refer to [`docs/LINUX.md`](docs/LINUX.md).
 
 ---
 
