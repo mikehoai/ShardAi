@@ -11,7 +11,9 @@ Security & Architecture Notes:
 
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import concurrent.futures
+from contextlib import aclosing, asynccontextmanager
+import inspect
 import ipaddress
 import json
 import logging
@@ -22,6 +24,7 @@ import re
 import secrets
 import socket
 import sys
+import threading
 import time
 from typing import Any, Literal
 import uuid
@@ -652,38 +655,103 @@ class LocalNodeRuntime:
         max_tokens: int,
         temperature: float,
     ) -> AsyncIterator[tuple[int, str, bool]]:
-        """Stream native llama_cpp tokens asynchronously on worker thread without blocking event loop."""
-        queue: asyncio.Queue[tuple[int, str, bool] | None | Exception] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        """Stream native llama_cpp tokens serialized via `_compute_lock` with prompt cancellation."""
+        async with self._compute_lock:
+            queue: asyncio.Queue[tuple[int, str, bool] | None | Exception] = asyncio.Queue(
+                maxsize=64
+            )
+            loop = asyncio.get_running_loop()
+            cancel_event = threading.Event()
+            runner = self.model_runner
 
-        def _worker() -> None:
+            def _put_with_cancel(
+                item: tuple[int, str, bool] | None | Exception,
+            ) -> bool:
+                while not cancel_event.is_set():
+                    try:
+                        put_fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                    except RuntimeError:
+                        return False
+                    while not cancel_event.is_set():
+                        try:
+                            put_fut.result(timeout=0.05)
+                            return True
+                        except concurrent.futures.TimeoutError:
+                            continue
+                        except Exception:
+                            return False
+                    put_fut.cancel()
+                    return False
+                return False
+
+            def _worker() -> None:
+                try:
+                    assert runner is not None
+                    stream_fn = runner.stream_native
+                    try:
+                        sig = inspect.signature(stream_fn)
+                        accepts_cancel = "cancel_event" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        )
+                    except (TypeError, ValueError):
+                        accepts_cancel = False
+
+                    if accepts_cancel:
+                        gen = stream_fn(
+                            prompt=prompt,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            cancel_event=cancel_event,
+                        )
+                    else:
+                        gen = stream_fn(
+                            prompt=prompt,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        )
+
+                    try:
+                        for step, text, is_eos in gen:
+                            if cancel_event.is_set():
+                                break
+                            if not _put_with_cancel((step, text, is_eos)):
+                                break
+                    finally:
+                        close_gen = getattr(gen, "close", None)
+                        if callable(close_gen):
+                            close_gen()
+
+                    if not cancel_event.is_set():
+                        _put_with_cancel(None)
+                except Exception as exc:
+                    if not cancel_event.is_set():
+                        _put_with_cancel(exc)
+
+            fut = asyncio.create_task(asyncio.to_thread(_worker))
+
             try:
-                assert self.model_runner is not None
-                for step, text, is_eos in self.model_runner.stream_native(
-                    prompt=prompt,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ):
-                    loop.call_soon_threadsafe(queue.put_nowait, (step, text, is_eos))
-                loop.call_soon_threadsafe(queue.put_nowait, None)
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-
-        worker_task = asyncio.to_thread(_worker)
-        fut = asyncio.create_task(worker_task)
-
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item
-        finally:
-            if not fut.done():
-                fut.cancel()
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            finally:
+                cancel_event.set()
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                if not fut.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
+                    except BaseException:
+                        pass
 
     async def stream_p2p_pipeline_tokens(
         self,
@@ -707,16 +775,19 @@ class LocalNodeRuntime:
         )
         if self.model_runner.has_native_llama and next_peer_initial is None:
             try:
-                async for step_idx, token_text, is_eos in self._stream_native_async(
-                    prompt=prompt,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                ):
-                    self.active_request_steps[request_id] = step_idx
-                    yield request_id, step_idx, 0, token_text, is_eos
-                    if is_eos:
-                        break
+                async with aclosing(
+                    self._stream_native_async(
+                        prompt=prompt,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                ) as native_stream:
+                    async for step_idx, token_text, is_eos in native_stream:
+                        self.active_request_steps[request_id] = step_idx
+                        yield request_id, step_idx, 0, token_text, is_eos
+                        if is_eos:
+                            break
             finally:
                 self.pending_token_queues.pop(request_id, None)
                 self.active_request_steps.pop(request_id, None)
@@ -1033,6 +1104,7 @@ class LocalNodeRuntime:
                 ]
             return True
         except Exception as exc:
+            self.last_tracker_reachable = False
             logger.warning("Background tracker heartbeat re-announce failed: %s", exc)
             return False
 
@@ -1041,12 +1113,24 @@ class LocalNodeRuntime:
         if self.state != NodeState.RUNNING:
             return
 
-        is_online: bool = self.network_status == NetworkStatus.ONLINE
+        wants_cloud_tracker: bool = (
+            _is_tracker_enabled()
+            and self.room_id is not None
+            and (
+                self.network_mode == NetworkMode.INTERNET
+                or (
+                    self.network_mode is None
+                    and self.network_status == NetworkStatus.ONLINE
+                )
+            )
+        )
+        is_online_effective: bool = False
         cloud_coverage: float | None = None
-        if is_online and _is_tracker_enabled() and self.room_id is not None:
-            await self.maybe_send_tracker_heartbeat()
-            if self.state != NodeState.RUNNING:
-                return
+        if wants_cloud_tracker:
+            if self.network_status == NetworkStatus.ONLINE:
+                await self.maybe_send_tracker_heartbeat()
+                if self.state != NodeState.RUNNING:
+                    return
             try:
                 rooms = await self.tracker_client.fetch_available_rooms()
                 if self.state != NodeState.RUNNING:
@@ -1055,6 +1139,17 @@ class LocalNodeRuntime:
                     if room.room_id == self.room_id:
                         cloud_coverage = room.coverage_percent
                         break
+                if self.network_status != NetworkStatus.ONLINE:
+                    prev_status = self.network_status
+                    self.network_status = NetworkStatus.ONLINE
+                    logger.info(
+                        "Tracker connectivity restored; transitioning %s -> %s.",
+                        prev_status,
+                        NetworkStatus.ONLINE,
+                    )
+                    await self.maybe_send_tracker_heartbeat(force=True)
+                    if self.state != NodeState.RUNNING:
+                        return
                 # Also refresh peer routing table for this room/model
                 if self.model_id is not None:
                     refreshed_peers = await self.tracker_client.fetch_peers(
@@ -1070,14 +1165,23 @@ class LocalNodeRuntime:
                             p for p in refreshed_peers if p.peer_id != self.node_id
                         ]
                 self.last_tracker_reachable = True
+                is_online_effective = True
             except Exception as exc:
-                logger.debug("Background coverage poll skipped Cloud Tracker: %s", exc)
+                if self.state != NodeState.RUNNING:
+                    return
+                self.last_tracker_reachable = False
+                is_online_effective = False
+                logger.warning(
+                    "Background coverage poll failed reaching Cloud Tracker (%s); falling back to LAN/Solo.",
+                    exc,
+                )
 
         if self.state != NodeState.RUNNING:
             return
 
-        # LAN peers (UDP beacon + zeroconf). Offline nodes rebuild the routing table from the
-        # LAN on every tick so peers that left the Wi-Fi are dropped automatically.
+        # LAN peers (UDP beacon + zeroconf). Offline/degraded nodes rebuild the routing table from
+        # the LAN on every tick so stale remote peers and departed Wi-Fi peers are dropped cleanly.
+        lan_peers: list[PeerNodeInfo] = []
         try:
             lan_beacons = await _scan_all_lan_beacons(udp_timeout_seconds=0.15)
             if self.state != NodeState.RUNNING:
@@ -1088,22 +1192,26 @@ class LocalNodeRuntime:
                 self_node_id=self.node_id,
                 total_layers=self.total_layers,
             )
-            if is_online:
-                known_ids = {p.peer_id for p in self.peers}
-                self.peers.extend(p for p in lan_peers if p.peer_id not in known_ids)
-            else:
-                self.peers = lan_peers
-                new_status = NetworkStatus.LAN_ONLY if lan_peers else NetworkStatus.OFFLINE_SOLO
-                if new_status != self.network_status:
-                    logger.info(
-                        "Network status changed: %s -> %s (%d LAN peers)",
-                        self.network_status,
-                        new_status,
-                        len(lan_peers),
-                    )
-                    self.network_status = new_status
         except Exception as exc:
             logger.debug("Background LAN scan error: %s", exc)
+
+        if self.state != NodeState.RUNNING:
+            return
+
+        if is_online_effective:
+            known_ids = {p.peer_id for p in self.peers}
+            self.peers.extend(p for p in lan_peers if p.peer_id not in known_ids)
+        else:
+            self.peers = list(lan_peers)
+            new_status = NetworkStatus.LAN_ONLY if lan_peers else NetworkStatus.OFFLINE_SOLO
+            if new_status != self.network_status:
+                logger.info(
+                    "Network status changed: %s -> %s (%d LAN peers)",
+                    self.network_status,
+                    new_status,
+                    len(lan_peers),
+                )
+                self.network_status = new_status
 
         if self.state != NodeState.RUNNING:
             return

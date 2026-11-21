@@ -22,6 +22,7 @@ import logging
 import math
 from pathlib import Path
 import struct
+import threading
 import time
 from typing import Any
 
@@ -439,9 +440,12 @@ class ShardModelRunner:
         messages: list[dict[str, str]] | None = None,
         max_tokens: int = 256,
         temperature: float = 0.7,
+        cancel_event: threading.Event | None = None,
     ) -> Any:
         """Stream real tokens directly from native llama_cpp handle."""
         if self._native_handle is None:
+            return
+        if cancel_event is not None and cancel_event.is_set():
             return
         if messages:
             stream = self._native_handle.create_chat_completion(
@@ -451,15 +455,22 @@ class ShardModelRunner:
                 stream=True,
             )
             step = 0
-            for chunk in stream:
-                choice = chunk["choices"][0]
-                delta = choice.get("delta", {})
-                content = delta.get("content", "")
-                finish = choice.get("finish_reason")
-                is_eos = finish is not None and finish != ""
-                if content or is_eos:
-                    yield step, content, bool(is_eos)
-                    step += 1
+            try:
+                for chunk in stream:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    choice = chunk["choices"][0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    finish = choice.get("finish_reason")
+                    is_eos = finish is not None and finish != ""
+                    if content or is_eos:
+                        yield step, content, bool(is_eos)
+                        step += 1
+            finally:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    close_fn()
         else:
             stream = self._native_handle.create_completion(
                 prompt=prompt,
@@ -468,14 +479,21 @@ class ShardModelRunner:
                 stream=True,
             )
             step = 0
-            for chunk in stream:
-                choice = chunk["choices"][0]
-                text = choice.get("text", "")
-                finish = choice.get("finish_reason")
-                is_eos = finish is not None and finish != ""
-                if text or is_eos:
-                    yield step, text, bool(is_eos)
-                    step += 1
+            try:
+                for chunk in stream:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    choice = chunk["choices"][0]
+                    text = choice.get("text", "")
+                    finish = choice.get("finish_reason")
+                    is_eos = finish is not None and finish != ""
+                    if text or is_eos:
+                        yield step, text, bool(is_eos)
+                        step += 1
+            finally:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    close_fn()
 
     def _evict_expired_sessions(self) -> None:
         """Enforce TTL and LRU capacity bounds on cached per-request KV states."""
