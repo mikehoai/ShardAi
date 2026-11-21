@@ -2470,4 +2470,367 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       expect(input.style.opacity).toBe("1");
     });
   });
+
+  it("supports Escape close, aria-modal, focus trap on modals, and Enter submission on paste-invite-input", async () => {
+    const mockRooms: RoomLobbyItem[] = [
+      {
+        room_id: "locked-room",
+        model: "Qwen/Qwen2.5-7B-Instruct",
+        nodes_online: 1,
+        total_shared_ram_gb: 8,
+        is_private: true,
+        network_scope: "internet",
+      },
+    ];
+    const startPayloads: StartNodeRequest[] = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify(mockRooms), { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "qwen7b",
+                name: "Qwen 2.5 7B",
+                repo_id: "Qwen/Qwen2.5-7B-Instruct",
+                filename: "qwen2.5-7b.gguf",
+                estimated_ram_gb: 5,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "invite-enter-room", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        const doneStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(doneStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        return new Response(
+          JSON.stringify({
+            state: "RUNNING",
+            node_id: parsed.node_id,
+            model_id: parsed.model_id,
+            room_id: parsed.room_id,
+            is_private: true,
+            is_unlisted: true,
+            backend: parsed.backend,
+            n_layers: 32,
+            total_layers: 32,
+            allocated_ram_mb: parsed.max_ram_mb,
+            allocated_vram_mb: parsed.max_vram_mb,
+            p2p_listen_port: parsed.p2p_listen_port,
+            connected_peers_count: 1,
+            peers: [],
+            session_token: "sk-enter-invite",
+            api_base_url: "http://127.0.0.1:8000/v1",
+            coverage_percent: 100,
+            is_swarm_ready: true,
+            network_status: "online",
+            message: "Active",
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("join-room-locked-room")).toBeTruthy();
+    });
+
+    // 1. Private Room Key modal: aria-modal, Tab trap, and Escape dismissal
+    fireEvent.click(screen.getByTestId("join-room-locked-room"));
+    const privateModal = screen.getByTestId("private-room-key-modal");
+    expect(privateModal.getAttribute("aria-modal")).toBe("true");
+
+    const privateButtons = privateModal.querySelectorAll("button");
+    const lastPrivateBtn = privateButtons[privateButtons.length - 1] as HTMLButtonElement;
+    const keyInput = screen.getByTestId("private-room-key-input") as HTMLInputElement;
+    lastPrivateBtn.focus();
+    expect(document.activeElement).toBe(lastPrivateBtn);
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(keyInput);
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(lastPrivateBtn);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("private-room-key-modal")).toBeNull();
+
+    // 2. Create Room modal: aria-modal, Escape dismissal, and Enter on paste-invite-input
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    const createModal = screen.getByTestId("create-room-modal");
+    expect(createModal.getAttribute("aria-modal")).toBe("true");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("create-room-modal")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    const inviteInput = screen.getByTestId("paste-invite-input");
+    fireEvent.change(inviteInput, {
+      target: { value: "invite-enter-room | key-via-enter" },
+    });
+    fireEvent.keyDown(inviteInput, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+    expect(startPayloads[0]).toMatchObject({
+      room_id: "invite-enter-room",
+      room_key: "key-via-enter",
+      is_unlisted: true,
+    });
+    expect(screen.queryByTestId("create-room-modal")).toBeNull();
+  });
+
+  it("resets ChatWindow history on model switch and purges empty assistant placeholder on early Stop", async () => {
+    const sentPayloads: Array<{ model: string; messages: Array<{ role: string; content: string }> }> = [];
+    let holdOpenStream = false;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/chat/completions")) {
+        const parsed = JSON.parse(String(init?.body ?? "{}")) as {
+          model: string;
+          messages: Array<{ role: string; content: string }>;
+        };
+        sentPayloads.push(parsed);
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (holdOpenStream) {
+              return;
+            }
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  choices: [{ delta: { content: `Reply from ${parsed.model}` } }],
+                })}\n\n`
+              )
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    const { rerender } = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-session-a"
+        modelId="model-a"
+        onClose={vi.fn()}
+      />
+    );
+
+    // Send turn to Model A
+    fireEvent.change(screen.getByTestId("chat-input"), { target: { value: "Hello Model A" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain("Reply from model-a");
+    });
+
+    // Switch to Model B -> stale Model A history must be cleared and never sent to Model B
+    rerender(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-session-b"
+        modelId="model-b"
+        onClose={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId("chat-empty-state")).toBeTruthy();
+    expect(screen.queryByText("Hello Model A")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("chat-input"), { target: { value: "Hello Model B" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain("Reply from model-b");
+    });
+    expect(sentPayloads[1]).toEqual({
+      model: "model-b",
+      messages: [{ role: "user", content: "Hello Model B" }],
+      stream: true,
+    });
+
+    // Abort before any token arrives -> empty assistant placeholder bubble is purged
+    holdOpenStream = true;
+    fireEvent.change(screen.getByTestId("chat-input"), { target: { value: "Aborted early" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-stop-btn")).toBeTruthy();
+      expect(screen.getByTestId("chat-thinking-indicator")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("chat-stop-btn"));
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-stop-btn")).toBeNull();
+      expect(screen.queryByTestId("chat-thinking-indicator")).toBeNull();
+    });
+    const assistantBubbles = screen.getAllByTestId("chat-message-assistant");
+    expect(assistantBubbles).toHaveLength(1);
+    expect(assistantBubbles[0].textContent).toContain("Reply from model-b");
+  });
+
+  it("releases ReadableStream reader lock on SSE download error and sets progressbar ARIA attributes", async () => {
+    const encoder = new TextEncoder();
+    const releaseLockSpy = vi.fn();
+    const cancelSpy = vi.fn(async () => undefined);
+    let readCallCount = 0;
+    let resolveSecondRead!: () => void;
+    const secondReadGate = new Promise<void>((resolve) => {
+      resolveSecondRead = resolve;
+    });
+
+    const customReader = {
+      read: vi.fn(async () => {
+        readCallCount += 1;
+        if (readCallCount === 1) {
+          return {
+            done: false,
+            value: encoder.encode(
+              `data: ${JSON.stringify({
+                model_id: "meta-llama/Llama-3.1-8B-Instruct",
+                status: "downloading",
+                progress: 65,
+                downloaded_bytes: 65,
+                total_bytes: 100,
+                local_path: null,
+                message: "Downloading 65%",
+              })}\n\n`
+            ),
+          };
+        }
+        await secondReadGate;
+        return {
+          done: false,
+          value: encoder.encode(
+            `data: ${JSON.stringify({
+              model_id: "meta-llama/Llama-3.1-8B-Instruct",
+              status: "error",
+              progress: 65,
+              downloaded_bytes: 65,
+              total_bytes: 100,
+              local_path: null,
+              message: "Simulated SSE stream failure",
+            })}\n\n`
+          ),
+        };
+      }),
+      cancel: cancelSpy,
+      releaseLock: releaseLockSpy,
+      closed: Promise.resolve(undefined),
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "llama3",
+                name: "Llama 3.1 8B",
+                repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+                filename: "llama.gguf",
+                estimated_ram_gb: 6,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(JSON.stringify({ allowed: true, room_id: "public", message: "OK" }), {
+          status: 200,
+        });
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "Content-Type": "text/event-stream" }),
+          body: {
+            getReader: () => customReader,
+          },
+        } as unknown as Response;
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      const progressEl = screen.getByRole("progressbar");
+      expect(progressEl.getAttribute("aria-valuenow")).toBe("65");
+      expect(progressEl.getAttribute("aria-valuemin")).toBe("0");
+      expect(progressEl.getAttribute("aria-valuemax")).toBe("100");
+    });
+
+    resolveSecondRead();
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain("Simulated SSE stream failure");
+    });
+
+    expect(releaseLockSpy).toHaveBeenCalledTimes(1);
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
 });
