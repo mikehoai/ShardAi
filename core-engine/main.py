@@ -1067,23 +1067,25 @@ class LocalNodeRuntime:
             total_layers=self.total_layers,
         )
 
-    async def maybe_send_tracker_heartbeat(self, force: bool = False) -> bool:
-        """Periodically re-announce this node via `POST /announce` before the 60s TTL expires."""
+    async def _send_tracker_heartbeat(
+        self, force: bool = False
+    ) -> tuple[bool, list[PeerNodeInfo] | None]:
+        """Execute heartbeat re-announce and return `(sent, authoritative_peers)`."""
         if (
             self.state != NodeState.RUNNING
             or self.network_status != NetworkStatus.ONLINE
             or not _is_tracker_enabled()
             or self.room_id is None
         ):
-            return False
+            return False, None
 
         now = time.monotonic()
         if not force and (now - self._last_heartbeat_at) < _heartbeat_interval_seconds():
-            return False
+            return False, None
 
         heartbeat_req = self._build_heartbeat_request()
         if heartbeat_req is None:
-            return False
+            return False, None
 
         max_layers = self._active_max_layers_can_hold or max(1, self.n_layers)
         try:
@@ -1095,18 +1097,27 @@ class LocalNodeRuntime:
                 room_key_hash=self.room_key_hash,
             )
             if self.state != NodeState.RUNNING:
-                return False
+                return False, None
             self._last_heartbeat_at = time.monotonic()
             self.last_tracker_reachable = True
-            if assignment.peers:
-                self.peers = [
-                    p for p in assignment.peers if p.peer_id != self.node_id
-                ]
-            return True
+            hb_peers: list[PeerNodeInfo] | None = (
+                [p for p in assignment.peers if p.peer_id != self.node_id]
+                if assignment.peers is not None and assignment.peers_authoritative
+                else None
+            )
+            return True, hb_peers
         except Exception as exc:
             self.last_tracker_reachable = False
             logger.warning("Background tracker heartbeat re-announce failed: %s", exc)
-            return False
+            return False, None
+
+    async def maybe_send_tracker_heartbeat(self, force: bool = False) -> bool:
+        """Periodically re-announce this node via `POST /announce` before the 60s TTL expires."""
+        sent, hb_peers = await self._send_tracker_heartbeat(force=force)
+        if sent and hb_peers is not None and self.state == NodeState.RUNNING:
+            self.peers = hb_peers
+            self.recompute_local_coverage()
+        return sent
 
     async def refresh_room_coverage(self) -> None:
         """Refresh heartbeat registration, `coverage_percent`, and `is_swarm_ready`."""
@@ -1126,11 +1137,16 @@ class LocalNodeRuntime:
         )
         is_online_effective: bool = False
         cloud_coverage: float | None = None
+        cloud_peers: list[PeerNodeInfo] | None = None
         if wants_cloud_tracker:
             if self.network_status == NetworkStatus.ONLINE:
-                await self.maybe_send_tracker_heartbeat()
+                sent, hb_peers = await self._send_tracker_heartbeat()
                 if self.state != NodeState.RUNNING:
                     return
+                if sent and hb_peers is not None:
+                    cloud_peers = hb_peers
+                    self.peers = list(hb_peers)
+                    self.recompute_local_coverage()
             try:
                 rooms = await self.tracker_client.fetch_available_rooms()
                 if self.state != NodeState.RUNNING:
@@ -1160,8 +1176,8 @@ class LocalNodeRuntime:
                     )
                     if self.state != NodeState.RUNNING:
                         return
-                    if refreshed_peers:
-                        self.peers = [
+                    if refreshed_peers is not None:
+                        cloud_peers = [
                             p for p in refreshed_peers if p.peer_id != self.node_id
                         ]
                 self.last_tracker_reachable = True
@@ -1181,7 +1197,7 @@ class LocalNodeRuntime:
 
         # LAN peers (UDP beacon + zeroconf). Offline/degraded nodes rebuild the routing table from
         # the LAN on every tick so stale remote peers and departed Wi-Fi peers are dropped cleanly.
-        lan_peers: list[PeerNodeInfo] = []
+        lan_peers: list[PeerNodeInfo] | None = None
         try:
             lan_beacons = await _scan_all_lan_beacons(udp_timeout_seconds=0.15)
             if self.state != NodeState.RUNNING:
@@ -1199,23 +1215,36 @@ class LocalNodeRuntime:
             return
 
         if is_online_effective:
-            known_ids = {p.peer_id for p in self.peers}
-            self.peers.extend(p for p in lan_peers if p.peer_id not in known_ids)
+            if cloud_peers is not None:
+                merged_peers: list[PeerNodeInfo] = list(cloud_peers)
+                if lan_peers:
+                    known_ids = {p.peer_id for p in merged_peers}
+                    merged_peers.extend(
+                        p for p in lan_peers if p.peer_id not in known_ids
+                    )
+                self.peers = merged_peers
+            elif lan_peers:
+                known_ids = {p.peer_id for p in self.peers}
+                self.peers.extend(p for p in lan_peers if p.peer_id not in known_ids)
         else:
-            self.peers = list(lan_peers)
-            new_status = NetworkStatus.LAN_ONLY if lan_peers else NetworkStatus.OFFLINE_SOLO
+            effective_lan_peers = lan_peers if lan_peers is not None else []
+            self.peers = list(effective_lan_peers)
+            new_status = (
+                NetworkStatus.LAN_ONLY
+                if effective_lan_peers
+                else NetworkStatus.OFFLINE_SOLO
+            )
             if new_status != self.network_status:
                 logger.info(
                     "Network status changed: %s -> %s (%d LAN peers)",
                     self.network_status,
                     new_status,
-                    len(lan_peers),
+                    len(effective_lan_peers),
                 )
                 self.network_status = new_status
 
         if self.state != NodeState.RUNNING:
             return
-
         local_pct = self.recompute_local_coverage()
         if cloud_coverage is not None:
             self.coverage_percent = round(min(100.0, max(0.0, cloud_coverage)), 1)

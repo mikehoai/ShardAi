@@ -36,6 +36,7 @@ class AnnounceAssignment:
     assigned_end_layer: int
     role: PeerRole
     peers: list[PeerNodeInfo]
+    peers_authoritative: bool = True
 
 
 def _normalize_peer(
@@ -373,6 +374,9 @@ class SignalingTrackerClient:
             assigned_start, min(int(raw_end), resolved_total_layers - 1)
         )
 
+        has_peers_field: bool = (
+            "peers" in inner_data or "peers" in response_data
+        )
         raw_peers_obj: Any = inner_data.get("peers", response_data.get("peers", []))
         raw_peers: list[dict[str, Any]] = (
             [item for item in raw_peers_obj if isinstance(item, dict)]
@@ -385,9 +389,10 @@ class SignalingTrackerClient:
             if (peer := _normalize_peer(raw, config.room_id, resolved_total_layers - 1)).peer_id
             != config.node_id
         ]
+        peers_authoritative: bool = has_peers_field and isinstance(raw_peers_obj, list)
 
         # If /announce didn't embed peers, query GET /peers/:room_id/:model
-        if not normalized and "peers" not in inner_data and "peers" not in response_data:
+        if not normalized and not has_peers_field:
             try:
                 normalized = await self.fetch_peers(
                     model_id=config.model_id,
@@ -396,6 +401,7 @@ class SignalingTrackerClient:
                     room_key_hash=effective_room_key_hash,
                     node_id=config.node_id,
                 )
+                peers_authoritative = True
             except Exception as exc:
                 logger.debug("Optional follow-up fetch_peers skipped: %s", exc)
 
@@ -404,6 +410,7 @@ class SignalingTrackerClient:
             assigned_end_layer=assigned_end,
             role=assigned_role,
             peers=normalized,
+            peers_authoritative=peers_authoritative,
         )
 
     async def register_node_and_fetch_peers(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 import json
 from pathlib import Path
+import time
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -12,8 +13,16 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
+import main as main_module
 from main import app, runtime
-from shard_engine.schemas import NetworkMode, NetworkStatus, NodeState, StartNodeRequest
+from shard_engine.schemas import (
+    NetworkMode,
+    NetworkStatus,
+    NodeState,
+    PeerNodeInfo,
+    PeerRole,
+    StartNodeRequest,
+)
 from shard_engine.tracker_client import (
     SignalingTrackerClient,
     TrackerUnreachableError,
@@ -23,10 +32,7 @@ from shard_engine.tracker_client import (
 client = TestClient(app)
 
 
-@pytest.fixture(autouse=True)
-def reset_runtime_state() -> Iterator[None]:
-    """Reset runtime state and restore the original tracker client around each test."""
-    original_tracker = runtime.tracker_client
+def _reset_runtime_fields() -> None:
     runtime.session_token = None
     runtime.memory_manager.release_all()
     runtime.state = NodeState.STOPPED
@@ -37,17 +43,26 @@ def reset_runtime_state() -> Iterator[None]:
     runtime.peers = []
     runtime.network_status = None
     runtime.last_tracker_reachable = None
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.coverage_percent = 0.0
+    runtime.is_swarm_ready = False
+    runtime._last_heartbeat_at = 0.0
+    runtime._active_start_request = None
+    runtime._active_max_layers_can_hold = 0
+    runtime.p2p_listen_port = None
+    runtime.n_layers = 0
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_state() -> Iterator[None]:
+    """Reset runtime state and restore the original tracker client around each test."""
+    original_tracker = runtime.tracker_client
+    _reset_runtime_fields()
     yield
     runtime.tracker_client = original_tracker
-    runtime.session_token = None
-    runtime.memory_manager.release_all()
-    runtime.state = NodeState.STOPPED
-    runtime.node_id = None
-    runtime.model_id = None
-    runtime.room_id = None
-    runtime.room_key_hash = None
-    runtime.peers = []
-    runtime.network_status = None
+    _reset_runtime_fields()
 
 
 def _make_mock_tracker(
@@ -728,3 +743,385 @@ async def test_fetch_peers_retries_transient_503_and_raises_unreachable_on_timeo
     timeout_tracker = _make_mock_tracker(_timeout_handler, max_retries=2)
     with pytest.raises(TrackerUnreachableError):
         await timeout_tracker.fetch_peers(model_id="Qwen/Qwen2.5-7B-Instruct")
+
+
+@pytest.mark.asyncio
+async def test_refresh_room_coverage_clears_stale_peers_when_room_becomes_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #29: Empty `fetch_peers()` (or self-only response) clears stale peers and updates `/status` and `/peers`."""
+    _enable_tracker(monkeypatch)
+    monkeypatch.setattr(
+        main_module,
+        "_scan_all_lan_beacons",
+        AsyncMock(return_value=[]),
+    )
+
+    peer_response_payload: list[dict[str, Any]] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rooms":
+            return httpx.Response(status_code=200, json={"rooms": []})
+        if request.url.path.startswith("/peers"):
+            return httpx.Response(status_code=200, json={"peers": peer_response_payload})
+        return httpx.Response(status_code=404, json={"error": "Unhandled route"})
+
+    stale_peer = PeerNodeInfo(
+        peer_id="node-b",
+        ip_address="203.0.113.20",
+        port=49153,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="empty-room",
+    )
+
+    runtime.tracker_client = _make_mock_tracker(_handler)
+    runtime.state = NodeState.RUNNING
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.node_id = "node-a"
+    runtime.model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    runtime.room_id = "empty-room"
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.peers = [stale_peer]
+    runtime.coverage_percent = 100.0
+    runtime.is_swarm_ready = True
+    runtime._last_heartbeat_at = time.monotonic()
+
+    await runtime.refresh_room_coverage()
+
+    assert runtime.peers == []
+    assert runtime.coverage_percent == 50.0
+    assert runtime.is_swarm_ready is False
+
+    status_res = client.get("/status")
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["connected_peers_count"] == 0
+    assert status_data["peers"] == []
+    assert status_data["coverage_percent"] == 50.0
+    assert status_data["is_swarm_ready"] is False
+
+    peers_res = client.get("/peers")
+    assert peers_res.status_code == 200
+    assert peers_res.json() == []
+
+    # Self-only peer payload returned by tracker also filters out self and yields []
+    runtime.peers = [stale_peer]
+    runtime.coverage_percent = 100.0
+    runtime.is_swarm_ready = True
+    peer_response_payload = [
+        {
+            "node_id": "node-a",
+            "ip": "203.0.113.10",
+            "port": 49152,
+            "assigned_start_layer": 0,
+            "assigned_end_layer": 15,
+            "role": "primary",
+        }
+    ]
+    await runtime.refresh_room_coverage()
+
+    assert runtime.peers == []
+    assert runtime.coverage_percent == 50.0
+    assert runtime.is_swarm_ready is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_room_coverage_preserves_active_lan_peers_atomically_when_cloud_room_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active LAN peers stay intact without flicker when cloud peers empty, and clear when LAN departs."""
+    _enable_tracker(monkeypatch)
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rooms":
+            return httpx.Response(status_code=200, json={"rooms": []})
+        if request.url.path.startswith("/peers"):
+            return httpx.Response(status_code=200, json={"peers": []})
+        return httpx.Response(status_code=404)
+
+    cloud_peer_b = PeerNodeInfo(
+        peer_id="cloud-peer-b",
+        ip_address="203.0.113.30",
+        port=49154,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="hybrid-room",
+    )
+    lan_peer_c = PeerNodeInfo(
+        peer_id="lan-peer-c",
+        ip_address="192.168.1.42",
+        port=49155,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="hybrid-room",
+    )
+
+    observed_mid_scan_peer_ids: list[list[str]] = []
+    lan_beacons_active = True
+
+    async def _fake_scan_lan_beacons(
+        udp_timeout_seconds: float = 0.2,
+        zeroconf_wait_seconds: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        _ = (udp_timeout_seconds, zeroconf_wait_seconds)
+        observed_mid_scan_peer_ids.append([p.peer_id for p in runtime.peers])
+        if not lan_beacons_active:
+            return []
+        return [
+            {
+                "node_id": "lan-peer-c",
+                "room_id": "hybrid-room",
+                "ip_address": "192.168.1.42",
+                "p2p_port": 49155,
+                "shard_layer_start": 16,
+                "shard_layer_end": 31,
+                "role": "primary",
+            }
+        ]
+
+    monkeypatch.setattr(main_module, "_scan_all_lan_beacons", _fake_scan_lan_beacons)
+
+    runtime.tracker_client = _make_mock_tracker(_handler)
+    runtime.state = NodeState.RUNNING
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.node_id = "node-a"
+    runtime.model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    runtime.room_id = "hybrid-room"
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.peers = [cloud_peer_b, lan_peer_c]
+    runtime.coverage_percent = 100.0
+    runtime.is_swarm_ready = True
+    runtime._last_heartbeat_at = time.monotonic()
+
+    await runtime.refresh_room_coverage()
+
+    assert len(observed_mid_scan_peer_ids) == 1
+    assert "lan-peer-c" in observed_mid_scan_peer_ids[0]
+    assert [p.peer_id for p in runtime.peers] == ["lan-peer-c"]
+    assert runtime.coverage_percent == 100.0
+    assert runtime.is_swarm_ready is True
+
+    # Once the LAN peer departs too, the routing table clears completely
+    lan_beacons_active = False
+    await runtime.refresh_room_coverage()
+
+    assert runtime.peers == []
+    assert runtime.coverage_percent == 50.0
+    assert runtime.is_swarm_ready is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_room_coverage_preserves_peers_on_transient_tracker_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient network/tracker errors during `fetch_peers()` must not wipe existing `self.peers`."""
+    _enable_tracker(monkeypatch)
+    monkeypatch.setattr(
+        main_module,
+        "_scan_all_lan_beacons",
+        AsyncMock(return_value=[]),
+    )
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rooms":
+            return httpx.Response(status_code=200, json={"rooms": []})
+        if request.url.path.startswith("/peers"):
+            raise httpx.ConnectTimeout("tracker unreachable")
+        return httpx.Response(status_code=404)
+
+    existing_peer = PeerNodeInfo(
+        peer_id="peer-b",
+        ip_address="203.0.113.40",
+        port=49156,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="outage-room",
+    )
+
+    runtime.tracker_client = _make_mock_tracker(_handler, max_retries=1)
+    runtime.state = NodeState.RUNNING
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.node_id = "node-a"
+    runtime.model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    runtime.room_id = "outage-room"
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.peers = [existing_peer]
+    runtime.coverage_percent = 100.0
+    runtime.is_swarm_ready = True
+    runtime._last_heartbeat_at = time.monotonic()
+
+    await runtime.refresh_room_coverage()
+
+    assert [p.peer_id for p in runtime.peers] == ["peer-b"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_send_tracker_heartbeat_clears_peers_on_authoritative_empty_and_guards_failed_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heartbeat clears stale peers on authoritative `[]`, but preserves peers if omitted follow-up fails."""
+    _enable_tracker(monkeypatch)
+
+    mode: str = "authoritative_empty"
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/announce":
+            if mode == "authoritative_empty":
+                return httpx.Response(
+                    status_code=200,
+                    json={
+                        "assigned_start_layer": 0,
+                        "assigned_end_layer": 15,
+                        "role": "primary",
+                        "peers": [],
+                    },
+                )
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "assigned_start_layer": 0,
+                    "assigned_end_layer": 15,
+                    "role": "primary",
+                },
+            )
+        if request.method == "GET" and request.url.path.startswith("/peers"):
+            if mode == "omitted_followup_503":
+                return httpx.Response(status_code=503, json={"error": "Service unavailable"})
+            return httpx.Response(status_code=200, json={"peers": []})
+        return httpx.Response(status_code=404)
+
+    peer_b = PeerNodeInfo(
+        peer_id="peer-b",
+        ip_address="203.0.113.50",
+        port=49157,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="hb-room",
+    )
+
+    runtime.tracker_client = _make_mock_tracker(_handler, max_retries=1)
+    runtime.state = NodeState.RUNNING
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.node_id = "node-a"
+    runtime.model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    runtime.room_id = "hb-room"
+    runtime.p2p_listen_port = 49510
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.n_layers = 16
+    runtime._active_start_request = StartNodeRequest(
+        node_id="node-a",
+        model_id="meta-llama/Llama-3.1-8B-Instruct",
+        network_mode=NetworkMode.INTERNET,
+        room_id="hb-room",
+        ram_gb=4,
+        shared_ram_gb=4,
+        max_ram_mb=4096,
+        p2p_listen_port=49510,
+        shard_layer_start=0,
+        shard_layer_end=15,
+        total_layers=32,
+    )
+
+    # Subcase A: Explicit empty "peers": [] clears stale peers and recomputes local coverage
+    runtime.peers = [peer_b]
+    runtime.coverage_percent = 100.0
+    runtime.is_swarm_ready = True
+    assert await runtime.maybe_send_tracker_heartbeat(force=True) is True
+    assert runtime.peers == []
+    assert runtime.coverage_percent == 50.0
+    assert runtime.is_swarm_ready is False
+
+    # Subcase B: Omitted "peers" + transient 503 on follow-up fetch_peers preserves existing peers
+    mode = "omitted_followup_503"
+    runtime.peers = [peer_b]
+    runtime.coverage_percent = 100.0
+    runtime.is_swarm_ready = True
+    assert await runtime.maybe_send_tracker_heartbeat(force=True) is True
+    assert [p.peer_id for p in runtime.peers] == ["peer-b"]
+
+    # Subcase C: Omitted "peers" + successful 200 [] on follow-up fetch_peers clears stale peers
+    mode = "omitted_followup_empty"
+    assert await runtime.maybe_send_tracker_heartbeat(force=True) is True
+    assert runtime.peers == []
+    assert runtime.coverage_percent == 50.0
+    assert runtime.is_swarm_ready is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_room_coverage_does_not_mutate_when_stopped_mid_fetch_peers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stopping the runtime during `fetch_peers()` must prevent stale refresh from mutating `self.peers`."""
+    _enable_tracker(monkeypatch)
+    monkeypatch.setattr(
+        main_module,
+        "_scan_all_lan_beacons",
+        AsyncMock(return_value=[]),
+    )
+
+    peer_b = PeerNodeInfo(
+        peer_id="peer-b",
+        ip_address="203.0.113.60",
+        port=49158,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="stop-room",
+    )
+    peer_c = PeerNodeInfo(
+        peer_id="peer-c",
+        ip_address="203.0.113.61",
+        port=49159,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+        room_id="stop-room",
+    )
+
+    async def _stopping_fetch_peers(
+        *_args: Any, **_kwargs: Any
+    ) -> list[PeerNodeInfo]:
+        runtime.state = NodeState.STOPPED
+        runtime.peers = []
+        return [peer_c]
+
+    monkeypatch.setattr(
+        runtime.tracker_client,
+        "fetch_available_rooms",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        runtime.tracker_client,
+        "fetch_peers",
+        _stopping_fetch_peers,
+    )
+
+    runtime.state = NodeState.RUNNING
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.node_id = "node-a"
+    runtime.model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    runtime.room_id = "stop-room"
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.peers = [peer_b]
+    runtime._last_heartbeat_at = time.monotonic()
+
+    await runtime.refresh_room_coverage()
+
+    assert runtime.state == NodeState.STOPPED
+    assert runtime.peers == []
