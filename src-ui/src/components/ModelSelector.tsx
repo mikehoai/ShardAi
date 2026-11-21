@@ -86,6 +86,7 @@ export interface ModelSelectorProps {
   customFilename: string;
   localFilePath: string;
   disabled: boolean;
+  isDesktopShell?: boolean;
   marginBottom?: string;
   onTabChange: (tab: ModelTab) => void;
   onSelectCatalogModel: (catalogId: string, item: CatalogModelItem | undefined) => void;
@@ -108,6 +109,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   customFilename,
   localFilePath,
   disabled,
+  isDesktopShell,
   marginBottom = "16px",
   onTabChange,
   onSelectCatalogModel,
@@ -119,6 +121,10 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
 }) => {
   const localFileInputRef = useRef<HTMLInputElement | null>(null);
   const tid = (name: string): string => `${testIdPrefix}${name}`;
+  const resolvedIsDesktopShell =
+    isDesktopShell ??
+    (typeof window !== "undefined" &&
+      ("__TAURI_INTERNALS__" in window || "__TAURI__" in window));
 
   return (
     <div style={{ marginBottom }}>
@@ -283,42 +289,63 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       {modelTab === "local" && (
         <div
           data-testid={tid("panel-local")}
-          style={{ display: "flex", gap: "6px", alignItems: "center" }}
+          style={{ display: "flex", flexDirection: "column", gap: "6px" }}
         >
-          <input
-            type="text"
-            data-testid={tid("local-file-input")}
-            className="native-input"
-            value={localFilePath}
-            disabled={disabled}
-            onChange={(e) => onLocalFilePathChange(e.target.value)}
-            placeholder="Select or paste absolute path to local .gguf file..."
-            style={{ flex: 1 }}
-          />
-          <input
-            ref={localFileInputRef}
-            type="file"
-            accept=".gguf"
-            aria-hidden="true"
-            tabIndex={-1}
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) {
-                const fileWithPath = file as File & { path?: string };
-                onLocalFilePathChange(fileWithPath.path ?? file.name);
-              }
-            }}
-          />
-          <button
-            type="button"
-            data-testid={tid("browse-gguf-btn")}
-            className="native-btn"
-            disabled={disabled}
-            onClick={() => onBrowseLocalFile(() => localFileInputRef.current?.click())}
-          >
-            Browse (.gguf)
-          </button>
+          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <input
+              type="text"
+              data-testid={tid("local-file-input")}
+              className="native-input"
+              value={localFilePath}
+              disabled={disabled}
+              onChange={(e) => onLocalFilePathChange(e.target.value)}
+              placeholder="Select or paste absolute path to local .gguf file..."
+              style={{ flex: 1 }}
+            />
+            <input
+              ref={localFileInputRef}
+              type="file"
+              accept=".gguf"
+              aria-hidden="true"
+              tabIndex={-1}
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  const fileWithPath = file as File & { path?: string };
+                  onLocalFilePathChange(fileWithPath.path ?? file.name);
+                }
+              }}
+            />
+            <button
+              type="button"
+              data-testid={tid("browse-gguf-btn")}
+              className="native-btn"
+              disabled={disabled}
+              onClick={() => onBrowseLocalFile(() => localFileInputRef.current?.click())}
+            >
+              Browse (.gguf)
+            </button>
+          </div>
+          {!resolvedIsDesktopShell && (
+            <div
+              role="note"
+              data-testid={tid("browser-preview-local-path-notice")}
+              style={{
+                padding: "7px 10px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-surface-subtle)",
+                border: "1px solid var(--border-hairline)",
+                fontSize: "11.5px",
+                color: "var(--text-secondary)",
+                lineHeight: 1.4,
+              }}
+            >
+              Browser preview cannot access full local filesystem paths. Paste
+              the absolute path to your <code>.gguf</code> file above, or use
+              the native desktop app to browse files.
+            </div>
+          )}
         </div>
       )}
     </div>

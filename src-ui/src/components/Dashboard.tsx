@@ -796,15 +796,29 @@ export const Dashboard: React.FC = () => {
           directory: false,
           filters: [{ name: "GGUF Model", extensions: ["gguf"] }],
         });
-        if (typeof picked === "string" && picked.trim()) {
-          onPicked(picked.trim());
-          return;
-        }
         if (picked === null) {
           return;
         }
-      } catch {
-        // Fallback to native HTML file picker if dialog plugin is unavailable
+        const resolvedPath =
+          typeof picked === "string"
+            ? picked.trim()
+            : Array.isArray(picked)
+              ? String(picked[0] ?? "").trim()
+              : "";
+        if (resolvedPath) {
+          onPicked(resolvedPath);
+          return;
+        }
+        setErrorMessage(
+          "Native file picker did not return a valid .gguf file path. Please paste the full path manually."
+        );
+        return;
+      } catch (err: unknown) {
+        const detail = err instanceof Error ? err.message : String(err);
+        setErrorMessage(
+          `Unable to open native .gguf file picker (${detail}). Please paste the absolute file path manually.`
+        );
+        return;
       }
     }
     triggerFallbackInput();
@@ -1669,6 +1683,7 @@ export const Dashboard: React.FC = () => {
                   customFilename={customFilename}
                   localFilePath={localFilePath}
                   disabled={isSharing || isBusy}
+                  isDesktopShell={inTauri}
                   onTabChange={(tab) => {
                     setModelTab(tab);
                     setDownloadProgress(null);
@@ -2271,6 +2286,7 @@ export const Dashboard: React.FC = () => {
                         customFilename={modalCustomFilename}
                         localFilePath={modalLocalFilePath}
                         disabled={isSharing || isBusy}
+                        isDesktopShell={inTauri}
                         onTabChange={(tab) => {
                           setModalModelTab(tab);
                           setErrorMessage(null);

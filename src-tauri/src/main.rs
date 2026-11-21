@@ -500,6 +500,7 @@ fn window_start_drag(window: tauri::Window) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(PythonCoreState::default())
         .setup(|app| {
             // 1. Auto-boot core-engine sidecar in the background as soon as the desktop app opens
@@ -597,6 +598,20 @@ mod tests {
     }
 
     #[test]
+    fn default_capabilities_include_dialog_permission() {
+        let caps_json = include_str!("../capabilities/default.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(caps_json).expect("capabilities/default.json must be valid JSON");
+        let perms = parsed["permissions"]
+            .as_array()
+            .expect("permissions must be a JSON array");
+        assert!(
+            perms.iter().any(|item| item.as_str() == Some("dialog:default")),
+            "capabilities/default.json must include dialog:default"
+        );
+    }
+
+    #[test]
     fn test_release_prioritizes_sidecar_over_python() {
         assert!(!should_prefer_python(false, None, None));
         assert!(!should_prefer_python(false, Some("   "), Some("0")));
@@ -684,5 +699,10 @@ mod tests {
     fn test_select_core_launch_target_returns_error_when_both_missing() {
         let res = select_core_launch_target(false, None, Err("missing".to_string()));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn dialog_plugin_initializes() {
+        let _plugin: tauri::plugin::TauriPlugin<tauri::Wry> = tauri_plugin_dialog::init();
     }
 }

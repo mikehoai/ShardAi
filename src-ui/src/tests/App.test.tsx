@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   Dashboard,
@@ -21,6 +22,10 @@ import type {
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(),
 }));
 
 describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
@@ -2469,5 +2474,63 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       expect(input.disabled).toBe(false);
       expect(input.style.opacity).toBe("1");
     });
+  });
+
+  it("uses native Tauri dialog for local .gguf selection, ignores cancel, surfaces errors, and shows browser preview notice", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+
+    // 1. Browser preview mode displays guidance notice on Local File tab
+    const browserView = render(<Dashboard />);
+    fireEvent.click(screen.getByTestId("tab-local"));
+    expect(screen.getByTestId("browser-preview-local-path-notice")).toBeTruthy();
+    expect(screen.getByTestId("browser-preview-local-path-notice").textContent).toContain(
+      "Browser preview cannot access full local filesystem paths"
+    );
+    browserView.unmount();
+
+    // 2. Native Tauri shell opens OS picker, populates absolute path, handles cancel and errors
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const mockedDialogOpen = vi.mocked(openFileDialog);
+    mockedDialogOpen.mockResolvedValueOnce("C:\\Users\\alice\\models\\llama-3.1-8b.gguf");
+
+    render(<Dashboard />);
+    fireEvent.click(screen.getByTestId("tab-local"));
+    expect(screen.queryByTestId("browser-preview-local-path-notice")).toBeNull();
+
+    const fileInputSpy = vi.spyOn(HTMLInputElement.prototype, "click");
+    fireEvent.click(screen.getByTestId("browse-gguf-btn"));
+
+    await waitFor(() => {
+      expect(mockedDialogOpen).toHaveBeenCalledWith({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "GGUF Model", extensions: ["gguf"] }],
+      });
+      expect((screen.getByTestId("local-file-input") as HTMLInputElement).value).toBe(
+        "C:\\Users\\alice\\models\\llama-3.1-8b.gguf"
+      );
+    });
+    expect(fileInputSpy).not.toHaveBeenCalled();
+
+    // Cancelling (null) keeps existing path and does not open HTML file input
+    mockedDialogOpen.mockResolvedValueOnce(null);
+    fireEvent.click(screen.getByTestId("browse-gguf-btn"));
+    await waitFor(() => {
+      expect(mockedDialogOpen).toHaveBeenCalledTimes(2);
+    });
+    expect((screen.getByTestId("local-file-input") as HTMLInputElement).value).toBe(
+      "C:\\Users\\alice\\models\\llama-3.1-8b.gguf"
+    );
+    expect(fileInputSpy).not.toHaveBeenCalled();
+
+    // Dialog error displays English error banner and does NOT fall back to bare HTML file picker
+    mockedDialogOpen.mockRejectedValueOnce(new Error("dialog capability denied"));
+    fireEvent.click(screen.getByTestId("browse-gguf-btn"));
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Unable to open native .gguf file picker"
+      );
+    });
+    expect(fileInputSpy).not.toHaveBeenCalled();
   });
 });
