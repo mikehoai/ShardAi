@@ -1722,7 +1722,9 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
 
         if probe_path is not None and probe_path.exists():
             try:
-                initial_fingerprint = compute_model_fingerprint(probe_path)
+                initial_fingerprint = await asyncio.to_thread(
+                    compute_model_fingerprint, probe_path
+                )
             except Exception:
                 initial_fingerprint = None
 
@@ -1901,7 +1903,9 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             source_type=request.source_type.value,
             filename=request.filename,
         )
-        model_fingerprint: str = compute_model_fingerprint(local_model_path)
+        model_fingerprint: str = await asyncio.to_thread(
+            compute_model_fingerprint, local_model_path
+        )
         if cloud_online and model_fingerprint != initial_fingerprint:
             try:
                 await runtime.tracker_client.register_node_with_assignment(
