@@ -273,9 +273,11 @@ export const Dashboard: React.FC = () => {
   // Private Room Key Modal State (when clicking Join on a locked room)
   const [pendingPrivateRoom, setPendingPrivateRoom] = useState<RoomLobbyItem | null>(null);
   const [privateKeyInput, setPrivateKeyInput] = useState<string>("");
+  const privateRoomModalRef = useRef<HTMLDivElement | null>(null);
 
   // Create New Room / Join Unlisted Modal State
   const [showRoomModal, setShowRoomModal] = useState<boolean>(false);
+  const createRoomModalRef = useRef<HTMLDivElement | null>(null);
   const [modalRoomId, setModalRoomId] = useState<string>("studio-room-1");
   const [modalModelTab, setModalModelTab] = useState<ModelTab>("catalog");
   const [modalSelectedCatalogId, setModalSelectedCatalogId] = useState<string>("");
@@ -337,6 +339,72 @@ export const Dashboard: React.FC = () => {
       setIsChatOpen(false);
     }
   }, [isSharing, sessionToken]);
+
+  useEffect(() => {
+    if (isChatOpen) return;
+    const activeModalEl =
+      pendingPrivateRoom !== null
+        ? privateRoomModalRef.current
+        : showRoomModal
+          ? createRoomModalRef.current
+          : null;
+    if (!activeModalEl) return;
+
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    const getFocusable = (): HTMLElement[] =>
+      Array.from(
+        activeModalEl.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]):not([tabindex="-1"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => el.getAttribute("aria-hidden") !== "true");
+
+    if (!activeModalEl.contains(document.activeElement)) {
+      const focusables = getFocusable();
+      if (focusables.length > 0) {
+        focusables[0].focus();
+      }
+    }
+
+    const handleModalKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (pendingPrivateRoom !== null) {
+          setPendingPrivateRoom(null);
+        } else if (showRoomModal) {
+          setShowRoomModal(false);
+        }
+        return;
+      }
+
+      if (event.key === "Tab") {
+        const focusables = getFocusable();
+        if (focusables.length === 0) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const current = document.activeElement;
+
+        if (event.shiftKey) {
+          if (!activeModalEl.contains(current) || current === first) {
+            event.preventDefault();
+            last.focus();
+          }
+        } else if (!activeModalEl.contains(current) || current === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleModalKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleModalKeyDown);
+      if (previouslyFocused && previouslyFocused.isConnected) {
+        previouslyFocused.focus();
+      }
+    };
+  }, [pendingPrivateRoom, showRoomModal, isChatOpen]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Model Download Progress Bar State
@@ -712,34 +780,46 @@ export const Dashboard: React.FC = () => {
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() ?? "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
 
-      for (const rawEvent of events) {
-        const line = rawEvent.trim();
-        if (!line.startsWith("data:")) continue;
-        const dataStr = line.slice(5).trim();
-        if (dataStr === "[DONE]") {
-          await reader.cancel();
-          return;
+        for (const rawEvent of events) {
+          const line = rawEvent.trim();
+          if (!line.startsWith("data:")) continue;
+          const dataStr = line.slice(5).trim();
+          if (dataStr === "[DONE]") {
+            try {
+              await reader.cancel();
+            } catch {
+              // Ignore cancel errors while releasing stream lock
+            }
+            return;
+          }
+          let payload: SseDownloadEvent;
+          try {
+            payload = JSON.parse(dataStr) as SseDownloadEvent;
+          } catch {
+            continue;
+          }
+          if (payload.status === "error") {
+            try {
+              await reader.cancel();
+            } catch {
+              // Ignore cancel errors while releasing stream lock
+            }
+            throw new Error(payload.message || "Model download failed.");
+          }
+          setDownloadProgress(payload.progress);
+          setDownloadStatusMsg(payload.message || `${payload.progress.toFixed(0)}%`);
         }
-        let payload: SseDownloadEvent;
-        try {
-          payload = JSON.parse(dataStr) as SseDownloadEvent;
-        } catch {
-          continue;
-        }
-        if (payload.status === "error") {
-          await reader.cancel();
-          throw new Error(payload.message || "Model download failed.");
-        }
-        setDownloadProgress(payload.progress);
-        setDownloadStatusMsg(payload.message || `${payload.progress.toFixed(0)}%`);
       }
+    } finally {
+      reader.releaseLock();
     }
   };
 
@@ -1896,6 +1976,11 @@ export const Dashboard: React.FC = () => {
                       </span>
                     </div>
                     <div
+                      role="progressbar"
+                      aria-label={downloadStatusMsg || "Model download progress"}
+                      aria-valuenow={Math.round(downloadProgress)}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
                       style={{
                         width: "100%",
                         height: "6px",
@@ -2166,7 +2251,9 @@ export const Dashboard: React.FC = () => {
                 {/* Private Room Key Prompt Modal */}
                 {pendingPrivateRoom !== null && (
                   <div
+                    ref={privateRoomModalRef}
                     role="dialog"
+                    aria-modal="true"
                     aria-label="Enter Private Room Key"
                     data-testid="private-room-key-modal"
                     className="native-panel"
@@ -2219,7 +2306,9 @@ export const Dashboard: React.FC = () => {
                 {/* Create New Room / Join Unlisted Modal */}
                 {showRoomModal && (
                   <div
+                    ref={createRoomModalRef}
                     role="dialog"
+                    aria-modal="true"
                     aria-label="Create New Room or Join Unlisted"
                     data-testid="create-room-modal"
                     className="native-panel"
@@ -2384,6 +2473,12 @@ export const Dashboard: React.FC = () => {
                           className="native-input"
                           value={invitePasteInput}
                           onChange={(e) => setInvitePasteInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              handleJoinByInviteString();
+                            }
+                          }}
                           placeholder="e.g. studio-room-1 | secret-pass"
                           style={{ flex: 1 }}
                         />

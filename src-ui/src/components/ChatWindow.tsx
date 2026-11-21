@@ -33,6 +33,27 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const prevModelSessionRef = useRef<{ modelId: string; sessionToken: string }>({
+    modelId,
+    sessionToken,
+  });
+
+  // Reset chat history when switching active model or gateway session token
+  useEffect(() => {
+    const prev = prevModelSessionRef.current;
+    if (prev.modelId === modelId && prev.sessionToken === sessionToken) {
+      return;
+    }
+    prevModelSessionRef.current = { modelId, sessionToken };
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsStreaming(false);
+    setMessages([]);
+    setChatError(null);
+    setInputValue("");
+  }, [modelId, sessionToken]);
 
   // Abort any in-flight stream when closing or unmounting
   useEffect(() => {
@@ -83,6 +104,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       abortControllerRef.current = null;
     }
     setIsStreaming(false);
+    setMessages((prev) =>
+      prev.filter((item) => !(item.role === "assistant" && item.content.trim() === ""))
+    );
   };
 
   const handleClearChat = (): void => {
@@ -161,6 +185,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
       }
+      setMessages((prev) =>
+        prev.filter((item) => !(item.id === assistantMsgId && item.content.trim() === ""))
+      );
       setIsStreaming(false);
     }
   };
