@@ -12,6 +12,7 @@ Security & Architecture Notes:
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import ipaddress
 import json
 import logging
 import multiprocessing
@@ -389,6 +390,34 @@ class LocalNodeRuntime:
             f"All primary and backup peers failed for layer {completed_layer + 1}: {last_exc}"
         ) from last_exc
 
+    def _is_authorized_activation_origin(self, origin_ip: str, origin_port: int) -> bool:
+        """Verify `frame.origin_ip`/`origin_port` matches the head node or a verified peer."""
+        if not (1 <= origin_port <= 65535):
+            return False
+        try:
+            origin_addr = ipaddress.ip_address(origin_ip.strip().split("%", 1)[0])
+        except ValueError:
+            return False
+
+        if origin_addr.is_unspecified or origin_addr.is_multicast or origin_addr.is_link_local:
+            return False
+
+        if not self.peers:
+            return False
+
+        head_peers = [peer for peer in self.peers if peer.shard_layer_start == 0]
+        allowed_peers = head_peers if head_peers else self.peers
+        for peer in allowed_peers:
+            if peer.port != origin_port:
+                continue
+            try:
+                peer_addr = ipaddress.ip_address(peer.ip_address.strip().split("%", 1)[0])
+            except ValueError:
+                continue
+            if peer_addr == origin_addr:
+                return True
+        return False
+
     async def handle_incoming_activation(self, frame: ActivationFrame) -> None:
         """Callback triggered by `receive_activations` when an upstream peer pushes a tensor."""
         if self.model_runner is None or self.state != NodeState.RUNNING:
@@ -397,6 +426,16 @@ class LocalNodeRuntime:
             )
             raise RuntimeError(
                 "Node is not RUNNING and cannot process incoming activation frames."
+            )
+
+        if not self._is_authorized_activation_origin(frame.origin_ip, frame.origin_port):
+            logger.warning(
+                "Rejecting incoming activation frame from unauthorized origin %s:%d.",
+                frame.origin_ip,
+                frame.origin_port,
+            )
+            raise RuntimeError(
+                f"Rejected activation frame from unauthorized origin {frame.origin_ip}:{frame.origin_port}."
             )
 
         async with self._compute_lock:
@@ -1178,6 +1217,29 @@ async def verify_openai_bearer_token(
     return provided_token
 
 
+def _get_configured_local_ipc_token() -> str | None:
+    """Return the configured local IPC token from `SHARDAI_LOCAL_IPC_TOKEN`, if enabled."""
+    token = os.getenv("SHARDAI_LOCAL_IPC_TOKEN", "").strip()
+    return token or None
+
+
+async def verify_local_ipc_token(
+    x_shardai_local_token: str | None = Header(
+        default=None, alias="X-ShardAi-Local-Token"
+    ),
+) -> None:
+    """Enforce `X-ShardAi-Local-Token` on sensitive control routes when configured."""
+    expected_token = _get_configured_local_ipc_token()
+    if expected_token is None:
+        return
+    provided_token = (x_shardai_local_token or "").strip()
+    if not provided_token or not secrets.compare_digest(provided_token, expected_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Missing or invalid X-ShardAi-Local-Token header.",
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Ensure model shards, session tokens, and P2P listeners are released on shutdown."""
@@ -1535,6 +1597,7 @@ async def stream_model_download(
     room_id: str | None = None,
     room_key: str | None = None,
     network_mode: NetworkMode = NetworkMode.INTERNET,
+    _ipc_auth: None = Depends(verify_local_ipc_token),
 ) -> StreamingResponse:
     """Ensure any requested catalog, HF repo, direct URL, or local `.gguf` model is ready."""
     cleaned_room_id = room_id.strip() if room_id is not None else ""
@@ -1557,13 +1620,16 @@ async def stream_model_download(
         ):
             runtime.model_downloader.resolve_direct_url_path(cleaned_id, filename=filename)
         elif source_type == ModelSourceType.LOCAL_FILE:
-            local_path = Path(cleaned_id).expanduser().resolve()
-            if not local_path.is_file() and not (local_path.is_dir() and (local_path / "config.json").is_file()):
-                raise FileNotFoundError(f"Local .gguf model file not found: {local_path}")
+            runtime.model_downloader.resolve_safe_local_model_path(cleaned_id)
         elif not is_offline_mode() and Path(cleaned_id).suffix.lower() != ".gguf":
             runtime.model_downloader.resolve_safe_model_dir(cleaned_id)
         else:
             runtime.model_downloader.resolve_safe_gguf_path(cleaned_id)
+    except PermissionError as perm_exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(perm_exc),
+        ) from perm_exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1645,7 +1711,10 @@ async def stream_model_download(
     response_model=NodeStatusResponse,
     status_code=status.HTTP_200_OK,
 )
-async def start_node(request: StartNodeRequest) -> NodeStatusResponse:
+async def start_node(
+    request: StartNodeRequest,
+    _ipc_auth: None = Depends(verify_local_ipc_token),
+) -> NodeStatusResponse:
     """Load model shard, join LAN/Internet room, and issue an OpenAI Gateway session token."""
     if request.shard_layer_end < request.shard_layer_start:
         raise HTTPException(
@@ -1673,50 +1742,72 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         probe_path: Path | None = None
         initial_fingerprint: str | None = None
         if request.source_type == ModelSourceType.LOCAL_FILE:
-            local_candidate = Path(request.model_id.strip()).expanduser().resolve()
-            if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
-                probe_path = local_candidate
-            elif local_candidate.is_file():
-                if local_candidate.suffix.lower() != ".gguf":
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail=f"Expected a .gguf model file, got: {local_candidate.name}",
-                    )
-                probe_path = local_candidate
-            else:
+            try:
+                probe_path = runtime.model_downloader.resolve_safe_local_model_path(
+                    request.model_id
+                )
+            except PermissionError as perm_exc:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=str(perm_exc),
+                ) from perm_exc
+            except FileNotFoundError as not_found_exc:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Local .gguf model file not found: {local_candidate}",
+                    detail=str(not_found_exc),
+                ) from not_found_exc
+            except ValueError as val_exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(val_exc),
+                ) from val_exc
+        elif request.source_type == ModelSourceType.DIRECT_URL:
+            try:
+                direct_target = runtime.model_downloader.resolve_direct_url_path(
+                    request.model_id, filename=request.filename
                 )
+            except PermissionError as perm_exc:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=str(perm_exc),
+                ) from perm_exc
+            except ValueError as val_exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(val_exc),
+                ) from val_exc
+            min_gguf_bytes = (
+                len(GGUF_MAGIC) if is_offline_mode() else MIN_ONLINE_GGUF_BYTES
+            )
+            if is_valid_gguf_file(direct_target, min_bytes=min_gguf_bytes):
+                probe_path = direct_target
         else:
             try:
                 min_gguf_bytes = (
                     len(GGUF_MAGIC) if is_offline_mode() else MIN_ONLINE_GGUF_BYTES
                 )
-                if request.source_type == ModelSourceType.DIRECT_URL:
-                    direct_target = runtime.model_downloader.resolve_direct_url_path(
-                        request.model_id, filename=request.filename
-                    )
-                    if is_valid_gguf_file(direct_target, min_bytes=min_gguf_bytes):
-                        probe_path = direct_target
+                in_models = runtime.model_downloader.resolve_gguf_in_models_dir(
+                    request.model_id, request.filename
+                )
+                if is_valid_gguf_file(in_models, min_bytes=min_gguf_bytes):
+                    probe_path = in_models
                 else:
-                    in_models = runtime.model_downloader.resolve_gguf_in_models_dir(
-                        request.model_id, request.filename
+                    _, candidate_gguf = runtime.model_downloader.resolve_safe_gguf_path(
+                        request.model_id
                     )
-                    if is_valid_gguf_file(in_models, min_bytes=min_gguf_bytes):
-                        probe_path = in_models
+                    if is_valid_gguf_file(candidate_gguf, min_bytes=min_gguf_bytes):
+                        probe_path = candidate_gguf
                     else:
-                        _, candidate_gguf = runtime.model_downloader.resolve_safe_gguf_path(
+                        _, candidate_dir = runtime.model_downloader.resolve_safe_model_dir(
                             request.model_id
                         )
-                        if is_valid_gguf_file(candidate_gguf, min_bytes=min_gguf_bytes):
-                            probe_path = candidate_gguf
-                        else:
-                            _, candidate_dir = runtime.model_downloader.resolve_safe_model_dir(
-                                request.model_id
-                            )
-                            if (candidate_dir / "config.json").is_file():
-                                probe_path = candidate_dir
+                        if (candidate_dir / "config.json").is_file():
+                            probe_path = candidate_dir
+            except PermissionError as perm_exc:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=str(perm_exc),
+                ) from perm_exc
             except Exception:
                 probe_path = None
 
@@ -1894,13 +1985,19 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                 )
 
         # 4. Download/resolve ONLY the Cloud-assigned shard layers [target_start..target_end]
-        local_model_path = await runtime.model_downloader.ensure_model_downloaded(
-            request.model_id,
-            shard_layer_start=target_start,
-            shard_layer_end=target_end,
-            source_type=request.source_type.value,
-            filename=request.filename,
-        )
+        try:
+            local_model_path = await runtime.model_downloader.ensure_model_downloaded(
+                request.model_id,
+                shard_layer_start=target_start,
+                shard_layer_end=target_end,
+                source_type=request.source_type.value,
+                filename=request.filename,
+            )
+        except PermissionError as perm_exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(perm_exc),
+            ) from perm_exc
         model_fingerprint: str = compute_model_fingerprint(local_model_path)
         if cloud_online and model_fingerprint != initial_fingerprint:
             try:
@@ -2106,7 +2203,9 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
     response_model=NodeStatusResponse,
     status_code=status.HTTP_200_OK,
 )
-async def stop_node() -> NodeStatusResponse:
+async def stop_node(
+    _ipc_auth: None = Depends(verify_local_ipc_token),
+) -> NodeStatusResponse:
     """Stop P2P listener, invalidate session_token, and release all RAM/VRAM shards."""
     async with runtime.get_lifecycle_lock():
         return await _stop_node_unlocked()
@@ -2185,7 +2284,10 @@ async def list_peers() -> list[PeerNodeInfo]:
 
 
 @app.post("/peers/register", response_model=list[PeerNodeInfo])
-async def register_peer(peer: PeerNodeInfo) -> list[PeerNodeInfo]:
+async def register_peer(
+    peer: PeerNodeInfo,
+    _ipc_auth: None = Depends(verify_local_ipc_token),
+) -> list[PeerNodeInfo]:
     """Register or update a direct P2P peer in the local routing table."""
     runtime.peers = [p for p in runtime.peers if p.peer_id != peer.peer_id]
     runtime.peers.append(peer)

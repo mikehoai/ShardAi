@@ -337,6 +337,16 @@ async def test_head_node_fails_over_immediately_on_middle_node_forwarding_failur
     ]
     head_port = await head_node.start_p2p_listener(port=0)
     assert head_node.p2p_listen_port == head_port
+    head_peer = PeerNodeInfo(
+        peer_id="head-node",
+        ip_address="127.0.0.1",
+        port=head_port,
+        shard_layer_start=0,
+        shard_layer_end=15,
+        role=PeerRole.PRIMARY,
+    )
+    broken_middle.peers.append(head_peer)
+    backup_tail.peers.append(head_peer)
 
     try:
         start_time = time.monotonic()
