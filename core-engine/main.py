@@ -347,6 +347,7 @@ class LocalNodeRuntime:
             NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS
         )
         self._compute_lock: asyncio.Lock = asyncio.Lock()
+        self._compute_lock_loop: asyncio.AbstractEventLoop | None = None
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
         self.tracker_client: SignalingTrackerClient = SignalingTrackerClient(
@@ -357,6 +358,14 @@ class LocalNodeRuntime:
             connect_timeout_seconds=4.0,
             max_retries=3,
         )
+
+    def get_compute_lock(self) -> asyncio.Lock:
+        """Return the compute serialization lock bound to the active event loop."""
+        running_loop = asyncio.get_running_loop()
+        if self._compute_lock_loop is not running_loop:
+            self._compute_lock = asyncio.Lock()
+            self._compute_lock_loop = running_loop
+        return self._compute_lock
 
     def get_lifecycle_lock(self) -> asyncio.Lock:
         """Return the lifecycle serialization lock bound to the active event loop."""
@@ -832,7 +841,7 @@ class LocalNodeRuntime:
         if cancel_event.is_set() or self.model_runner is None:
             return
 
-        async with self._compute_lock:
+        async with self.get_compute_lock():
             runner = self.model_runner
             if cancel_event.is_set() or runner is None:
                 return
@@ -1437,19 +1446,27 @@ class LocalNodeRuntime:
                     await self.maybe_send_tracker_heartbeat(force=True)
                     if self.state != NodeState.RUNNING:
                         return
-                # Also refresh peer routing table for this room/model
+                # Also refresh peer routing table for this room/model without invalidating active peers on transient errors
                 if self.model_id is not None:
-                    refreshed_peers = await self.tracker_client.fetch_peers(
-                        model_id=self.model_id,
-                        room_id=self.room_id,
-                        room_key_hash=self.room_key_hash,
-                        node_id=self.node_id,
-                    )
-                    if self.state != NodeState.RUNNING:
-                        return
-                    if refreshed_peers is not None:
-                        cloud_peers = self._apply_peer_failover_overrides(
-                            [p for p in refreshed_peers if p.peer_id != self.node_id]
+                    try:
+                        refreshed_peers = await self.tracker_client.fetch_peers(
+                            model_id=self.model_id,
+                            room_id=self.room_id,
+                            room_key_hash=self.room_key_hash,
+                            node_id=self.node_id,
+                        )
+                        if self.state != NodeState.RUNNING:
+                            return
+                        if refreshed_peers is not None:
+                            cloud_peers = self._apply_peer_failover_overrides(
+                                [p for p in refreshed_peers if p.peer_id != self.node_id]
+                            )
+                    except Exception as peer_exc:
+                        if self.state != NodeState.RUNNING:
+                            return
+                        logger.warning(
+                            "Background peer refresh failed transiently (%s); preserving existing peers.",
+                            peer_exc,
                         )
                 self.last_tracker_reachable = True
                 is_online_effective = True
