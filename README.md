@@ -39,7 +39,7 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
   * **LAN Only (`zeroconf` mDNS):** Discovers peers automatically on your local network (`_shardai._tcp.local.`) with zero external internet dependency.
   * **Offline Solo Fallback:** Runs all model layers locally on a single machine when offline or unassisted.
 * **⚡ Standard CLI & Lightweight Tauri Shell:**
-  * **`shardai` CLI:** Rich terminal commands (`create`, `join`, `chat`, `status`, `stop`, `pull`, `models`, `rooms`, `serve`, `network`, `version`) with automated PATH installer scripts.
+  * **`shardai` CLI:** Rich cross-platform terminal commands (`create`, `join`, `chat`, `status`, `stop`, `pull`, `models`, `rooms`, `serve`, `network`, `doctor`, `service`, `completion`, `version`) with automated Windows, macOS, and Ubuntu/Linux PATH & `systemd` installers.
   * **Tauri v2 Desktop App:** Lightweight native window with system tray, collapsible sidebar, sun/moon dark theme, hardware telemetry, and automated Python sidecar supervisor (zero zombie processes).
 * **🔒 Binary Tensor Streaming & Loopback Security:** Uses `lz4`-compressed binary tensor framing over P2P sockets (never `pickle` or raw JSON tensors) and binds the local control plane strictly to `127.0.0.1` with IPC token authentication (`X-ShardAi-Local-Token`).
 
@@ -166,7 +166,13 @@ Install the `shardai` command onto your system PATH:
   ```powershell
   .\scripts\install_cli.ps1
   ```
-* **macOS / Linux:**
+* **Linux / Ubuntu (headless client, PEP 668 safe, optional `systemd` & completions):**
+  ```bash
+  chmod +x ./scripts/install_linux.sh
+  ./scripts/install_linux.sh --source --shell-completion
+  ```
+  See [`docs/LINUX.md`](docs/LINUX.md) for `.deb` installation, background daemonization, Docker, and Ubuntu firewall setup.
+* **macOS / Generic Unix:**
   ```bash
   chmod +x ./scripts/install_cli.sh
   ./scripts/install_cli.sh
@@ -182,15 +188,18 @@ Install the `shardai` command onto your system PATH:
 | :--- | :--- | :--- |
 | `shardai create` | Host a room & share RAM/model | `shardai create --model llama-3.1-8b --ram 4` |
 | `shardai join` | Join an existing room | `shardai join my-room` |
-| `shardai serve` | Run background local daemon | `shardai serve --port 8000` |
+| `shardai serve` | Run local daemon (foreground or `--background`) | `shardai serve --background` |
 | `shardai status` | Show node state & masked API key | `shardai status --show-key` |
-| `shardai stop` | Stop active node & free memory | `shardai stop` |
+| `shardai stop` | Stop active node & free memory (`--shutdown-daemon`) | `shardai stop --shutdown-daemon` |
 | `shardai rooms` | List available rooms | `shardai rooms` |
 | `shardai models` | List catalog models & RAM estimates | `shardai models` |
 | `shardai pull` | Pre-download model weights | `shardai pull llama-3.1-8b` |
 | `shardai peers` | List direct P2P connections | `shardai peers` |
 | `shardai chat` | Interactive REPL or one-shot prompt | `shardai chat "Why is distributed inference fast?"` |
 | `shardai network` | Telemetry & host RAM headroom | `shardai network` |
+| `shardai doctor` | Inspect Linux/Ubuntu, RAM/cgroup & daemon readiness | `shardai doctor` |
+| `shardai service` | Generate or manage Linux `systemd` service unit | `shardai service unit` |
+| `shardai completion` | Output Bash or Zsh shell completion script | `shardai completion bash` |
 | `shardai version` | Display installed CLI version | `shardai version` |
 
 > **Flag Ergonomics:** All commands support standard POSIX double-dash flags (`--model`, `--room`), short flags (`-m`, `-r`, `-k`), and single-dash flags (`-model`, `-room`, `-ram`). Use `--json` for machine-readable output.
@@ -245,8 +254,9 @@ ShardAi/
 │   ├── main.py          # FastAPI control plane, /v1/chat/completions gateway & sidecar entry
 │   ├── pyproject.toml   # Python project metadata, [project.scripts], & build config
 │   └── requirements.txt # Pinned runtime and test dependencies
-├── docs/                # Build and cross-platform packaging documentation (BUILD.md)
-├── scripts/             # PyInstaller sidecar, CLI builders & PATH installers (.ps1 / .sh)
+├── docs/                # Build, Linux/Ubuntu, and cross-platform packaging documentation
+├── packaging/           # Linux systemd units, shell completions, and container assets
+├── scripts/             # PyInstaller sidecar, CLI builders, .deb packager & PATH installers
 ├── src-tauri/           # Rust native shell (windowing, system tray, Python process guard)
 ├── src-ui/              # React 18 + TypeScript desktop UI dashboard
 ├── package.json         # Root Tauri CLI & UI workspace scripts

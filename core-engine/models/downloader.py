@@ -17,7 +17,9 @@ import logging
 import math
 import os
 from pathlib import Path
+import platform
 import re
+import sys
 import time
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -247,6 +249,39 @@ def get_shardai_home() -> Path:
     override = os.getenv("SHARDAI_HOME_DIR", "").strip()
     base = Path(override).expanduser() if override else (Path.home() / ".shardai")
     return base.resolve()
+
+
+def resolve_default_cache_dir(shardai_home: Path | None = None) -> Path:
+    """Resolve a persistent, writable default directory for cached model weights.
+
+    Precedence:
+    1. Explicit `SHARDAI_CACHE_DIR` environment override.
+    2. Frozen PyInstaller executables (`<shardai_home>/cache_models`) to avoid ephemeral `_MEI` dirs.
+    3. Repository `core-engine/cache_models` when writable during local development/tests.
+    4. Linux `$XDG_CACHE_HOME/shardai/cache_models` or `<shardai_home>/cache_models` fallback.
+    """
+    env_cache = os.getenv("SHARDAI_CACHE_DIR", "").strip()
+    if env_cache:
+        return Path(env_cache).expanduser().resolve()
+
+    resolved_home = shardai_home if shardai_home is not None else get_shardai_home()
+    if getattr(sys, "frozen", False):
+        return (resolved_home / "cache_models").resolve()
+
+    source_cache = (Path(__file__).resolve().parent.parent / "cache_models").resolve()
+    try:
+        source_cache.mkdir(parents=True, exist_ok=True)
+        if os.access(source_cache, os.W_OK):
+            return source_cache
+    except OSError:
+        pass
+
+    if platform.system() == "Linux":
+        xdg_cache = os.getenv("XDG_CACHE_HOME", "").strip()
+        if xdg_cache:
+            return (Path(xdg_cache).expanduser() / "shardai" / "cache_models").resolve()
+
+    return (resolved_home / "cache_models").resolve()
 
 
 def compute_model_fingerprint(model_path: Path) -> str:
@@ -542,7 +577,7 @@ class ModelDownloader:
         http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.shardai_home: Path = get_shardai_home()
-        default_dir = Path(__file__).resolve().parent.parent / "cache_models"
+        default_dir = resolve_default_cache_dir(self.shardai_home)
         self.cache_dir: Path = Path(cache_dir).resolve() if cache_dir else default_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir: Path = (

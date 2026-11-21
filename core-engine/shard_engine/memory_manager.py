@@ -127,14 +127,45 @@ def calculate_max_layers(
     )
 
 
+def _parse_linux_meminfo(meminfo_text: str) -> tuple[int, int]:
+    """Parse `/proc/meminfo` and return `(total_bytes, available_bytes)`.
+
+    Falls back to `MemFree + Buffers + Cached` when `MemAvailable` is absent.
+    """
+    values_kb: dict[str, int] = {}
+    for line in meminfo_text.splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        parts = rest.strip().split()
+        if not parts:
+            continue
+        try:
+            values_kb[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+
+    total_kb = values_kb.get("MemTotal", 0)
+    avail_kb = values_kb.get("MemAvailable", 0)
+    if avail_kb <= 0:
+        avail_kb = (
+            values_kb.get("MemFree", 0)
+            + values_kb.get("Buffers", 0)
+            + values_kb.get("Cached", 0)
+        )
+    return max(0, total_kb * 1024), max(0, avail_kb * 1024)
+
+
 def get_system_memory_info() -> tuple[float, float, int]:
     """Return `(total_ram_gb, available_ram_gb, max_shareable_ram_gb)` for the host OS.
 
-    Reserves 1 GB of free RAM for the operating system (`floor(available - 1)`).
+    Reserves 1 GB of free RAM for the operating system (`floor(available - 1)`),
+    and clamps Linux host readings to active container cgroup v1/v2 limits.
     """
     system_name: str = platform.system()
     total_bytes: int = 0
     avail_bytes: int = 0
+    cgroup_limit: int | None = None
 
     try:
         if system_name == "Windows":
@@ -156,13 +187,22 @@ def get_system_memory_info() -> tuple[float, float, int]:
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[attr-defined]
                 total_bytes = int(stat.ullTotalPhys)
                 avail_bytes = int(stat.ullAvailPhys)
-        elif system_name == "Linux" and Path("/proc/meminfo").exists():
-            meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
-            for line in meminfo.splitlines():
-                if line.startswith("MemTotal:"):
-                    total_bytes = int(line.split()[1]) * 1024
-                elif line.startswith("MemAvailable:"):
-                    avail_bytes = int(line.split()[1]) * 1024
+        elif system_name == "Linux":
+            if Path("/proc/meminfo").exists():
+                meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+                total_bytes, avail_bytes = _parse_linux_meminfo(meminfo)
+            from shard_engine.linux_env import read_cgroup_memory_limit
+
+            cgroup_limit, cgroup_current = read_cgroup_memory_limit()
+            if cgroup_limit is not None and cgroup_limit > 0:
+                total_bytes = min(total_bytes, cgroup_limit) if total_bytes > 0 else cgroup_limit
+                if cgroup_current is not None and cgroup_current >= 0:
+                    cgroup_avail = max(0, cgroup_limit - cgroup_current)
+                    avail_bytes = (
+                        min(avail_bytes, cgroup_avail) if avail_bytes > 0 else cgroup_avail
+                    )
+                else:
+                    avail_bytes = min(avail_bytes, cgroup_limit) if avail_bytes > 0 else cgroup_limit
         elif system_name == "Darwin":
             total_out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
             total_bytes = int(total_out)
@@ -177,7 +217,7 @@ def get_system_memory_info() -> tuple[float, float, int]:
     except Exception as exc:
         logger.warning("Failed to inspect OS memory via native API: %s", exc)
 
-    if total_bytes <= 0 or avail_bytes <= 0:
+    if total_bytes <= 0 or (avail_bytes <= 0 and cgroup_limit is None):
         # Conservative fallback if OS telemetry is unavailable
         return 16.0, 8.0, 7
 

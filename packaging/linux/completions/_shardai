@@ -1,0 +1,44 @@
+#compdef shardai
+# Zsh completion for shardai CLI
+_shardai() {
+  local -a subcommands
+  subcommands=(
+    'create:Create a new ShardAi room and share RAM/VRAM'
+    'join:Join an existing ShardAi room'
+    'serve:Start the local ShardAi FastAPI daemon'
+    'status:Show active node status and masked API key'
+    'stop:Stop the active node and release memory'
+    'rooms:List available Internet and LAN rooms'
+    'models:List curated catalog models'
+    'pull:Download and cache model weights'
+    'peers:List direct P2P routing peers'
+    'chat:Chat with the active ShardAi node'
+    'network:Check Signaling Tracker and host memory'
+    'doctor:Inspect Linux/Ubuntu and runtime readiness'
+    'service:Generate or manage systemd daemon unit'
+    'completion:Output bash or zsh completion script'
+    'version:Print installed ShardAi CLI version'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'shardai commands' subcommands
+    return
+  fi
+
+  case "${words[2]}" in
+    service)
+      _values 'action' unit install uninstall status start stop restart logs
+      ;;
+    completion)
+      _values 'shell' bash zsh
+      ;;
+    *)
+      _arguments \
+        '--help[Show command help]' \
+        '--json[Output machine-readable JSON]' \
+        '--host[Loopback daemon host]:host:(127.0.0.1 localhost ::1)' \
+        '--port[Loopback daemon port]:port:'
+      ;;
+  esac
+}
+_shardai "$@"

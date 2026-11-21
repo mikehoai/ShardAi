@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the `shardai` CLI command onto the user's PATH (macOS / Linux).
+# Install the `shardai` CLI command onto the user's PATH (macOS / Linux / Ubuntu).
 #
 # Usage:
 #   ./scripts/install_cli.sh
@@ -47,7 +47,7 @@ TARGET_BIN="${INSTALL_DIR}/shardai"
 if [[ "${USE_BINARY}" == "true" ]]; then
   SOURCE_BIN="${REPO_ROOT}/dist/cli/shardai"
   if [[ ! -f "${SOURCE_BIN}" ]]; then
-    echo "Error: Standalone CLI binary not found at ${SOURCE_BIN}. Run './scripts/build_core.sh' first." >&2
+    echo "Error: Standalone CLI binary not found at ${SOURCE_BIN}. Run './scripts/build_core.sh --cli-only' first." >&2
     exit 1
   fi
   cp -f "${SOURCE_BIN}" "${TARGET_BIN}"
@@ -58,10 +58,30 @@ else
     PYTHON_EXE="${PYTHON_BIN}"
   elif [[ -x "${CORE_DIR}/.venv/bin/python" ]]; then
     PYTHON_EXE="${CORE_DIR}/.venv/bin/python"
-  elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_EXE="$(command -v python3)"
   else
-    PYTHON_EXE="$(command -v python)"
+    BASE_PYTHON=""
+    if command -v python3 >/dev/null 2>&1; then
+      BASE_PYTHON="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+      BASE_PYTHON="$(command -v python)"
+    else
+      echo "Error: Python 3.11+ is required. On Ubuntu/Debian run: sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip" >&2
+      exit 1
+    fi
+
+    # Create an isolated venv to comply with PEP 668 on Ubuntu 24.04+ / Debian 12+
+    echo "==> Creating isolated virtualenv at ${CORE_DIR}/.venv (PEP 668 safe)..."
+    if ! "${BASE_PYTHON}" -m venv "${CORE_DIR}/.venv" >/dev/null 2>&1; then
+      echo "Error: Failed to create Python virtualenv. On Ubuntu/Debian run: sudo apt-get install -y python3-venv" >&2
+      exit 1
+    fi
+    PYTHON_EXE="${CORE_DIR}/.venv/bin/python"
+  fi
+
+  if ! "${PYTHON_EXE}" -c "import typer, fastapi, httpx, pydantic" >/dev/null 2>&1; then
+    echo "==> Installing Python dependencies from ${CORE_DIR}/requirements.txt..."
+    "${PYTHON_EXE}" -m pip install --upgrade pip
+    "${PYTHON_EXE}" -m pip install -r "${CORE_DIR}/requirements.txt"
   fi
 
   echo "==> Installing shardai CLI package from ${CORE_DIR} using ${PYTHON_EXE}..."
@@ -85,6 +105,7 @@ fi
 echo ""
 echo "ShardAi CLI quickstart:"
 echo "  shardai --help"
+echo "  shardai doctor"
 echo "  shardai create --model llama-3.1-8b --room my-room --ram 4"
 echo "  shardai join my-room"
 echo "  shardai status"

@@ -1,0 +1,6 @@
+# Enforce Unix LF line endings on Linux shell scripts, systemd units, and containers
+*.sh text eol=lf
+*.service text eol=lf
+Dockerfile text eol=lf
+Dockerfile* text eol=lf
+packaging/linux/completions/* text eol=lf

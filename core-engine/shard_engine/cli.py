@@ -2,7 +2,8 @@
 
 Provides:
 - Standard `shardai <command> [options]` subcommands (`create`, `join`, `serve`,
-  `status`, `stop`, `rooms`, `models`, `pull`, `peers`, `chat`, `network`, `version`).
+  `status`, `stop`, `rooms`, `models`, `pull`, `peers`, `chat`, `network`,
+  `doctor`, `service`, `completion`, `version`).
 - Seamless normalization for single-dash long flags (`-model`, `-room`, `-ram`, etc.)
   alongside standard POSIX `--model` / `-m` flags.
 - Backwards compatibility for the Tauri desktop sidecar (`--mode daemon --port 8000`)
@@ -19,10 +20,15 @@ import importlib
 import json
 import os
 from pathlib import Path
+import platform
 import secrets
+import shutil
+import subprocess
 import sys
+import time
 import types
 from typing import Literal, NoReturn
+from urllib.parse import urlparse
 
 import click
 import httpx
@@ -39,6 +45,20 @@ from models.downloader import (
     normalize_hf_repo_id,
 )
 from shard_engine import __version__ as SHARDAI_VERSION
+from shard_engine.linux_env import (
+    SERVICE_ACTIONS,
+    clear_daemon_pid,
+    collect_environment_diagnostics,
+    get_daemon_log_file,
+    get_systemd_unit_path,
+    is_process_alive,
+    read_daemon_pid,
+    render_shell_completion,
+    render_systemd_unit,
+    run_systemctl,
+    terminate_daemon_process,
+    write_daemon_pid,
+)
 from shard_engine.memory_manager import get_system_memory_info
 from shard_engine.schemas import (
     ModelSourceType,
@@ -60,6 +80,8 @@ SINGLE_DASH_LONG_FLAGS: frozenset[str] = frozenset(
         "api-key",
         "api-url",
         "backend",
+        "background",
+        "enable",
         "filename",
         "foreground",
         "help",
@@ -69,6 +91,7 @@ SINGLE_DASH_LONG_FLAGS: frozenset[str] = frozenset(
         "mode",
         "model",
         "network",
+        "no-enable",
         "no-ssd-offload",
         "no-stream",
         "no-unlisted",
@@ -81,12 +104,15 @@ SINGLE_DASH_LONG_FLAGS: frozenset[str] = frozenset(
         "ram",
         "room",
         "room-key",
+        "scope",
         "show-key",
+        "shutdown-daemon",
         "source-type",
         "ssd-offload",
         "stream",
         "system",
         "temperature",
+        "tracker-url",
         "unlisted",
         "version",
     }
@@ -333,9 +359,13 @@ def _make_http_client(
     timeout: httpx.Timeout,
     transport: httpx.BaseTransport | None = None,
 ) -> httpx.Client:
-    """Create an `httpx.Client` configured with explicit timeout and optional test transport."""
+    """Create an `httpx.Client` configured with explicit timeout, local token, and optional test transport."""
     effective_transport = transport if transport is not None else _http_transport_override
-    return httpx.Client(timeout=timeout, transport=effective_transport)
+    local_token = os.getenv("SHARDAI_LOCAL_TOKEN", "").strip()
+    headers: dict[str, str] | None = (
+        {"X-ShardAi-Local-Token": local_token} if local_token else None
+    )
+    return httpx.Client(timeout=timeout, transport=effective_transport, headers=headers)
 
 
 def _check_daemon_healthy(
@@ -1090,6 +1120,130 @@ def join(
     )
 
 
+def _start_daemon_background(
+    *,
+    host: str,
+    port: int,
+    offline: bool | None,
+    json_output: bool,
+    startup_timeout_seconds: float = 15.0,
+) -> None:
+    """Launch `shardai serve` detached in the background, track its PID, and await `/health`."""
+    safe_host = validate_loopback_host(host)
+    base_url = build_engine_base_url(host=safe_host, port=port)
+
+    if _check_daemon_healthy(base_url):
+        existing_pid = read_daemon_pid(port)
+        if json_output:
+            _emit_json(
+                {
+                    "status": "already_running",
+                    "host": safe_host,
+                    "port": port,
+                    "pid": existing_pid,
+                    "api_base_url": f"{base_url}/v1",
+                }
+            )
+        else:
+            typer.echo(
+                f"ShardAi daemon is already running at {base_url}"
+                + (f" (PID {existing_pid})." if existing_pid else ".")
+            )
+        return
+
+    stale_pid = read_daemon_pid(port)
+    if stale_pid is not None and not is_process_alive(stale_pid):
+        clear_daemon_pid(port)
+
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "serve", "--host", safe_host, "--port", str(port)]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "shard_engine",
+            "serve",
+            "--host",
+            safe_host,
+            "--port",
+            str(port),
+        ]
+    if offline is True:
+        cmd.append("--offline")
+    elif offline is False:
+        cmd.append("--online")
+
+    child_env = os.environ.copy()
+    child_env["SHARDAI_ENGINE_PORT"] = str(port)
+    child_env["PYTHONUNBUFFERED"] = "1"
+    if not getattr(sys, "frozen", False):
+        core_dir = str(Path(__file__).resolve().parent.parent)
+        existing_pp = child_env.get("PYTHONPATH", "").strip()
+        child_env["PYTHONPATH"] = f"{core_dir}{os.pathsep}{existing_pp}" if existing_pp else core_dir
+
+    log_file = get_daemon_log_file(port)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("a", encoding="utf-8") as log_handle:
+        if os.name == "nt":
+            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+                subprocess, "DETACHED_PROCESS", 0
+            )
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                creationflags=flags,
+            )
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                start_new_session=True,
+            )
+
+    write_daemon_pid(port, proc.pid)
+
+    deadline = time.monotonic() + startup_timeout_seconds
+    while time.monotonic() < deadline:
+        if _check_daemon_healthy(base_url):
+            if json_output:
+                _emit_json(
+                    {
+                        "status": "running",
+                        "host": safe_host,
+                        "port": port,
+                        "pid": proc.pid,
+                        "log_file": str(log_file),
+                        "api_base_url": f"{base_url}/v1",
+                    }
+                )
+            else:
+                typer.echo(f"ShardAi daemon started in background (PID {proc.pid}).")
+                typer.echo(f"Gateway URL : {base_url}/v1")
+                typer.echo(f"Log file    : {log_file}")
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            proc.kill()
+    clear_daemon_pid(port)
+    _fail(
+        f"Background ShardAi daemon failed to become healthy on {base_url}. "
+        f"Check logs at {log_file}."
+    )
+
+
 @cli_app.command(context_settings=_COMMON_CONTEXT_SETTINGS)
 def serve(
     host: str = typer.Option(
@@ -1111,10 +1265,29 @@ def serve(
         "--offline/--online",
         help="Override SHARDAI_OFFLINE_MODE environment setting.",
     ),
+    background: bool = typer.Option(
+        False,
+        "--background",
+        "-d",
+        help="Run the daemon detached in the background and record its PID/log files.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output machine-readable JSON (with --background).",
+    ),
 ) -> None:
     """Start the local ShardAi FastAPI daemon without immediately joining a room."""
     safe_host = validate_loopback_host(host)
     _apply_offline_env(offline)
+    if background:
+        _start_daemon_background(
+            host=safe_host,
+            port=port,
+            offline=offline,
+            json_output=json_output,
+        )
+        return
     _run_daemon_server(host=safe_host, port=port)
 
 
@@ -1236,6 +1409,11 @@ def stop(
         "--api-url",
         help="Override daemon base URL.",
     ),
+    shutdown_daemon: bool = typer.Option(
+        False,
+        "--shutdown-daemon",
+        help="Terminate the background daemon process after stopping the active node.",
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -1244,6 +1422,7 @@ def stop(
 ) -> None:
     """Stop the active node, revoke the session API key, and release RAM/VRAM shards."""
     base_url = build_engine_base_url(host=host, port=port, api_url=api_url)
+    payload: dict[str, object]
     try:
         with _make_http_client(
             timeout=httpx.Timeout(timeout=10.0, connect=2.0)
@@ -1256,11 +1435,29 @@ def stop(
                         f"Failed to stop node (HTTP {resp.status_code}).",
                     )
                 )
-            payload = resp.json()
-            if not isinstance(payload, dict):
+            raw_payload = resp.json()
+            if not isinstance(raw_payload, dict):
                 _fail("Unexpected stop response from local daemon.")
+            payload = dict(raw_payload)
     except (httpx.HTTPError, OSError) as exc:
-        _fail(f"Local ShardAi daemon is not reachable at {base_url}: {exc}")
+        if not shutdown_daemon:
+            _fail(f"Local ShardAi daemon is not reachable at {base_url}: {exc}")
+        daemon_stopped, daemon_msg = terminate_daemon_process(port)
+        if not daemon_stopped:
+            _fail(f"Local ShardAi daemon is not reachable at {base_url} ({daemon_msg}).")
+        payload = {
+            "state": "STOPPED",
+            "allocated_ram_mb": 0,
+            "allocated_vram_mb": 0,
+            "message": daemon_msg,
+            "daemon_stopped": True,
+            "daemon_message": daemon_msg,
+        }
+    else:
+        if shutdown_daemon:
+            daemon_stopped, daemon_msg = terminate_daemon_process(port)
+            payload["daemon_stopped"] = daemon_stopped
+            payload["daemon_message"] = daemon_msg
 
     if json_output:
         _emit_json(payload)
@@ -1271,6 +1468,8 @@ def stop(
         f"VRAM: {payload.get('allocated_vram_mb', 0)} MB). "
         f"{payload.get('message', '')}".strip()
     )
+    if shutdown_daemon and payload.get("daemon_message") and payload.get("daemon_message") != payload.get("message"):
+        typer.echo(str(payload["daemon_message"]))
 
 
 @cli_app.command(context_settings=_COMMON_CONTEXT_SETTINGS)
@@ -2099,6 +2298,281 @@ def network(
         f"{mem_payload.get('total_ram_gb')} GB total "
         f"(max shareable: {mem_payload.get('max_shareable_ram_gb')} GB)"
     )
+
+
+@cli_app.command(context_settings=_COMMON_CONTEXT_SETTINGS)
+def doctor(
+    host: str = typer.Option(
+        DEFAULT_HOST,
+        "--host",
+        "-H",
+        help="Local loopback daemon host.",
+    ),
+    port: int = typer.Option(
+        int(os.getenv("SHARDAI_ENGINE_PORT", str(DEFAULT_PORT))),
+        "--port",
+        "-p",
+        min=1024,
+        max=65535,
+        help="Local daemon HTTP port.",
+    ),
+    api_url: str | None = typer.Option(
+        None,
+        "--api-url",
+        help="Override daemon base URL.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output machine-readable JSON diagnostics.",
+    ),
+) -> None:
+    """Inspect Linux/Ubuntu runtime readiness, memory/cgroup limits, GPU, and daemon status."""
+    base_url = build_engine_base_url(host=host, port=port, api_url=api_url)
+    parsed = urlparse(base_url)
+    diag_host = parsed.hostname or validate_loopback_host(host)
+    diag_port = parsed.port or port
+    daemon_reachable = _check_daemon_healthy(base_url)
+    diag = collect_environment_diagnostics(
+        host=diag_host,
+        port=diag_port,
+        daemon_reachable=daemon_reachable,
+    )
+
+    if json_output:
+        _emit_json(diag)
+        if not diag.get("ok"):
+            raise typer.Exit(code=1)
+        return
+
+    distro_obj = diag.get("distro")
+    distro_dict = distro_obj if isinstance(distro_obj, dict) else {}
+    accel_obj = diag.get("accelerator")
+    accel_dict = accel_obj if isinstance(accel_obj, dict) else {}
+    mem_obj = diag.get("memory")
+    mem_dict = mem_obj if isinstance(mem_obj, dict) else {}
+
+    typer.echo(
+        f"Environment   : {distro_dict.get('pretty_name') or diag.get('platform')} "
+        f"({diag.get('target_triple')})"
+        + (" [WSL]" if distro_dict.get("is_wsl") else "")
+    )
+    typer.echo(
+        f"Accelerator   : {str(accel_dict.get('backend') or 'cpu').upper()}"
+        + (f" ({accel_dict.get('device_name')})" if accel_dict.get("device_name") else "")
+    )
+    if mem_dict.get("cgroup_limit_bytes") is not None:
+        limit_gb = float(mem_dict["cgroup_limit_bytes"]) / float(1024**3)  # type: ignore[arg-type]
+        typer.echo(f"Cgroup Limit  : {limit_gb:.2f} GB")
+
+    checks_obj = diag.get("checks")
+    rows: list[list[str]] = []
+    if isinstance(checks_obj, list):
+        for item in checks_obj:
+            if isinstance(item, dict):
+                rows.append(
+                    [
+                        str(item.get("name") or ""),
+                        str(item.get("status") or "").upper(),
+                        str(item.get("detail") or ""),
+                    ]
+                )
+    if rows:
+        typer.echo("")
+        typer.echo(format_table(("CHECK", "STATUS", "DETAIL"), rows))
+
+    if not diag.get("ok"):
+        raise typer.Exit(code=1)
+
+
+@cli_app.command(context_settings=_COMMON_CONTEXT_SETTINGS)
+def service(
+    action: str = typer.Argument(
+        ...,
+        help="Systemd action: unit, install, uninstall, status, start, stop, restart, or logs.",
+    ),
+    scope: str = typer.Option(
+        "user",
+        "--scope",
+        help="Systemd unit scope: user (~/.config/systemd/user) or system (/etc/systemd/system).",
+    ),
+    host: str = typer.Option(
+        DEFAULT_HOST,
+        "--host",
+        "-H",
+        help="Loopback daemon host for unit ExecStart (127.0.0.1, localhost, or ::1).",
+    ),
+    port: int = typer.Option(
+        int(os.getenv("SHARDAI_ENGINE_PORT", str(DEFAULT_PORT))),
+        "--port",
+        "-p",
+        min=1024,
+        max=65535,
+        help="Loopback daemon HTTP port.",
+    ),
+    tracker_url: str | None = typer.Option(
+        None,
+        "--tracker-url",
+        help="Optional SHARDAI_TRACKER_URL environment variable for the service unit.",
+    ),
+    offline: bool | None = typer.Option(
+        None,
+        "--offline/--online",
+        help="Configure SHARDAI_OFFLINE_MODE=true inside the generated service unit.",
+    ),
+    enable: bool = typer.Option(
+        True,
+        "--enable/--no-enable",
+        help="Enable and immediately start shardai.service on install.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output machine-readable JSON.",
+    ),
+) -> None:
+    """Generate or manage a hardened loopback-only Linux systemd service unit."""
+    safe_host = validate_loopback_host(host)
+    normalized_action = action.strip().lower()
+    if normalized_action not in SERVICE_ACTIONS:
+        _fail(
+            f"Unsupported service action '{action}'. "
+            f"Choose one of: {', '.join(SERVICE_ACTIONS)}."
+        )
+
+    normalized_scope = scope.strip().lower()
+    if normalized_scope not in ("user", "system"):
+        _fail(f"Invalid --scope '{scope}'. Choose 'user' or 'system'.")
+    typed_scope: Literal["user", "system"] = (
+        "system" if normalized_scope == "system" else "user"
+    )
+
+    resolved_bin = shutil.which("shardai")
+    if resolved_bin:
+        exec_path = resolved_bin
+    elif getattr(sys, "frozen", False):
+        exec_path = sys.executable
+    else:
+        exec_path = "/usr/bin/shardai" if platform.system() == "Linux" else sys.executable
+
+    unit_path = get_systemd_unit_path(typed_scope)
+    if normalized_action == "unit":
+        unit_text = render_systemd_unit(
+            exec_path=exec_path,
+            host=safe_host,
+            port=port,
+            scope=typed_scope,
+            tracker_url=tracker_url,
+            offline=bool(offline),
+        )
+        if json_output:
+            _emit_json(
+                {
+                    "scope": typed_scope,
+                    "unit_path": str(unit_path),
+                    "content": unit_text,
+                }
+            )
+            return
+        typer.echo(unit_text, nl=False)
+        return
+
+    if platform.system() != "Linux":
+        _fail(
+            "systemd service management is only available on Linux. "
+            "Run 'shardai service unit' to preview the unit template."
+        )
+
+    if shutil.which("systemctl") is None:
+        _fail("systemctl was not found in PATH on this Linux host.")
+
+    if normalized_action == "install":
+        unit_text = render_systemd_unit(
+            exec_path=exec_path,
+            host=safe_host,
+            port=port,
+            scope=typed_scope,
+            tracker_url=tracker_url,
+            offline=bool(offline),
+        )
+        try:
+            unit_path.parent.mkdir(parents=True, exist_ok=True)
+            unit_path.write_text(unit_text, encoding="utf-8", newline="\n")
+        except PermissionError as exc:
+            _fail(f"Permission denied writing {unit_path}: {exc}")
+        reload_res = run_systemctl(["daemon-reload"], scope=typed_scope)
+        if reload_res.returncode != 0:
+            _fail(reload_res.stderr.strip() or "systemctl daemon-reload failed.")
+        if enable:
+            enable_res = run_systemctl(["enable", "--now", "shardai.service"], scope=typed_scope)
+            if enable_res.returncode != 0:
+                _fail(enable_res.stderr.strip() or "systemctl enable --now failed.")
+        if json_output:
+            _emit_json({"action": "install", "scope": typed_scope, "unit_path": str(unit_path), "enabled": enable})
+        else:
+            typer.echo(f"Installed systemd unit at {unit_path}" + (" and started shardai.service." if enable else "."))
+        return
+
+    if normalized_action == "uninstall":
+        run_systemctl(["disable", "--now", "shardai.service"], scope=typed_scope)
+        try:
+            unit_path.unlink(missing_ok=True)
+        except PermissionError as exc:
+            _fail(f"Permission denied removing {unit_path}: {exc}")
+        run_systemctl(["daemon-reload"], scope=typed_scope)
+        if json_output:
+            _emit_json({"action": "uninstall", "scope": typed_scope, "unit_path": str(unit_path)})
+        else:
+            typer.echo(f"Removed systemd unit {unit_path}.")
+        return
+
+    if normalized_action == "logs":
+        if shutil.which("journalctl") is None:
+            _fail("journalctl was not found in PATH.")
+        jcmd = ["journalctl"]
+        if typed_scope == "user":
+            jcmd.append("--user")
+        jcmd.extend(["-u", "shardai.service", "-n", "100", "--no-pager"])
+        proc = subprocess.run(jcmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            _fail(proc.stderr.strip() or "Failed to read shardai.service journal logs.")
+        typer.echo(proc.stdout, nl=False)
+        return
+
+    res = run_systemctl([normalized_action, "shardai.service"], scope=typed_scope)
+    if json_output:
+        _emit_json(
+            {
+                "action": normalized_action,
+                "scope": typed_scope,
+                "returncode": res.returncode,
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+            }
+        )
+        if res.returncode != 0:
+            raise typer.Exit(code=res.returncode)
+        return
+
+    if res.stdout:
+        typer.echo(res.stdout, nl=False)
+    if res.returncode != 0:
+        _fail(res.stderr.strip() or f"systemctl {normalized_action} exited with code {res.returncode}.")
+
+
+@cli_app.command(context_settings=_COMMON_CONTEXT_SETTINGS)
+def completion(
+    shell: str = typer.Argument(
+        ...,
+        help="Target shell completion format: bash or zsh.",
+    ),
+) -> None:
+    """Output Bash or Zsh shell completion script for the `shardai` CLI."""
+    normalized_shell = shell.strip().lower()
+    if normalized_shell not in ("bash", "zsh"):
+        _fail(f"Unsupported shell '{shell}'. Choose 'bash' or 'zsh'.")
+    typed_shell: Literal["bash", "zsh"] = "zsh" if normalized_shell == "zsh" else "bash"
+    typer.echo(render_shell_completion(typed_shell), nl=False)
 
 
 @cli_app.command(context_settings=_COMMON_CONTEXT_SETTINGS)

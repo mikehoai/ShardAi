@@ -82,16 +82,18 @@ def _list_local_ipv4_addresses() -> list[str]:
     except OSError:
         pass
 
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        probe.connect(("10.255.255.255", 1))
-        ip = str(probe.getsockname()[0])
-        if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
-            addresses.add(ip)
-    except OSError:
-        pass
-    finally:
-        probe.close()
+    # Ubuntu /etc/hosts often maps hostname to 127.0.1.1; probe RFC1918 subnets as fallback.
+    for target in ("10.255.255.255", "192.168.255.255", "172.16.255.255"):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect((target, 1))
+            ip = str(probe.getsockname()[0])
+            if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+                addresses.add(ip)
+        except OSError:
+            pass
+        finally:
+            probe.close()
 
     return sorted(addresses)
 

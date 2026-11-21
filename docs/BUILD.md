@@ -43,6 +43,24 @@ chmod +x scripts/build_core.sh
 #   src-tauri/binaries/core-engine-<target-triple>
 #   dist/cli/shardai-<target-triple>
 #   dist/cli/shardai
+#   dist/cli/shardai-<target-triple>.tar.gz (+ .sha256)
+```
+
+For headless Linux / Ubuntu servers where only the standalone CLI binary is needed (without copying into `src-tauri/binaries`):
+
+```bash
+./scripts/build_core.sh --cli-only
+```
+
+### Ubuntu / Debian `.deb` Package
+After building the standalone Linux CLI binary, package it with `systemd` units and Bash/Zsh completions:
+
+```bash
+chmod +x scripts/build_deb.sh
+./scripts/build_deb.sh --binary dist/cli/shardai --arch amd64
+# Output:
+#   dist/cli/shardai_<version>_amd64.deb
+#   dist/cli/shardai_<version>_amd64.deb.sha256
 ```
 
 ### Running the CLI Standalone or Installing to PATH
@@ -53,9 +71,14 @@ You can install the CLI directly onto your user PATH:
 .\scripts\install_cli.ps1
 ```
 ```bash
-# macOS / Linux PATH installer:
+# Ubuntu / Linux full installer (PEP 668 safe, supports --source, --binary, --release, --with-systemd):
+./scripts/install_linux.sh
+
+# Minimal macOS / Linux PATH installer:
 ./scripts/install_cli.sh
 ```
+
+See [`docs/LINUX.md`](LINUX.md) for full Ubuntu/Linux deployment, Docker, and `systemd` instructions.
 
 Example CLI commands:
 ```bash

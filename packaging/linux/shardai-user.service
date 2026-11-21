@@ -1,0 +1,16 @@
+[Unit]
+Description=ShardAi Local OpenAI Gateway and P2P LLM Node Daemon (User)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/shardai serve --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
