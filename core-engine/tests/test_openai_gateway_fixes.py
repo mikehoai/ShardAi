@@ -620,6 +620,14 @@ async def test_three_node_head_middle_tail_propagates_temperature_to_tail_decode
     middle.p2p_listen_port = middle_port
     tail.p2p_listen_port = tail_port
 
+    head_peer = PeerNodeInfo(
+        peer_id="head-node",
+        ip_address="127.0.0.1",
+        port=head_port,
+        shard_layer_start=0,
+        shard_layer_end=9,
+        role=PeerRole.PRIMARY,
+    )
     head.peers = [
         PeerNodeInfo(
             peer_id="middle-node",
@@ -631,6 +639,7 @@ async def test_three_node_head_middle_tail_propagates_temperature_to_tail_decode
         )
     ]
     middle.peers = [
+        head_peer,
         PeerNodeInfo(
             peer_id="tail-node",
             ip_address="127.0.0.1",
@@ -638,8 +647,9 @@ async def test_three_node_head_middle_tail_propagates_temperature_to_tail_decode
             shard_layer_start=20,
             shard_layer_end=31,
             role=PeerRole.PRIMARY,
-        )
+        ),
     ]
+    tail.peers = [head_peer]
 
     try:
         # 1. Deterministic temperature=0.0 across 2 tokens
@@ -751,6 +761,16 @@ async def test_two_node_real_pytorch_runtime_propagates_temperature_zero(
             port=tail_port,
             shard_layer_start=2,
             shard_layer_end=3,
+            role=PeerRole.PRIMARY,
+        )
+    ]
+    tail.peers = [
+        PeerNodeInfo(
+            peer_id="pytorch-head",
+            ip_address="127.0.0.1",
+            port=head_port,
+            shard_layer_start=0,
+            shard_layer_end=1,
             role=PeerRole.PRIMARY,
         )
     ]

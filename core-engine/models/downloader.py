@@ -12,6 +12,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -19,10 +20,11 @@ import os
 from pathlib import Path
 import platform
 import re
+import socket
 import sys
 import time
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
@@ -102,6 +104,67 @@ SUPPORTED_MODELS: dict[str, GgufModelSpec] = {
 FINGERPRINT_HEAD_BYTES: int = 10 * 1024 * 1024  # 10 MB prefix for fast fingerprint hashing
 GGUF_MAGIC: bytes = b"GGUF"
 MIN_ONLINE_GGUF_BYTES: int = 1_048_576
+MAX_DIRECT_URL_REDIRECTS: int = 5
+_REDIRECT_STATUS_CODES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
+_FORBIDDEN_DIRECT_URL_HOSTS: frozenset[str] = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+        "metadata.goog",
+        "instance-data",
+    }
+)
+
+
+def is_forbidden_ssrf_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if `ip_obj` is private, loopback, link-local, multicast, reserved, or non-global."""
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        return is_forbidden_ssrf_ip(ip_obj.ipv4_mapped)
+    return bool(
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+        or not ip_obj.is_global
+    )
+
+
+def _resolve_hostname_ips(hostname: str, port: int) -> list[str]:
+    """Resolve `hostname:port` via system DNS into deduplicated IP strings."""
+    infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    seen: list[str] = []
+    for _family, _socktype, _proto, _canonname, sockaddr in infos:
+        raw_ip = str(sockaddr[0]).split("%", 1)[0]
+        if raw_ip and raw_ip not in seen:
+            seen.append(raw_ip)
+    return seen
+
+
+def validate_direct_url_syntax_and_host(url: str) -> tuple[str, int]:
+    """Validate HTTP/HTTPS `direct_url` syntax and reject restricted hostnames and IP literals."""
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+        raise ValueError(f"Direct URL must be a valid http:// or https:// URL: '{url}'")
+
+    host = parsed.hostname.rstrip(".").lower()
+    if host in _FORBIDDEN_DIRECT_URL_HOSTS or host.endswith(
+        (".localhost", ".local", ".internal")
+    ):
+        raise PermissionError(f"Rejected restricted direct_url hostname '{host}'.")
+
+    try:
+        ip_obj = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        ip_obj = None
+
+    if ip_obj is not None and is_forbidden_ssrf_ip(ip_obj):
+        raise PermissionError(f"Rejected non-public direct_url IP address '{host}'.")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return host, port
 
 
 def has_gguf_magic(file_path: Path) -> bool:
@@ -575,6 +638,7 @@ class ModelDownloader:
         models_dir: Path | str | None = None,
         catalog_cache_path: Path | str | None = None,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        allowed_local_dirs: list[Path | str] | None = None,
     ) -> None:
         self.shardai_home: Path = get_shardai_home()
         default_dir = resolve_default_cache_dir(self.shardai_home)
@@ -594,8 +658,61 @@ class ModelDownloader:
         self.hf_shards_dir: Path = (self.cache_dir / "hf_shards").resolve()
         self.hf_shards_dir.mkdir(parents=True, exist_ok=True)
         self._http_transport: httpx.AsyncBaseTransport | None = http_transport
+        self._extra_allowed_local_dirs: list[Path] = [
+            Path(p).expanduser().resolve() for p in (allowed_local_dirs or [])
+        ]
         self._subscribers: list[asyncio.Queue[DownloadProgressEvent]] = []
         self._latest_event: dict[str, DownloadProgressEvent] = {}
+
+    def get_approved_local_roots(self) -> list[Path]:
+        """Return canonical directories permitted for local model file/directory loading."""
+        roots: list[Path] = [
+            self.models_dir,
+            self.cache_dir,
+            *self._extra_allowed_local_dirs,
+        ]
+        env_dirs = os.getenv("SHARDAI_ALLOWED_MODEL_DIRS", "").strip()
+        if env_dirs:
+            for raw_dir in env_dirs.split(os.pathsep):
+                cleaned = raw_dir.strip()
+                if cleaned:
+                    roots.append(Path(cleaned).expanduser().resolve())
+        unique_roots: list[Path] = []
+        for root in roots:
+            if root not in unique_roots:
+                unique_roots.append(root)
+        return unique_roots
+
+    def resolve_safe_local_model_path(self, raw_path: str) -> Path:
+        """Validate canonical containment within approved roots and `.gguf`/HF directory format."""
+        cleaned = raw_path.strip()
+        if not cleaned or "\x00" in cleaned:
+            raise ValueError("Local model path cannot be empty or contain NUL bytes.")
+
+        resolved = Path(cleaned).expanduser().resolve()
+        approved_roots = self.get_approved_local_roots()
+        if not any(resolved.is_relative_to(root) for root in approved_roots):
+            raise PermissionError(
+                "Rejected local model path outside approved model directories."
+            )
+
+        if resolved.is_dir():
+            if not (resolved / "config.json").is_file():
+                raise FileNotFoundError(
+                    f"Local model directory missing config.json: {resolved}"
+                )
+            return resolved
+
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Local .gguf model file not found: {resolved}")
+        if resolved.suffix.lower() != ".gguf":
+            raise ValueError(f"Expected a .gguf model file, got: {resolved.name}")
+        if not has_gguf_magic(resolved):
+            raise ValueError(
+                f"Local model file '{resolved.name}' is not a valid GGUF binary "
+                "(missing 4-byte GGUF magic header)."
+            )
+        return resolved
 
     def save_catalog_cache(self, models: list[dict[str, Any]]) -> None:
         """Persist synchronized online model catalog to `~/.shardai/models_cache.json`."""
@@ -662,7 +779,7 @@ class ModelDownloader:
 
         local_candidate = Path(cleaned_id)
         if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
-            resolved_local = local_candidate.resolve()
+            resolved_local = self.resolve_safe_local_model_path(cleaned_id)
             return cleaned_id, resolved_local
 
         repo_id: str = normalize_hf_repo_id(cleaned_id)
@@ -704,11 +821,12 @@ class ModelDownloader:
         # 2. Custom local `.gguf` file path
         local_candidate = Path(cleaned_id)
         if local_candidate.suffix.lower() == ".gguf" and (
-            local_candidate.is_absolute() or local_candidate.exists()
+            local_candidate.is_absolute()
+            or local_candidate.expanduser().exists()
+            or cleaned_id.startswith((".", "~"))
+            or "\\" in cleaned_id
         ):
-            resolved_local = local_candidate.resolve()
-            if not resolved_local.is_file():
-                raise FileNotFoundError(f"Local .gguf model file not found: {resolved_local}")
+            resolved_local = self.resolve_safe_local_model_path(cleaned_id)
             custom_spec = GgufModelSpec(
                 model_id=cleaned_id,
                 hf_repo_id="local",
@@ -961,9 +1079,8 @@ class ModelDownloader:
 
     def resolve_direct_url_path(self, url: str, filename: str | None = None) -> Path:
         """Validate an HTTP/HTTPS `.gguf` URL and resolve a safe destination inside `~/.shardai/models/`."""
+        validate_direct_url_syntax_and_host(url)
         parsed = urlparse(url.strip())
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError(f"Direct URL must be a valid http:// or https:// URL: '{url}'")
 
         raw_name = (filename or "").strip() or unquote(Path(parsed.path).name)
         safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(raw_name).name).strip("._")
@@ -976,6 +1093,40 @@ class ModelDownloader:
         if not target_path.is_relative_to(self.models_dir):
             raise PermissionError("Rejected direct_url destination outside ~/.shardai/models.")
         return target_path
+
+    async def _validate_direct_url_target(self, url: str) -> None:
+        """Resolve `url` hostname and reject any private, loopback, link-local, or reserved IP."""
+        host, port = validate_direct_url_syntax_and_host(url)
+        try:
+            ipaddress.ip_address(host.split("%", 1)[0])
+            return
+        except ValueError:
+            pass
+
+        try:
+            resolved_ips = await asyncio.to_thread(_resolve_hostname_ips, host, port)
+        except OSError as exc:
+            if self._http_transport is not None and host.endswith(".test"):
+                return
+            raise PermissionError(
+                f"Could not safely resolve direct_url host '{host}': {exc}"
+            ) from exc
+
+        if not resolved_ips:
+            raise PermissionError(f"direct_url host '{host}' did not resolve to any IP address.")
+
+        for raw_ip in resolved_ips:
+            cleaned_ip = raw_ip.split("%", 1)[0]
+            try:
+                ip_obj = ipaddress.ip_address(cleaned_ip)
+            except ValueError as exc:
+                raise PermissionError(
+                    f"Resolved direct_url IP '{raw_ip}' is invalid."
+                ) from exc
+            if is_forbidden_ssrf_ip(ip_obj):
+                raise PermissionError(
+                    f"Rejected direct_url host '{host}' resolving to restricted IP '{cleaned_ip}'."
+                )
 
     def resolve_gguf_in_models_dir(self, repo_id: str, filename: str | None) -> Path:
         """Resolve a safe `.gguf` target inside `~/.shardai/models/` (or `cache_dir` fallback)."""
@@ -1070,8 +1221,9 @@ class ModelDownloader:
         filename: str | None,
         _emit: Callable[[DownloadProgressEvent], None],
     ) -> Path:
-        """Stream a `.gguf` file from any external HTTP/HTTPS URL into `~/.shardai/models/`."""
+        """Stream a `.gguf` file from a validated public HTTP/HTTPS URL into `~/.shardai/models/`."""
         target_path = self.resolve_direct_url_path(url, filename=filename)
+        await self._validate_direct_url_target(url)
         min_bytes = (
             len(GGUF_MAGIC)
             if (is_offline_mode() and self._http_transport is None)
@@ -1120,44 +1272,65 @@ class ModelDownloader:
 
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=False,
                 timeout=httpx.Timeout(timeout=None, connect=15.0, read=60.0),
                 transport=self._http_transport,
             ) as client:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
-                    raw_content_length = response.headers.get("content-length")
-                    if raw_content_length:
-                        try:
-                            parsed_len = int(raw_content_length)
-                            if parsed_len > 0:
-                                total_bytes = parsed_len
-                        except ValueError:
-                            total_bytes = 0
-                    with part_path.open("wb") as handle:
-                        async for chunk in response.aiter_bytes(chunk_size=1_048_576):
-                            if not chunk:
-                                continue
-                            handle.write(chunk)
-                            downloaded += len(chunk)
-                            now = time.monotonic()
-                            if now - last_emit_ts >= 0.15 or (total_bytes > 0 and downloaded >= total_bytes):
-                                last_emit_ts = now
-                                pct = (
-                                    min(99.9, round((downloaded / float(total_bytes)) * 100.0, 1))
-                                    if total_bytes > 0
-                                    else 0.0
+                current_url = url.strip()
+                redirects_followed = 0
+                while True:
+                    await self._validate_direct_url_target(current_url)
+                    async with client.stream("GET", current_url) as response:
+                        if response.status_code in _REDIRECT_STATUS_CODES:
+                            location = response.headers.get("location", "").strip()
+                            if not location:
+                                raise ValueError(
+                                    f"Redirect response (HTTP {response.status_code}) missing Location header."
                                 )
-                                _emit(
-                                    DownloadProgressEvent(
-                                        model_id=url,
-                                        status="downloading",
-                                        progress_percent=pct,
-                                        downloaded_bytes=downloaded,
-                                        total_bytes=total_bytes,
-                                        message=f"Downloading {target_path.name} ({pct:.1f}%)...",
+                            redirects_followed += 1
+                            if redirects_followed > MAX_DIRECT_URL_REDIRECTS:
+                                raise PermissionError(
+                                    f"Exceeded maximum direct_url redirects ({MAX_DIRECT_URL_REDIRECTS})."
+                                )
+                            next_url = urljoin(current_url, location)
+                            await self._validate_direct_url_target(next_url)
+                            current_url = next_url
+                            continue
+
+                        response.raise_for_status()
+                        raw_content_length = response.headers.get("content-length")
+                        if raw_content_length:
+                            try:
+                                parsed_len = int(raw_content_length)
+                                if parsed_len > 0:
+                                    total_bytes = parsed_len
+                            except ValueError:
+                                total_bytes = 0
+                        with part_path.open("wb") as handle:
+                            async for chunk in response.aiter_bytes(chunk_size=1_048_576):
+                                if not chunk:
+                                    continue
+                                handle.write(chunk)
+                                downloaded += len(chunk)
+                                now = time.monotonic()
+                                if now - last_emit_ts >= 0.15 or (total_bytes > 0 and downloaded >= total_bytes):
+                                    last_emit_ts = now
+                                    pct = (
+                                        min(99.9, round((downloaded / float(total_bytes)) * 100.0, 1))
+                                        if total_bytes > 0
+                                        else 0.0
                                     )
-                                )
+                                    _emit(
+                                        DownloadProgressEvent(
+                                            model_id=url,
+                                            status="downloading",
+                                            progress_percent=pct,
+                                            downloaded_bytes=downloaded,
+                                            total_bytes=total_bytes,
+                                            message=f"Downloading {target_path.name} ({pct:.1f}%)...",
+                                        )
+                                    )
+                        break
             if total_bytes > 0 and downloaded != total_bytes:
                 raise RuntimeError(
                     f"Incomplete GGUF download for '{target_path.name}': "
@@ -1394,13 +1567,16 @@ class ModelDownloader:
             ):
                 effective_source = "direct_url"
             elif Path(cleaned_id).suffix.lower() == ".gguf" and (
-                Path(cleaned_id).is_absolute() or Path(cleaned_id).exists()
+                Path(cleaned_id).is_absolute()
+                or Path(cleaned_id).expanduser().exists()
+                or cleaned_id.startswith((".", "~"))
+                or "\\" in cleaned_id
             ):
                 effective_source = "local_file"
 
         if effective_source == "local_file":
-            local_path = Path(cleaned_id).expanduser().resolve()
-            if local_path.is_dir() and (local_path / "config.json").is_file():
+            local_path = self.resolve_safe_local_model_path(cleaned_id)
+            if local_path.is_dir():
                 _emit(
                     DownloadProgressEvent(
                         model_id=model_id,
@@ -1411,10 +1587,6 @@ class ModelDownloader:
                     )
                 )
                 return local_path
-            if not local_path.is_file():
-                raise FileNotFoundError(f"Local .gguf model file not found: {local_path}")
-            if local_path.suffix.lower() != ".gguf":
-                raise ValueError(f"Expected a .gguf model file, got: {local_path.name}")
             size_bytes = local_path.stat().st_size
             _emit(
                 DownloadProgressEvent(
@@ -1436,10 +1608,10 @@ class ModelDownloader:
                 _emit=_emit,
             )
 
-        # Support already-downloaded local HF Safetensors directories passed directly
+        # Support already-downloaded local HF Safetensors directories inside approved roots
         local_candidate = Path(cleaned_id)
         if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
-            resolved_dir = local_candidate.resolve()
+            resolved_dir = self.resolve_safe_local_model_path(cleaned_id)
             _emit(
                 DownloadProgressEvent(
                     model_id=model_id,
