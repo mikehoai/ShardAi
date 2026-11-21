@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+import hashlib
 import json
 from pathlib import Path
 import struct
+import threading
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -13,14 +16,17 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
+import main as main_module
 from main import app, runtime
 import models.downloader as downloader_module
 from models.downloader import (
     DEFAULT_CATALOG_MODELS,
+    FINGERPRINT_HEAD_BYTES,
     GGUF_MAGIC,
     DownloadProgressEvent,
     ModelDownloader,
     compute_model_fingerprint,
+    compute_model_fingerprint_async,
     has_gguf_magic,
     is_valid_gguf_file,
 )
@@ -603,3 +609,283 @@ def test_catalog_endpoint_falls_back_to_default_when_cache_lacks_valid_repo_id_o
     assert body_cloud["source"] == "cache"
     assert body_cloud["count"] == 1
     assert body_cloud["models"][0]["repo_id"] == "safe-org/Safe-Model-GGUF"
+
+
+@pytest.mark.asyncio
+async def test_start_node_fingerprint_computation_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 1 and Step 4 fingerprint disk reads run off the event loop without stalling `/health` or `/status`."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+    monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+
+    downloader = _make_downloader(tmp_path)
+    gguf_path = downloader.models_dir / "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf"
+    _write_synthetic_gguf(gguf_path, block_count=40, total_size=1_100_000)
+    expected_fp = compute_model_fingerprint(gguf_path)
+    runtime.model_downloader = downloader
+
+    def _tracker_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/announce"):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "assigned_start_layer": 0,
+                    "assigned_end_layer": 39,
+                    "role": "primary",
+                    "peers": [],
+                },
+            )
+        if request.method == "GET" and "/rooms" in request.url.path:
+            return httpx.Response(status_code=200, json={"rooms": []})
+        return httpx.Response(status_code=200, json={"peers": []})
+
+    runtime.tracker_client = _make_mock_tracker(_tracker_handler)
+
+    loop_thread_id = threading.get_ident()
+    worker_thread_ids: list[int] = []
+    step1_entered = threading.Event()
+    step1_release = threading.Event()
+    step4_entered = threading.Event()
+    step4_release = threading.Event()
+    real_fingerprint = compute_model_fingerprint
+
+    def _blocking_fingerprint_probe(model_path: Path) -> str:
+        call_idx = len(worker_thread_ids)
+        worker_thread_ids.append(threading.get_ident())
+        if call_idx == 0:
+            step1_entered.set()
+            assert step1_release.wait(timeout=5.0)
+        elif call_idx == 1:
+            step4_entered.set()
+            assert step4_release.wait(timeout=5.0)
+        return real_fingerprint(model_path)
+
+    monkeypatch.setattr(main_module, "compute_model_fingerprint", _blocking_fingerprint_probe)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as async_client:
+        start_task = asyncio.create_task(
+            async_client.post(
+                "/start-node",
+                json={
+                    "node_id": "fp-nonblock-node",
+                    "model_id": "deepseek-r1-distill-llama-8b",
+                    "filename": None,
+                    "source_type": "catalog",
+                    "network_mode": "internet",
+                    "room_id": "fp-nonblock-room",
+                    "ram_gb": 8,
+                    "p2p_listen_port": 49431,
+                },
+            )
+        )
+        try:
+            assert await asyncio.to_thread(step1_entered.wait, 5.0)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            status_res = await asyncio.wait_for(async_client.get("/status"), timeout=1.0)
+            assert health_res.status_code == 200
+            assert status_res.status_code == 200
+            assert status_res.json()["state"] == NodeState.STARTING.value
+            step1_release.set()
+
+            assert await asyncio.to_thread(step4_entered.wait, 5.0)
+            health_res_step4 = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            status_res_step4 = await asyncio.wait_for(async_client.get("/status"), timeout=1.0)
+            assert health_res_step4.status_code == 200
+            assert status_res_step4.status_code == 200
+            assert status_res_step4.json()["state"] == NodeState.STARTING.value
+            step4_release.set()
+
+            start_res = await asyncio.wait_for(start_task, timeout=5.0)
+            assert start_res.status_code == 200
+            assert start_res.json()["model_fingerprint"] == expected_fp
+            assert len(worker_thread_ids) == 2
+            assert all(tid != loop_thread_id for tid in worker_thread_ids)
+        finally:
+            step1_release.set()
+            step4_release.set()
+            if not start_task.done():
+                start_task.cancel()
+                try:
+                    await start_task
+                except asyncio.CancelledError:
+                    pass
+            if runtime.state != NodeState.STOPPED:
+                await async_client.post("/stop-node")
+
+
+@pytest.mark.asyncio
+async def test_compute_model_fingerprint_chunked_large_file_dir_and_async_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunked prefix hashing matches reference SHA-256 for large files, dirs, and async offload."""
+    payload = (
+        (b"\x11" * (5 * 1024 * 1024))
+        + (b"\x22" * (FINGERPRINT_HEAD_BYTES - 5 * 1024 * 1024))
+        + (b"\x33" * 4096)
+    )
+    large_file = tmp_path / "large-model.gguf"
+    large_file.write_bytes(payload)
+
+    expected_file_fp = hashlib.sha256(
+        f"file:{len(payload)}:".encode("utf-8") + payload[:FINGERPRINT_HEAD_BYTES]
+    ).hexdigest()
+    assert compute_model_fingerprint(large_file) == expected_file_fp
+
+    # Mutating tail bytes beyond FINGERPRINT_HEAD_BYTES (with same total size) preserves digest
+    tail_modified = tmp_path / "large-model-tail-modified.gguf"
+    tail_modified.write_bytes(payload[:-128] + (b"\x99" * 128))
+    assert compute_model_fingerprint(tail_modified) == expected_file_fp
+
+    # Mutating a byte inside the 10 MB prefix (beyond the first 1 MiB chunk) changes digest
+    mid_modified = tmp_path / "large-model-mid-modified.gguf"
+    mid_bytes = bytearray(payload)
+    mid_bytes[5 * 1024 * 1024] ^= 0xFF
+    mid_modified.write_bytes(bytes(mid_bytes))
+    assert compute_model_fingerprint(mid_modified) != expected_file_fp
+
+    # Directory artifact: manifest + first 1 MiB of first weight/config file
+    model_dir = tmp_path / "hf-dir"
+    model_dir.mkdir()
+    config_file = model_dir / "config.json"
+    config_bytes = b'{"num_hidden_layers": 32}'
+    config_file.write_bytes(config_bytes)
+    shard_file = model_dir / "model-00001-of-00002.safetensors"
+    shard_bytes = b"SAFETENSORS_HEADER" + (b"\x44" * 2_000_000)
+    shard_file.write_bytes(shard_bytes)
+
+    manifest = f"{config_file.name}:{len(config_bytes)}|{shard_file.name}:{len(shard_bytes)}"
+    expected_dir_fp = hashlib.sha256(
+        f"dir:{manifest}:".encode("utf-8") + config_bytes
+    ).hexdigest()
+    assert compute_model_fingerprint(model_dir) == expected_dir_fp
+
+    with pytest.raises(FileNotFoundError):
+        compute_model_fingerprint(tmp_path / "does-not-exist.gguf")
+
+    # Verify async wrapper runs off the event loop thread and returns exact digest
+    loop_thread_id = threading.get_ident()
+    observed_threads: list[int] = []
+    real_sync_fp = downloader_module.compute_model_fingerprint
+
+    def _spy_fp(path: Path) -> str:
+        observed_threads.append(threading.get_ident())
+        return real_sync_fp(path)
+
+    monkeypatch.setattr(downloader_module, "compute_model_fingerprint", _spy_fp)
+    async_fp = await compute_model_fingerprint_async(large_file)
+    assert async_fp == expected_file_fp
+    assert len(observed_threads) == 1
+    assert observed_threads[0] != loop_thread_id
+
+
+@pytest.mark.asyncio
+async def test_start_node_fingerprint_step1_error_fallback_and_step4_error_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 1 worker failure falls back to `initial_fingerprint=None`; Step 4 failure releases resources."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+    monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+
+    downloader = _make_downloader(tmp_path)
+    gguf_path = downloader.models_dir / "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf"
+    _write_synthetic_gguf(gguf_path, block_count=40, total_size=1_100_000)
+    expected_fp = compute_model_fingerprint(gguf_path)
+    runtime.model_downloader = downloader
+
+    announce_payloads: list[dict[str, Any]] = []
+
+    def _tracker_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/announce"):
+            announce_payloads.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "assigned_start_layer": 0,
+                    "assigned_end_layer": 39,
+                    "role": "primary",
+                    "peers": [],
+                },
+            )
+        if request.method == "GET" and "/rooms" in request.url.path:
+            return httpx.Response(status_code=200, json={"rooms": []})
+        return httpx.Response(status_code=200, json={"peers": []})
+
+    runtime.tracker_client = _make_mock_tracker(_tracker_handler)
+    real_fingerprint = compute_model_fingerprint
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as async_client:
+        # Case A: Step 1 worker failure falls back cleanly and Step 4 syncs fingerprint
+        calls_case_a = 0
+
+        def _fail_step1_only(model_path: Path) -> str:
+            nonlocal calls_case_a
+            calls_case_a += 1
+            if calls_case_a == 1:
+                raise OSError("slow disk read error")
+            return real_fingerprint(model_path)
+
+        monkeypatch.setattr(main_module, "compute_model_fingerprint", _fail_step1_only)
+        res_a = await async_client.post(
+            "/start-node",
+            json={
+                "node_id": "fp-step1-fallback-node",
+                "model_id": "deepseek-r1-distill-llama-8b",
+                "filename": None,
+                "source_type": "catalog",
+                "network_mode": "internet",
+                "room_id": "fp-fallback-room",
+                "ram_gb": 8,
+                "p2p_listen_port": 49432,
+            },
+        )
+        assert res_a.status_code == 200
+        assert res_a.json()["model_fingerprint"] == expected_fp
+        assert len(announce_payloads) == 2
+        assert "model_fingerprint" not in announce_payloads[0]
+        assert announce_payloads[1]["model_fingerprint"] == expected_fp
+        await async_client.post("/stop-node")
+
+        # Case B: Step 4 worker failure aborts with HTTP 500, NodeState.ERROR, and 0 allocated RAM/VRAM
+        announce_payloads.clear()
+        calls_case_b = 0
+
+        def _fail_step4_only(model_path: Path) -> str:
+            nonlocal calls_case_b
+            calls_case_b += 1
+            if calls_case_b == 2:
+                raise OSError("disk disappeared")
+            return real_fingerprint(model_path)
+
+        monkeypatch.setattr(main_module, "compute_model_fingerprint", _fail_step4_only)
+        try:
+            res_b = await async_client.post(
+                "/start-node",
+                json={
+                    "node_id": "fp-step4-error-node",
+                    "model_id": "deepseek-r1-distill-llama-8b",
+                    "filename": None,
+                    "source_type": "catalog",
+                    "network_mode": "internet",
+                    "room_id": "fp-error-room",
+                    "ram_gb": 8,
+                    "p2p_listen_port": 49433,
+                },
+            )
+            assert res_b.status_code == 500
+            assert "disk disappeared" in res_b.json()["detail"]
+            assert runtime.state == NodeState.ERROR
+            assert runtime.memory_manager.allocated_ram_mb == 0
+            assert runtime.memory_manager.allocated_vram_mb == 0
+        finally:
+            if runtime.state != NodeState.STOPPED:
+                await async_client.post("/stop-node")

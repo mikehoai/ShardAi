@@ -102,6 +102,7 @@ SUPPORTED_MODELS: dict[str, GgufModelSpec] = {
 }
 
 FINGERPRINT_HEAD_BYTES: int = 10 * 1024 * 1024  # 10 MB prefix for fast fingerprint hashing
+FINGERPRINT_CHUNK_BYTES: int = 1_048_576  # 1 MiB bounded read buffer
 GGUF_MAGIC: bytes = b"GGUF"
 MIN_ONLINE_GGUF_BYTES: int = 1_048_576
 MAX_DIRECT_URL_REDIRECTS: int = 5
@@ -347,15 +348,31 @@ def resolve_default_cache_dir(shardai_home: Path | None = None) -> Path:
     return (resolved_home / "cache_models").resolve()
 
 
+def _feed_file_prefix(
+    file_path: Path,
+    max_bytes: int,
+    update: Callable[[bytes], None],
+) -> None:
+    """Stream up to `max_bytes` from `file_path` into `update` using bounded chunks."""
+    remaining = max(0, max_bytes)
+    if remaining == 0:
+        return
+    with file_path.open("rb") as handle:
+        while remaining > 0:
+            chunk = handle.read(min(remaining, FINGERPRINT_CHUNK_BYTES))
+            if not chunk:
+                break
+            update(chunk)
+            remaining -= len(chunk)
+
+
 def compute_model_fingerprint(model_path: Path) -> str:
     """Compute a fast SHA-256 fingerprint from the first 10 MB + total size of a model artifact."""
     hasher = hashlib.sha256()
     if model_path.is_file():
         total_size = model_path.stat().st_size
         hasher.update(f"file:{total_size}:".encode("utf-8"))
-        with model_path.open("rb") as handle:
-            head_chunk = handle.read(FINGERPRINT_HEAD_BYTES)
-            hasher.update(head_chunk)
+        _feed_file_prefix(model_path, FINGERPRINT_HEAD_BYTES, hasher.update)
         return hasher.hexdigest()
 
     if model_path.is_dir():
@@ -366,12 +383,20 @@ def compute_model_fingerprint(model_path: Path) -> str:
         hasher.update(f"dir:{manifest}:".encode("utf-8"))
         for p in weight_files:
             if p.suffix.lower() in (".safetensors", ".gguf") or p.name == "config.json":
-                with p.open("rb") as handle:
-                    hasher.update(handle.read(min(FINGERPRINT_HEAD_BYTES, 1_048_576)))
+                _feed_file_prefix(
+                    p,
+                    min(FINGERPRINT_HEAD_BYTES, FINGERPRINT_CHUNK_BYTES),
+                    hasher.update,
+                )
                 break
         return hasher.hexdigest()
 
     raise FileNotFoundError(f"Cannot compute model_fingerprint; path not found: {model_path}")
+
+
+async def compute_model_fingerprint_async(model_path: Path) -> str:
+    """Offload `compute_model_fingerprint` to a worker thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(compute_model_fingerprint, model_path)
 
 
 def select_best_gguf_filename(repo_files: list[str]) -> str | None:
