@@ -14,6 +14,7 @@ Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
 
 from array import array
 from collections import OrderedDict
+from collections.abc import Iterator
 import ctypes
 from dataclasses import dataclass, field
 import gc
@@ -130,6 +131,10 @@ class ShardModelRunner:
         # not fit in `max_ram_mb` are paged on demand from disk instead of triggering OOM.
         self.use_mmap: bool = use_mmap
         self._native_handle: Any | None = native_handle
+        self._native_lock: threading.Lock = threading.Lock()
+        self._stop_events_lock: threading.Lock = threading.Lock()
+        self._active_stop_events: set[threading.Event] = set()
+        self._closed_event: threading.Event = threading.Event()
 
         # PyTorch layer-sharded components
         self._is_real_pytorch: bool = False
@@ -434,66 +439,86 @@ class ShardModelRunner:
                 exc,
             )
 
+    def _is_native_cancelled(
+        self,
+        stop_event: threading.Event | None,
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
+        """Return True when the runner is releasing or the caller requested cancellation."""
+        return (
+            self._closed_event.is_set()
+            or (stop_event is not None and stop_event.is_set())
+            or (cancel_event is not None and cancel_event.is_set())
+        )
+
     def stream_native(
         self,
         prompt: str,
         messages: list[dict[str, str]] | None = None,
         max_tokens: int = 256,
         temperature: float = 0.7,
+        stop_event: threading.Event | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> Any:
+    ) -> Iterator[tuple[int, str, bool]]:
         """Stream real tokens directly from native llama_cpp handle."""
-        if self._native_handle is None:
+        if self._native_handle is None or self._is_native_cancelled(stop_event, cancel_event):
             return
-        if cancel_event is not None and cancel_event.is_set():
-            return
-        if messages:
-            stream = self._native_handle.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True,
-            )
-            step = 0
-            try:
-                for chunk in stream:
-                    if cancel_event is not None and cancel_event.is_set():
-                        break
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
-                    content = delta.get("content", "")
-                    finish = choice.get("finish_reason")
-                    is_eos = finish is not None and finish != ""
-                    if content or is_eos:
-                        yield step, content, bool(is_eos)
-                        step += 1
-            finally:
-                close_fn = getattr(stream, "close", None)
-                if callable(close_fn):
-                    close_fn()
-        else:
-            stream = self._native_handle.create_completion(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True,
-            )
-            step = 0
-            try:
-                for chunk in stream:
-                    if cancel_event is not None and cancel_event.is_set():
-                        break
-                    choice = chunk["choices"][0]
-                    text = choice.get("text", "")
-                    finish = choice.get("finish_reason")
-                    is_eos = finish is not None and finish != ""
-                    if text or is_eos:
-                        yield step, text, bool(is_eos)
-                        step += 1
-            finally:
-                close_fn = getattr(stream, "close", None)
-                if callable(close_fn):
-                    close_fn()
+
+        tracked_events = [ev for ev in (stop_event, cancel_event) if ev is not None]
+        if tracked_events:
+            with self._stop_events_lock:
+                self._active_stop_events.update(tracked_events)
+
+        try:
+            with self._native_lock:
+                native_handle = self._native_handle
+                if native_handle is None or self._is_native_cancelled(stop_event, cancel_event):
+                    return
+
+                use_chat: bool = bool(messages)
+                if use_chat:
+                    stream = native_handle.create_chat_completion(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=True,
+                    )
+                else:
+                    stream = native_handle.create_completion(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=True,
+                    )
+
+                step: int = 0
+                try:
+                    for chunk in stream:
+                        if self._is_native_cancelled(stop_event, cancel_event):
+                            break
+                        choice = chunk["choices"][0]
+                        raw_text = (
+                            choice.get("delta", {}).get("content", "")
+                            if use_chat
+                            else choice.get("text", "")
+                        )
+                        text: str = raw_text if isinstance(raw_text, str) else ""
+                        finish = choice.get("finish_reason")
+                        is_eos: bool = finish is not None and finish != ""
+                        if text or is_eos:
+                            yield step, text, bool(is_eos)
+                            step += 1
+                            if is_eos or self._is_native_cancelled(stop_event, cancel_event):
+                                break
+                finally:
+                    close_stream = getattr(stream, "close", None)
+                    if callable(close_stream):
+                        close_stream()
+        finally:
+            if tracked_events:
+                with self._stop_events_lock:
+                    for ev in tracked_events:
+                        self._active_stop_events.discard(ev)
 
     def _evict_expired_sessions(self) -> None:
         """Enforce TTL and LRU capacity bounds on cached per-request KV states."""
@@ -794,6 +819,12 @@ class ShardModelRunner:
 
     def release(self) -> None:
         """Explicitly release any native model handles and KV-caches to prevent RAM leaks."""
+        self._closed_event.set()
+        with self._stop_events_lock:
+            active_events = list(self._active_stop_events)
+        for evt in active_events:
+            evt.set()
+
         self._sessions.clear()
         self._embed_tokens = None
         self._layers = []
@@ -805,10 +836,11 @@ class ShardModelRunner:
         self._tokenizer = None
         self._is_real_pytorch = False
 
-        if self._native_handle is not None:
-            close_fn = getattr(self._native_handle, "close", None)
-            if callable(close_fn):
-                close_fn()
-            self._native_handle = None
+        with self._native_lock:
+            if self._native_handle is not None:
+                close_fn = getattr(self._native_handle, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                self._native_handle = None
 
         gc.collect()

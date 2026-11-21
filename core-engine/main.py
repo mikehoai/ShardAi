@@ -10,9 +10,8 @@ Security & Architecture Notes:
 """
 
 import asyncio
-from collections.abc import AsyncIterator
-import concurrent.futures
-from contextlib import aclosing, asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import aclosing, asynccontextmanager, closing
 import inspect
 import ipaddress
 import json
@@ -33,6 +32,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+from starlette.background import BackgroundTask
+from starlette.responses import ContentStream
+from starlette.types import Receive, Scope, Send
 
 from models.downloader import (
     DEFAULT_CATALOG_MODELS,
@@ -103,6 +105,50 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("shardai.main")
+
+NATIVE_STREAM_QUEUE_MAXSIZE: int = 64
+NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS: float = 2.0
+
+
+class _ClosableStreamingResponse(StreamingResponse):
+    """StreamingResponse that triggers a stop callback and closes its async iterator on teardown."""
+
+    def __init__(
+        self,
+        content: ContentStream,
+        status_code: int = 200,
+        headers: Mapping[str, str] | None = None,
+        media_type: str | None = None,
+        background: BackgroundTask | None = None,
+        on_close: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(
+            content=content,
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+            background=background,
+        )
+        self._on_close: Callable[[], None] | None = on_close
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._on_close is not None:
+                try:
+                    self._on_close()
+                except Exception:
+                    pass
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if callable(aclose):
+                try:
+                    await asyncio.wait_for(
+                        aclose(),
+                        timeout=NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    pass
 
 
 def _extract_chat_messages_dicts(messages: list[ChatMessage]) -> list[dict[str, str]]:
@@ -296,6 +342,10 @@ class LocalNodeRuntime:
         self.failed_peer_cooldown_seconds: float = 60.0
         self._evicted_peers: dict[str, tuple[float, str, int]] = {}
         self._promoted_peer_ids: dict[str, float] = {}
+        self.native_stream_queue_maxsize: int = NATIVE_STREAM_QUEUE_MAXSIZE
+        self.native_cancel_wait_timeout_seconds: float = (
+            NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS
+        )
         self._compute_lock: asyncio.Lock = asyncio.Lock()
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
@@ -773,94 +823,176 @@ class LocalNodeRuntime:
         messages: list[dict[str, str]] | None,
         max_tokens: int,
         temperature: float,
+        stop_event: threading.Event | None = None,
     ) -> AsyncIterator[tuple[int, str, bool]]:
-        """Stream native llama_cpp tokens serialized via `_compute_lock` with prompt cancellation."""
+        """Stream native llama_cpp tokens asynchronously, serialized by `_compute_lock` with cancellation."""
+        cancel_event: threading.Event = (
+            stop_event if stop_event is not None else threading.Event()
+        )
+        if cancel_event.is_set() or self.model_runner is None:
+            return
+
         async with self._compute_lock:
+            runner = self.model_runner
+            if cancel_event.is_set() or runner is None:
+                return
+
+            queue_maxsize: int = max(1, int(self.native_stream_queue_maxsize))
+            # Reserve 1 extra slot so terminal sentinel (None or Exception) never drops on QueueFull
             queue: asyncio.Queue[tuple[int, str, bool] | None | Exception] = asyncio.Queue(
-                maxsize=64
+                maxsize=queue_maxsize + 1
             )
             loop = asyncio.get_running_loop()
-            cancel_event = threading.Event()
-            runner = self.model_runner
+            slot_cond: threading.Condition = threading.Condition()
+            in_flight: int = 0
+            consumer_closed: bool = False
 
-            def _put_with_cancel(
-                item: tuple[int, str, bool] | None | Exception,
+            def _release_slot() -> None:
+                nonlocal in_flight
+                with slot_cond:
+                    if in_flight > 0:
+                        in_flight -= 1
+                    slot_cond.notify_all()
+
+            def _put_if_active(
+                payload: tuple[int, str, bool] | None | Exception,
+                is_token: bool,
+            ) -> None:
+                if consumer_closed or (is_token and cancel_event.is_set()):
+                    if is_token:
+                        _release_slot()
+                    return
+                try:
+                    queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    if is_token:
+                        _release_slot()
+
+            def _enqueue_threadsafe(
+                payload: tuple[int, str, bool] | None | Exception,
+                *,
+                is_token: bool,
             ) -> bool:
-                while not cancel_event.is_set():
-                    try:
-                        put_fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
-                    except RuntimeError:
-                        return False
-                    while not cancel_event.is_set():
-                        try:
-                            put_fut.result(timeout=0.05)
-                            return True
-                        except concurrent.futures.TimeoutError:
-                            continue
-                        except Exception:
-                            return False
-                    put_fut.cancel()
+                if loop.is_closed():
+                    if is_token:
+                        _release_slot()
                     return False
-                return False
+                try:
+                    loop.call_soon_threadsafe(_put_if_active, payload, is_token)
+                    return True
+                except RuntimeError:
+                    if is_token:
+                        _release_slot()
+                    return False
 
             def _worker() -> None:
+                nonlocal in_flight
+                sent_terminal: bool = False
                 try:
-                    assert runner is not None
                     stream_fn = runner.stream_native
+                    kwargs: dict[str, Any] = {
+                        "prompt": prompt,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    }
                     try:
                         sig = inspect.signature(stream_fn)
-                        accepts_cancel = "cancel_event" in sig.parameters or any(
+                        has_var_kw = any(
                             p.kind == inspect.Parameter.VAR_KEYWORD
                             for p in sig.parameters.values()
                         )
+                        if "stop_event" in sig.parameters or has_var_kw:
+                            kwargs["stop_event"] = cancel_event
+                        elif "cancel_event" in sig.parameters:
+                            kwargs["cancel_event"] = cancel_event
                     except (TypeError, ValueError):
-                        accepts_cancel = False
+                        pass
 
-                    if accepts_cancel:
-                        gen = stream_fn(
-                            prompt=prompt,
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            cancel_event=cancel_event,
-                        )
-                    else:
-                        gen = stream_fn(
-                            prompt=prompt,
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                        )
-
-                    try:
-                        for step, text, is_eos in gen:
+                    with closing(stream_fn(**kwargs)) as native_gen:
+                        for step, text, is_eos in native_gen:
                             if cancel_event.is_set():
                                 break
-                            if not _put_with_cancel((step, text, is_eos)):
+                            with slot_cond:
+                                while (
+                                    in_flight >= queue_maxsize
+                                    and not cancel_event.is_set()
+                                ):
+                                    slot_cond.wait(timeout=0.05)
+                                if cancel_event.is_set():
+                                    break
+                                in_flight += 1
+                            if not _enqueue_threadsafe((step, text, is_eos), is_token=True):
                                 break
-                    finally:
-                        close_gen = getattr(gen, "close", None)
-                        if callable(close_gen):
-                            close_gen()
-
-                    if not cancel_event.is_set():
-                        _put_with_cancel(None)
+                            if is_eos or cancel_event.is_set():
+                                break
                 except Exception as exc:
                     if not cancel_event.is_set():
-                        _put_with_cancel(exc)
+                        sent_terminal = True
+                        _enqueue_threadsafe(exc, is_token=False)
+                    else:
+                        logger.debug(
+                            "Ignoring post-cancel native worker exception: %s", exc
+                        )
+                finally:
+                    if not sent_terminal:
+                        _enqueue_threadsafe(None, is_token=False)
 
-            fut = asyncio.create_task(asyncio.to_thread(_worker))
+            fut: asyncio.Future[None] = loop.run_in_executor(None, _worker)
+
+            def _consume_future_exception(done_fut: asyncio.Future[None]) -> None:
+                if not done_fut.cancelled():
+                    done_fut.exception()
+
+            fut.add_done_callback(_consume_future_exception)
 
             try:
                 while True:
-                    item = await queue.get()
+                    if cancel_event.is_set():
+                        break
+                    if not queue.empty():
+                        item = queue.get_nowait()
+                    else:
+                        get_task: asyncio.Task[
+                            tuple[int, str, bool] | None | Exception
+                        ] = asyncio.create_task(queue.get())
+                        try:
+                            while not get_task.done():
+                                if cancel_event.is_set():
+                                    break
+                                await asyncio.wait({get_task}, timeout=0.05)
+                            if not get_task.done():
+                                get_task.cancel()
+                                try:
+                                    await get_task
+                                except asyncio.CancelledError:
+                                    pass
+                                break
+                            item = get_task.result()
+                        except BaseException:
+                            if not get_task.done():
+                                get_task.cancel()
+                                try:
+                                    await get_task
+                                except asyncio.CancelledError:
+                                    pass
+                            elif not get_task.cancelled():
+                                get_task.exception()
+                            raise
+
                     if item is None:
                         break
                     if isinstance(item, Exception):
                         raise item
+                    _release_slot()
+                    if cancel_event.is_set():
+                        break
                     yield item
             finally:
+                consumer_closed = True
                 cancel_event.set()
+                with slot_cond:
+                    slot_cond.notify_all()
                 while not queue.empty():
                     try:
                         queue.get_nowait()
@@ -868,9 +1000,17 @@ class LocalNodeRuntime:
                         break
                 if not fut.done():
                     try:
-                        await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
-                    except BaseException:
+                        await asyncio.wait_for(
+                            asyncio.shield(fut),
+                            timeout=self.native_cancel_wait_timeout_seconds,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                         pass
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
     async def stream_p2p_pipeline_tokens(
         self,
@@ -879,6 +1019,7 @@ class LocalNodeRuntime:
         compress_activations: bool = True,
         messages: list[dict[str, str]] | None = None,
         temperature: float = 0.7,
+        stop_event: threading.Event | None = None,
     ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
         """Execute distributed P2P pipeline inference and yield `(request_id, step, token_id, text, is_eos)`."""
         self.validate_pipeline_preflight()
@@ -900,6 +1041,7 @@ class LocalNodeRuntime:
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        stop_event=stop_event,
                     )
                 ) as native_stream:
                     async for step_idx, token_text, is_eos in native_stream:
@@ -1508,6 +1650,14 @@ async def verify_local_ipc_token(
         )
 
 
+async def _release_model_runner_async() -> None:
+    """Detach and release the active model runner off the asyncio event loop."""
+    runner_to_release = runtime.model_runner
+    runtime.model_runner = None
+    if runner_to_release is not None:
+        await asyncio.to_thread(runner_to_release.release)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Ensure model shards, session tokens, and P2P listeners are released on shutdown."""
@@ -1525,9 +1675,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.close()
         await runtime.stop_p2p_listener()
-        if runtime.model_runner is not None:
-            runtime.model_runner.release()
-            runtime.model_runner = None
+        await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime.state = NodeState.STOPPED
 
@@ -2439,9 +2587,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.stop_advertising()
         await runtime.stop_p2p_listener()
-        if runtime.model_runner is not None:
-            runtime.model_runner.release()
-            runtime.model_runner = None
+        await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime.state = (
             NodeState.STOPPED
@@ -2460,9 +2606,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.stop_advertising()
         await runtime.stop_p2p_listener()
-        if runtime.model_runner is not None:
-            runtime.model_runner.release()
-            runtime.model_runner = None
+        await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime.state = NodeState.ERROR
         logger.exception("Failed to start ShardAi node: %s", exc)
@@ -2520,9 +2664,7 @@ async def _stop_node_unlocked() -> NodeStatusResponse:
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.stop_advertising()
         await runtime.stop_p2p_listener()
-        if runtime.model_runner is not None:
-            runtime.model_runner.release()
-            runtime.model_runner = None
+        await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime.pending_token_queues.clear()
         runtime.active_request_steps.clear()
@@ -2646,6 +2788,8 @@ async def openai_chat_completions(
     served_model: str = request.model or runtime.model_id or "shardai-p2p-model"
 
     if request.stream:
+        stream_stop_event: threading.Event = threading.Event()
+
         async def _openai_sse_stream() -> AsyncIterator[str]:
             # Emit initial assistant role delta chunk per OpenAI streaming spec
             role_chunk = json.dumps(
@@ -2666,34 +2810,37 @@ async def openai_chat_completions(
             yield f"data: {role_chunk}\n\n"
 
             try:
-                async for _req_id, _step, _tok_id, token_text, _is_eos in (
+                async with aclosing(
                     runtime.stream_p2p_pipeline_tokens(
                         prompt=prompt_text,
                         max_tokens=max_tokens,
                         compress_activations=True,
                         messages=chat_messages,
                         temperature=temperature,
+                        stop_event=stream_stop_event,
                     )
-                ):
-                    if not token_text:
-                        continue
-                    content_chunk = json.dumps(
-                        {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": served_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": token_text},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    )
-                    yield f"data: {content_chunk}\n\n"
+                ) as token_stream:
+                    async for _req_id, _step, _tok_id, token_text, _is_eos in token_stream:
+                        if not token_text:
+                            continue
+                        content_chunk = json.dumps(
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": served_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": token_text},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                        )
+                        yield f"data: {content_chunk}\n\n"
             except asyncio.CancelledError:
+                stream_stop_event.set()
                 raise
             except HTTPException as exc:
                 logger.warning(
@@ -2731,6 +2878,8 @@ async def openai_chat_completions(
                 yield f"data: {error_chunk}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+            finally:
+                stream_stop_event.set()
 
             stop_chunk = json.dumps(
                 {
@@ -2750,7 +2899,7 @@ async def openai_chat_completions(
             yield f"data: {stop_chunk}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(
+        return _ClosableStreamingResponse(
             _openai_sse_stream(),
             media_type="text/event-stream",
             headers={
@@ -2758,12 +2907,13 @@ async def openai_chat_completions(
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
+            on_close=stream_stop_event.set,
         )
 
     # Non-streaming completion: aggregate tokens from P2P pipeline
     collected_tokens: list[str] = []
     try:
-        async for _req_id, _step, _tok_id, token_text, _is_eos in (
+        async with aclosing(
             runtime.stream_p2p_pipeline_tokens(
                 prompt=prompt_text,
                 max_tokens=max_tokens,
@@ -2771,8 +2921,9 @@ async def openai_chat_completions(
                 messages=chat_messages,
                 temperature=temperature,
             )
-        ):
-            collected_tokens.append(token_text)
+        ) as token_stream:
+            async for _req_id, _step, _tok_id, token_text, _is_eos in token_stream:
+                collected_tokens.append(token_text)
     except RuntimeError as exc:
         logger.error("Non-streaming chat completion failed: %s", exc)
         return JSONResponse(
@@ -2830,27 +2981,32 @@ async def generate_stream(
     # Validate Head Node role & downstream peer availability BEFORE committing HTTP 200 SSE
     runtime.validate_pipeline_preflight()
 
+    stream_stop_event: threading.Event = threading.Event()
+
     async def _sse_token_generator() -> AsyncIterator[str]:
         try:
-            async for req_id, step_idx, token_id, token_text, is_eos in (
+            async with aclosing(
                 runtime.stream_p2p_pipeline_tokens(
                     prompt=request.prompt,
                     max_tokens=request.max_tokens,
                     compress_activations=request.compress_activations,
                     temperature=request.temperature,
+                    stop_event=stream_stop_event,
                 )
-            ):
-                event_payload: str = json.dumps(
-                    {
-                        "request_id": req_id,
-                        "step": step_idx,
-                        "token_id": token_id,
-                        "token": token_text,
-                        "is_eos": is_eos,
-                    }
-                )
-                yield f"data: {event_payload}\n\n"
+            ) as token_stream:
+                async for req_id, step_idx, token_id, token_text, is_eos in token_stream:
+                    event_payload: str = json.dumps(
+                        {
+                            "request_id": req_id,
+                            "step": step_idx,
+                            "token_id": token_id,
+                            "token": token_text,
+                            "is_eos": is_eos,
+                        }
+                    )
+                    yield f"data: {event_payload}\n\n"
         except asyncio.CancelledError:
+            stream_stop_event.set()
             raise
         except HTTPException as exc:
             logger.warning(
@@ -2882,9 +3038,11 @@ async def generate_stream(
                 }
             )
             yield f"data: {error_payload}\n\n"
+        finally:
+            stream_stop_event.set()
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(
+    return _ClosableStreamingResponse(
         _sse_token_generator(),
         media_type="text/event-stream",
         headers={
@@ -2892,6 +3050,7 @@ async def generate_stream(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+        on_close=stream_stop_event.set,
     )
 
 
