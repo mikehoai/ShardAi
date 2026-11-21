@@ -725,3 +725,483 @@ async def test_online_start_node_binds_p2p_to_0_0_0_0_while_api_stays_loopback(
     assert runtime.p2p_server.sockets[0].getsockname()[0] == "0.0.0.0"
     assert res.api_base_url is not None
     assert res.api_base_url.startswith("http://127.0.0.1:")
+
+
+def _make_recording_tracker(
+    announce_calls: list[dict[str, Any]],
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]],
+    *,
+    announce_status: int = 200,
+    announce_json: dict[str, Any] | None = None,
+    announce_exc: Exception | None = None,
+    leave_status: int = 200,
+) -> SignalingTrackerClient:
+    """Create a MockTransport SignalingTrackerClient recording /announce and /nodes/leave."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/announce":
+            body: dict[str, Any] = json.loads(request.content.decode("utf-8"))
+            announce_calls.append(body)
+            if announce_exc is not None:
+                raise announce_exc
+            if announce_status != 200:
+                return httpx.Response(
+                    status_code=announce_status,
+                    json=announce_json
+                    or {"error": {"code": "ROOM_FULL", "message": "Room is full."}},
+                )
+            return httpx.Response(
+                status_code=200,
+                json=announce_json
+                or {
+                    "assigned_start_layer": 0,
+                    "assigned_end_layer": 31,
+                    "role": "primary",
+                    "peers": [],
+                },
+            )
+        if request.method == "POST" and request.url.path == "/nodes/leave":
+            leave_body: dict[str, Any] = json.loads(request.content.decode("utf-8"))
+            leave_calls.append((leave_body, dict(request.headers)))
+            return httpx.Response(
+                status_code=leave_status,
+                json={"ok": leave_status < 400},
+            )
+        if request.method == "GET" and request.url.path == "/rooms":
+            return httpx.Response(status_code=200, json={"rooms": []})
+        if request.method == "GET" and request.url.path.startswith("/peers/"):
+            return httpx.Response(status_code=200, json={"peers": []})
+        return httpx.Response(status_code=404)
+
+    return _make_mock_tracker(_handler, max_retries=1)
+
+
+@pytest.mark.asyncio
+async def test_post_announce_download_exception_unregisters_zombie_node_with_private_key_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #27: Post-announce download failure must immediately call POST /nodes/leave."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        runtime.model_downloader,
+        "ensure_model_downloaded",
+        AsyncMock(side_effect=RuntimeError("download checksum mismatch")),
+    )
+
+    announce_calls: list[dict[str, Any]] = []
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(announce_calls, leave_calls)
+
+    secret_room_key = "my-private-room-secret"
+    expected_key_hash = hash_room_key(secret_room_key)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_node(
+            StartNodeRequest(
+                node_id="zombie-download-node",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="private-zombie-room",
+                room_key=secret_room_key,
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49480,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "download checksum mismatch" in str(exc_info.value.detail)
+    assert len(announce_calls) == 1
+    assert len(leave_calls) == 1
+
+    leave_payload, leave_headers = leave_calls[0]
+    assert leave_payload["node_id"] == "zombie-download-node"
+    assert leave_payload["room_id"] == "private-zombie-room"
+    assert leave_payload["model"] == "meta-llama/Llama-3.1-8B-Instruct"
+    assert leave_payload["room_key_hash"] == expected_key_hash
+    assert leave_headers.get("x-room-key-hash") == expected_key_hash
+    assert "room_key" not in leave_payload
+    assert secret_room_key not in caplog.text
+
+    assert runtime.state == NodeState.ERROR
+    assert runtime.node_id is None
+    assert runtime.room_id is None
+    assert runtime.room_key_hash is None
+    assert runtime.p2p_server is None
+    assert runtime.memory_manager.allocated_ram_mb == 0
+    assert runtime.memory_manager.allocated_vram_mb == 0
+
+    # Subsequent /stop-node after failed start must NOT issue a duplicate POST /nodes/leave
+    stop_res = await stop_node()
+    assert stop_res.state == NodeState.STOPPED
+    assert len(leave_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_post_announce_http_exception_unregisters_zombie_node(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #27: Post-announce HTTPException must still unregister the announced node."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        runtime.model_downloader,
+        "ensure_model_downloaded",
+        AsyncMock(
+            side_effect=HTTPException(status_code=502, detail="mirror failed")
+        ),
+    )
+
+    announce_calls: list[dict[str, Any]] = []
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(announce_calls, leave_calls)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_node(
+            StartNodeRequest(
+                node_id="zombie-http-node",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="http-fail-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49481,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "mirror failed"
+    assert len(announce_calls) == 1
+    assert len(leave_calls) == 1
+    assert leave_calls[0][0]["node_id"] == "zombie-http-node"
+    assert runtime.state == NodeState.ERROR
+    assert runtime.node_id is None
+    assert runtime.p2p_server is None
+    assert runtime.memory_manager.allocated_ram_mb == 0
+
+
+@pytest.mark.asyncio
+async def test_post_announce_shard_runner_oom_unregisters_normalized_node_id_and_releases_ram(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #27: ShardModelRunner OOM unregisters exact normalized node_id and frees RAM."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+
+    def _oom_runner(*args: Any, **kwargs: Any) -> ShardModelRunner:
+        raise MemoryError("simulated OOM during model init")
+
+    monkeypatch.setattr(main_module, "ShardModelRunner", _oom_runner)
+
+    announce_calls: list[dict[str, Any]] = []
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(announce_calls, leave_calls)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_node(
+            StartNodeRequest(
+                node_id="shardai-client-01",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="oom-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49482,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "simulated OOM during model init" in str(exc_info.value.detail)
+    assert len(announce_calls) >= 1
+    announced_id = announce_calls[0]["node_id"]
+    assert announced_id != "shardai-client-01"
+    assert announced_id.startswith("shardai-client-01-")
+    assert all(call["node_id"] == announced_id for call in announce_calls)
+
+    assert len(leave_calls) == 1
+    assert leave_calls[0][0]["node_id"] == announced_id
+    assert leave_calls[0][0]["room_id"] == "oom-room"
+    assert runtime.memory_manager.allocated_ram_mb == 0
+    assert runtime.memory_manager.allocated_vram_mb == 0
+    assert runtime.model_runner is None
+    assert runtime.p2p_server is None
+    assert runtime.state == NodeState.ERROR
+
+
+@pytest.mark.asyncio
+async def test_post_announce_mdns_failure_unregisters_zombie_node_and_releases_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #27: Post-runner mDNS failure unregisters node and releases ShardModelRunner."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+
+    release_calls = 0
+    original_release = ShardModelRunner.release
+
+    def _spy_release(self: ShardModelRunner) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(self)
+
+    monkeypatch.setattr(ShardModelRunner, "release", _spy_release)
+    monkeypatch.setattr(
+        main_module.lan_mdns_service,
+        "start_advertising",
+        AsyncMock(side_effect=OSError("UDP multicast error")),
+    )
+
+    announce_calls: list[dict[str, Any]] = []
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(announce_calls, leave_calls)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_node(
+            StartNodeRequest(
+                node_id="zombie-mdns-node",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="mdns-fail-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49483,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert len(announce_calls) >= 1
+    assert len(leave_calls) == 1
+    assert leave_calls[0][0]["node_id"] == "zombie-mdns-node"
+    assert release_calls == 1
+    assert runtime.model_runner is None
+    assert runtime.memory_manager.allocated_ram_mb == 0
+    assert runtime.p2p_server is None
+    assert runtime.state == NodeState.ERROR
+
+
+@pytest.mark.asyncio
+async def test_rollback_unregister_failure_preserves_original_error_and_local_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #27: Rollback /nodes/leave failure must not mask original error or leak resources."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        runtime.model_downloader,
+        "ensure_model_downloaded",
+        AsyncMock(side_effect=RuntimeError("corrupted model weights")),
+    )
+
+    announce_calls: list[dict[str, Any]] = []
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(
+        announce_calls,
+        leave_calls,
+        leave_status=503,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await start_node(
+            StartNodeRequest(
+                node_id="rollback-leave-fail-node",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="leave-fail-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49484,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "corrupted model weights" in str(exc_info.value.detail)
+    assert len(announce_calls) == 1
+    assert len(leave_calls) == 1
+    assert "Failed to unregister node 'rollback-leave-fail-node'" in caplog.text
+    assert runtime.p2p_server is None
+    assert runtime.memory_manager.allocated_ram_mb == 0
+    assert runtime.node_id is None
+    assert runtime.state == NodeState.ERROR
+    assert not runtime.get_lifecycle_lock().locked()
+
+
+@pytest.mark.asyncio
+async def test_pre_announce_rejection_and_offline_fallback_do_not_call_unregister(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #27: Pre-announce rejections, fallback modes, and LAN failures never call /nodes/leave."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+
+    # Subcase A: 409 Conflict during POST /announce
+    announce_a: list[dict[str, Any]] = []
+    leave_a: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(
+        announce_a, leave_a, announce_status=409
+    )
+    with pytest.raises(HTTPException) as exc_a:
+        await start_node(
+            StartNodeRequest(
+                node_id="pre-announce-409",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="full-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49485,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+    assert exc_a.value.status_code == 409
+    assert len(leave_a) == 0
+    assert runtime.state == NodeState.STOPPED
+
+    # Subcase B: Tracker timeout -> OFFLINE_SOLO fallback, followed by download failure
+    announce_b: list[dict[str, Any]] = []
+    leave_b: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(
+        announce_b,
+        leave_b,
+        announce_exc=httpx.ConnectTimeout("Tracker timed out"),
+    )
+    monkeypatch.setattr(
+        runtime.model_downloader,
+        "ensure_model_downloaded",
+        AsyncMock(side_effect=RuntimeError("offline disk error")),
+    )
+    with pytest.raises(HTTPException) as exc_b:
+        await start_node(
+            StartNodeRequest(
+                node_id="fallback-offline-fail",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="solo-fallback-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49486,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+    assert exc_b.value.status_code == 500
+    assert len(leave_b) == 0
+    assert runtime.state == NodeState.ERROR
+
+    # Subcase C: LAN mode download failure -> never calls /nodes/leave
+    announce_c: list[dict[str, Any]] = []
+    leave_c: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(announce_c, leave_c)
+    with pytest.raises(HTTPException) as exc_c:
+        await start_node(
+            StartNodeRequest(
+                node_id="lan-fail-node",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.LAN,
+                room_id="lan-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49487,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+    assert exc_c.value.status_code == 500
+    assert len(announce_c) == 0
+    assert len(leave_c) == 0
+    assert runtime.state == NodeState.ERROR
+
+
+@pytest.mark.asyncio
+async def test_post_announce_task_cancellation_unregisters_zombie_node(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #27: Cancelling startup post-announce must unregister node and transition to STOPPED."""
+    _enable_tracker(monkeypatch)
+    _stub_fast_local_env(monkeypatch, tmp_path)
+
+    download_entered = asyncio.Event()
+    never_set = asyncio.Event()
+
+    async def _blocking_download(*_args: Any, **_kwargs: Any) -> Path:
+        download_entered.set()
+        await never_set.wait()
+        return tmp_path / "unreachable.gguf"
+
+    monkeypatch.setattr(
+        runtime.model_downloader,
+        "ensure_model_downloaded",
+        _blocking_download,
+    )
+
+    announce_calls: list[dict[str, Any]] = []
+    leave_calls: list[tuple[dict[str, Any], dict[str, str]]] = []
+    runtime.tracker_client = _make_recording_tracker(announce_calls, leave_calls)
+
+    start_task = asyncio.create_task(
+        start_node(
+            StartNodeRequest(
+                node_id="cancel-zombie-node",
+                model_id="meta-llama/Llama-3.1-8B-Instruct",
+                network_mode=NetworkMode.INTERNET,
+                room_id="cancel-room",
+                ram_gb=8,
+                shared_ram_gb=8,
+                max_ram_mb=8192,
+                p2p_listen_port=49488,
+                shard_layer_start=0,
+                shard_layer_end=31,
+                total_layers=32,
+            )
+        )
+    )
+    await asyncio.wait_for(download_entered.wait(), timeout=5.0)
+    start_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert len(announce_calls) == 1
+    assert len(leave_calls) == 1
+    assert leave_calls[0][0]["node_id"] == "cancel-zombie-node"
+    assert leave_calls[0][0]["room_id"] == "cancel-room"
+    assert runtime.state == NodeState.STOPPED
+    assert runtime.p2p_server is None
+    assert runtime.node_id is None
+    assert not runtime.get_lifecycle_lock().locked()
