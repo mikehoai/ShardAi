@@ -2159,6 +2159,57 @@ async def start_node(
         return await _start_node_unlocked(request)
 
 
+async def _release_runtime_resources(target_state: NodeState) -> None:
+    """Release all local runtime resources, listeners, and metadata cleanly."""
+    runtime.session_token = None
+    runtime.is_swarm_ready = False
+    runtime.coverage_percent = 0.0
+    runtime._active_start_request = None
+    runtime._active_max_layers_can_hold = 0
+    runtime._last_heartbeat_at = 0.0
+    try:
+        for cleanup_step in (
+            runtime.stop_coverage_monitor,
+            lan_mdns_service.stop_advertising,
+            zeroconf_discovery.stop_advertising,
+            runtime.stop_p2p_listener,
+        ):
+            try:
+                await cleanup_step()
+            except Exception as cleanup_exc:
+                logger.debug(
+                    "Runtime cleanup step %s failed: %s",
+                    cleanup_step.__name__,
+                    cleanup_exc,
+                )
+    finally:
+        await _release_model_runner_async()
+        runtime.memory_manager.release_all()
+        runtime.pending_token_queues.clear()
+        runtime.active_request_steps.clear()
+        runtime._evicted_peers.clear()
+        runtime._promoted_peer_ids.clear()
+        runtime.peers = []
+        runtime.node_id = None
+        runtime.model_id = None
+        runtime.model_path = None
+        runtime.network_mode = None
+        runtime.room_id = None
+        runtime.room_key_hash = None
+        runtime.network_status = None
+        runtime.use_mmap = False
+        runtime.ssd_offload_active = False
+        runtime.source_type = None
+        runtime.model_fingerprint = None
+        runtime.is_private = False
+        runtime.is_unlisted = False
+        runtime.role = PeerRole.PRIMARY
+        runtime.backend = None
+        runtime.p2p_listen_port = None
+        runtime.n_layers = 0
+        runtime.state = target_state
+
+
 async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
     """Execute node startup while caller holds `runtime.get_lifecycle_lock()`."""
     if runtime.state != NodeState.STOPPED:
@@ -2169,6 +2220,29 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
     request.max_ram_mb = effective_ram_gb * 1024
 
     runtime.state = NodeState.STARTING
+    announced_to_tracker: bool = False
+    announced_room_key_hash: str | None = hash_room_key(request.room_key)
+
+    async def _rollback_failed_start(target_state: NodeState) -> None:
+        """Deregister an announced node (if any) and release all local startup resources."""
+        try:
+            if announced_to_tracker and _is_tracker_enabled():
+                try:
+                    await runtime.tracker_client.unregister_node(
+                        request.node_id,
+                        room_id=request.room_id,
+                        model_id=request.model_id,
+                        room_key_hash=announced_room_key_hash,
+                    )
+                except Exception as unreg_exc:
+                    logger.warning(
+                        "Failed to unregister node '%s' from signaling tracker during startup rollback: %s",
+                        request.node_id,
+                        unreg_exc,
+                    )
+        finally:
+            await _release_runtime_resources(target_state)
+
     try:
         # 1. Inspect existing local model metadata (GGUF header / config.json) & compute
         #    initial `model_fingerprint` (SHA-256 of first 10MB + total size) when cached/local.
@@ -2302,6 +2376,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                     )
                 )
                 cloud_online = True
+                announced_to_tracker = True
                 last_announce_monotonic = time.monotonic()
                 discovered_peers = [
                     peer for peer in assignment.peers if peer.peer_id != request.node_id
@@ -2510,7 +2585,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             else request.backend
         )
 
-        room_key_hash: str | None = hash_room_key(request.room_key)
+        room_key_hash: str | None = announced_room_key_hash
         is_private_room: bool = room_key_hash is not None
 
         # 7. Advertise on LAN (UDP beacon always; zeroconf DNS-SD broadcast in OFFLINE_MODE or
@@ -2593,39 +2668,19 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                 f"[{effective_backend.value}{offload_note}]."
             )
         )
+    except asyncio.CancelledError:
+        await _rollback_failed_start(NodeState.STOPPED)
+        raise
     except HTTPException as http_err:
-        runtime.session_token = None
-        runtime.is_swarm_ready = False
-        runtime.coverage_percent = 0.0
-        runtime._active_start_request = None
-        runtime._active_max_layers_can_hold = 0
-        runtime._last_heartbeat_at = 0.0
-        await runtime.stop_coverage_monitor()
-        await lan_mdns_service.stop_advertising()
-        await zeroconf_discovery.stop_advertising()
-        await runtime.stop_p2p_listener()
-        await _release_model_runner_async()
-        runtime.memory_manager.release_all()
-        runtime.state = (
+        target_state = (
             NodeState.STOPPED
             if http_err.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_409_CONFLICT)
             else NodeState.ERROR
         )
+        await _rollback_failed_start(target_state)
         raise
     except Exception as exc:
-        runtime.session_token = None
-        runtime.is_swarm_ready = False
-        runtime.coverage_percent = 0.0
-        runtime._active_start_request = None
-        runtime._active_max_layers_can_hold = 0
-        runtime._last_heartbeat_at = 0.0
-        await runtime.stop_coverage_monitor()
-        await lan_mdns_service.stop_advertising()
-        await zeroconf_discovery.stop_advertising()
-        await runtime.stop_p2p_listener()
-        await _release_model_runner_async()
-        runtime.memory_manager.release_all()
-        runtime.state = NodeState.ERROR
+        await _rollback_failed_start(NodeState.ERROR)
         logger.exception("Failed to start ShardAi node: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2671,41 +2726,7 @@ async def _stop_node_unlocked() -> NodeStatusResponse:
     except Exception as exc:
         logger.warning("Could not unregister node from signaling tracker: %s", exc)
     finally:
-        runtime.session_token = None
-        runtime.is_swarm_ready = False
-        runtime.coverage_percent = 0.0
-        runtime._active_start_request = None
-        runtime._active_max_layers_can_hold = 0
-        runtime._last_heartbeat_at = 0.0
-        await runtime.stop_coverage_monitor()
-        await lan_mdns_service.stop_advertising()
-        await zeroconf_discovery.stop_advertising()
-        await runtime.stop_p2p_listener()
-        await _release_model_runner_async()
-        runtime.memory_manager.release_all()
-        runtime.pending_token_queues.clear()
-        runtime.active_request_steps.clear()
-        runtime._evicted_peers.clear()
-        runtime._promoted_peer_ids.clear()
-        runtime.peers = []
-        runtime.node_id = None
-        runtime.model_id = None
-        runtime.model_path = None
-        runtime.network_mode = None
-        runtime.room_id = None
-        runtime.room_key_hash = None
-        runtime.network_status = None
-        runtime.use_mmap = False
-        runtime.ssd_offload_active = False
-        runtime.source_type = None
-        runtime.model_fingerprint = None
-        runtime.is_private = False
-        runtime.is_unlisted = False
-        runtime.role = PeerRole.PRIMARY
-        runtime.backend = None
-        runtime.p2p_listen_port = None
-        runtime.n_layers = 0
-        runtime.state = NodeState.STOPPED
+        await _release_runtime_resources(NodeState.STOPPED)
 
     return runtime.to_status_response(
         message="Node stopped, session token revoked, and all RAM/VRAM shards released."
