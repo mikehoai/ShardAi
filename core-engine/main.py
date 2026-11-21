@@ -242,6 +242,9 @@ def _heartbeat_interval_seconds() -> float:
         return 25.0
 
 
+_MAX_FAILOVER_TRACKED_PEERS: int = 256
+
+
 class LocalNodeRuntime:
     """Encapsulates runtime state, session auth, P2P listener, and model shard pipeline."""
 
@@ -286,6 +289,9 @@ class LocalNodeRuntime:
         self.active_request_steps: dict[str, int] = {}
         self.single_peer_token_timeout_seconds: float = 60.0
         self.failover_token_timeout_seconds: float = 10.0
+        self.failed_peer_cooldown_seconds: float = 60.0
+        self._evicted_peers: dict[str, tuple[float, str, int]] = {}
+        self._promoted_peer_ids: dict[str, float] = {}
         self._compute_lock: asyncio.Lock = asyncio.Lock()
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
@@ -339,6 +345,110 @@ class LocalNodeRuntime:
         candidates = self.find_candidate_peers_for_next_layer(completed_layer)
         return candidates[0] if candidates else None
 
+    def _prune_failover_state(self, now: float | None = None) -> None:
+        """Expire old failover quarantine/promotion entries and enforce bounded map size."""
+        current_time: float = time.monotonic() if now is None else now
+        expired_evicted = [
+            peer_id
+            for peer_id, (expires_at, _ip, _port) in self._evicted_peers.items()
+            if current_time >= expires_at
+        ]
+        for peer_id in expired_evicted:
+            self._evicted_peers.pop(peer_id, None)
+
+        expired_promoted = [
+            peer_id
+            for peer_id, expires_at in self._promoted_peer_ids.items()
+            if current_time >= expires_at
+        ]
+        for peer_id in expired_promoted:
+            self._promoted_peer_ids.pop(peer_id, None)
+
+        while len(self._evicted_peers) > _MAX_FAILOVER_TRACKED_PEERS:
+            oldest_evicted = next(iter(self._evicted_peers))
+            self._evicted_peers.pop(oldest_evicted, None)
+
+        while len(self._promoted_peer_ids) > _MAX_FAILOVER_TRACKED_PEERS:
+            oldest_promoted = next(iter(self._promoted_peer_ids))
+            self._promoted_peer_ids.pop(oldest_promoted, None)
+
+    def _apply_peer_failover_overrides(
+        self, peers: list[PeerNodeInfo]
+    ) -> list[PeerNodeInfo]:
+        """Filter quarantined dead endpoints and preserve promoted backup roles during cooldown."""
+        self._prune_failover_state()
+        filtered: list[PeerNodeInfo] = []
+        for peer in peers:
+            evicted = self._evicted_peers.get(peer.peer_id)
+            if evicted is not None:
+                _expires_at, evicted_ip, evicted_port = evicted
+                if (peer.ip_address, peer.port) == (evicted_ip, evicted_port):
+                    continue
+                self._evicted_peers.pop(peer.peer_id, None)
+
+            if peer.peer_id in self._promoted_peer_ids and peer.role != PeerRole.PRIMARY:
+                filtered.append(peer.model_copy(update={"role": PeerRole.PRIMARY}))
+            else:
+                filtered.append(peer)
+        return filtered
+
+    def _promote_failover_peer(
+        self,
+        promoted_peer: PeerNodeInfo,
+        failed_peers: list[PeerNodeInfo],
+    ) -> PeerNodeInfo:
+        """Evict failed primary/intermediate peers and promote the responsive backup peer."""
+        now: float = time.monotonic()
+        self._prune_failover_state(now=now)
+
+        cooldown: float = max(0.0, self.failed_peer_cooldown_seconds)
+        expires_at: float = now + cooldown
+        failed_ids: set[str] = {
+            peer.peer_id
+            for peer in failed_peers
+            if peer.peer_id != promoted_peer.peer_id
+        }
+
+        for failed_peer in failed_peers:
+            if failed_peer.peer_id == promoted_peer.peer_id:
+                continue
+            if cooldown > 0.0:
+                self._evicted_peers[failed_peer.peer_id] = (
+                    expires_at,
+                    failed_peer.ip_address,
+                    failed_peer.port,
+                )
+            self._promoted_peer_ids.pop(failed_peer.peer_id, None)
+
+        self._evicted_peers.pop(promoted_peer.peer_id, None)
+        if cooldown > 0.0:
+            self._promoted_peer_ids[promoted_peer.peer_id] = expires_at
+        self._prune_failover_state(now=now)
+
+        promoted_entry: PeerNodeInfo = (
+            promoted_peer
+            if promoted_peer.role == PeerRole.PRIMARY
+            else promoted_peer.model_copy(update={"role": PeerRole.PRIMARY})
+        )
+
+        updated_peers: list[PeerNodeInfo] = []
+        promoted_present: bool = False
+        for peer in self.peers:
+            if peer.peer_id in failed_ids:
+                continue
+            if peer.peer_id == promoted_peer.peer_id:
+                updated_peers.append(promoted_entry)
+                promoted_present = True
+            else:
+                updated_peers.append(peer)
+
+        if not promoted_present:
+            updated_peers.append(promoted_entry)
+
+        self.peers = updated_peers
+        self.recompute_local_coverage()
+        return promoted_entry
+
     async def send_with_failover(
         self,
         completed_layer: int,
@@ -354,6 +464,7 @@ class LocalNodeRuntime:
             )
 
         last_exc: Exception | None = None
+        failed_candidates: list[PeerNodeInfo] = []
         for idx, candidate in enumerate(candidates):
             try:
                 await send_activations(
@@ -364,18 +475,26 @@ class LocalNodeRuntime:
                     ack_timeout_seconds=ack_timeout_seconds,
                 )
                 if idx > 0:
-                    logger.info(
-                        "Failover succeeded: routed layer %d..%d activation to %s peer %s (%s:%d)",
-                        candidate.shard_layer_start,
-                        candidate.shard_layer_end,
-                        candidate.role.value,
-                        candidate.peer_id,
-                        candidate.ip_address,
-                        candidate.port,
+                    promoted = self._promote_failover_peer(
+                        promoted_peer=candidate,
+                        failed_peers=failed_candidates,
                     )
+                    logger.info(
+                        "Failover succeeded: routed layer %d..%d activation to %s peer %s (%s:%d); "
+                        "promoted to primary and evicted %d failed peer(s)",
+                        promoted.shard_layer_start,
+                        promoted.shard_layer_end,
+                        candidate.role.value,
+                        promoted.peer_id,
+                        promoted.ip_address,
+                        promoted.port,
+                        len(failed_candidates),
+                    )
+                    return promoted
                 return candidate
             except (TimeoutError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
                 last_exc = exc
+                failed_candidates.append(candidate)
                 logger.warning(
                     "Downstream %s peer %s (%s:%d) failed (%s); failing over to next backup peer...",
                     candidate.role.value,
@@ -720,6 +839,7 @@ class LocalNodeRuntime:
                     )
                     decoded_frame: DecodedTokenFrame | None = None
                     last_step_err: Exception | None = None
+                    failed_candidates: list[PeerNodeInfo] = []
                     step_timeout: float = (
                         self.single_peer_token_timeout_seconds
                         if len(candidates) == 1
@@ -765,12 +885,18 @@ class LocalNodeRuntime:
                                 timeout_seconds=step_timeout,
                             )
                             if idx > 0:
+                                promoted = self._promote_failover_peer(
+                                    promoted_peer=candidate,
+                                    failed_peers=failed_candidates,
+                                )
                                 logger.info(
-                                    "Pipeline failover succeeded via %s peer %s (%s:%d)",
+                                    "Pipeline failover succeeded via %s peer %s (%s:%d); "
+                                    "promoted to primary and evicted %d failed peer(s)",
                                     candidate.role.value,
-                                    candidate.peer_id,
-                                    candidate.ip_address,
-                                    candidate.port,
+                                    promoted.peer_id,
+                                    promoted.ip_address,
+                                    promoted.port,
+                                    len(failed_candidates),
                                 )
                             break
                         except (
@@ -780,6 +906,7 @@ class LocalNodeRuntime:
                             RuntimeError,
                         ) as step_exc:
                             last_step_err = step_exc
+                            failed_candidates.append(candidate)
                             logger.warning(
                                 "Peer %s (%s) dropped/timed out at step %d (%s); attempting backup failover...",
                                 candidate.peer_id,
@@ -989,9 +1116,9 @@ class LocalNodeRuntime:
             self._last_heartbeat_at = time.monotonic()
             self.last_tracker_reachable = True
             if assignment.peers:
-                self.peers = [
-                    p for p in assignment.peers if p.peer_id != self.node_id
-                ]
+                self.peers = self._apply_peer_failover_overrides(
+                    [p for p in assignment.peers if p.peer_id != self.node_id]
+                )
             return True
         except Exception as exc:
             logger.warning("Background tracker heartbeat re-announce failed: %s", exc)
@@ -1027,9 +1154,9 @@ class LocalNodeRuntime:
                     if self.state != NodeState.RUNNING:
                         return
                     if refreshed_peers:
-                        self.peers = [
-                            p for p in refreshed_peers if p.peer_id != self.node_id
-                        ]
+                        self.peers = self._apply_peer_failover_overrides(
+                            [p for p in refreshed_peers if p.peer_id != self.node_id]
+                        )
                 self.last_tracker_reachable = True
             except Exception as exc:
                 logger.debug("Background coverage poll skipped Cloud Tracker: %s", exc)
@@ -1049,18 +1176,25 @@ class LocalNodeRuntime:
                 self_node_id=self.node_id,
                 total_layers=self.total_layers,
             )
+            effective_lan_peers = self._apply_peer_failover_overrides(lan_peers)
             if is_online:
                 known_ids = {p.peer_id for p in self.peers}
-                self.peers.extend(p for p in lan_peers if p.peer_id not in known_ids)
+                self.peers.extend(
+                    p for p in effective_lan_peers if p.peer_id not in known_ids
+                )
             else:
-                self.peers = lan_peers
-                new_status = NetworkStatus.LAN_ONLY if lan_peers else NetworkStatus.OFFLINE_SOLO
+                self.peers = effective_lan_peers
+                new_status = (
+                    NetworkStatus.LAN_ONLY
+                    if effective_lan_peers
+                    else NetworkStatus.OFFLINE_SOLO
+                )
                 if new_status != self.network_status:
                     logger.info(
                         "Network status changed: %s -> %s (%d LAN peers)",
                         self.network_status,
                         new_status,
-                        len(lan_peers),
+                        len(effective_lan_peers),
                     )
                     self.network_status = new_status
         except Exception as exc:
@@ -2031,6 +2165,8 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.shard_layer_start = final_start
         runtime.shard_layer_end = final_end
         runtime.total_layers = final_total_layers
+        runtime._evicted_peers.clear()
+        runtime._promoted_peer_ids.clear()
         runtime.peers = discovered_peers
         runtime._active_start_request = request.model_copy(update={"room_key": None})
         runtime._active_max_layers_can_hold = max_layers_can_hold
@@ -2153,6 +2289,8 @@ async def _stop_node_unlocked() -> NodeStatusResponse:
         runtime.memory_manager.release_all()
         runtime.pending_token_queues.clear()
         runtime.active_request_steps.clear()
+        runtime._evicted_peers.clear()
+        runtime._promoted_peer_ids.clear()
         runtime.peers = []
         runtime.node_id = None
         runtime.model_id = None
@@ -2187,6 +2325,7 @@ async def list_peers() -> list[PeerNodeInfo]:
 @app.post("/peers/register", response_model=list[PeerNodeInfo])
 async def register_peer(peer: PeerNodeInfo) -> list[PeerNodeInfo]:
     """Register or update a direct P2P peer in the local routing table."""
+    runtime._evicted_peers.pop(peer.peer_id, None)
     runtime.peers = [p for p in runtime.peers if p.peer_id != peer.peer_id]
     runtime.peers.append(peer)
     runtime.peers.sort(key=lambda p: p.shard_layer_start)

@@ -17,12 +17,14 @@ os.environ.setdefault("SHARDAI_OFFLINE_MODE", "true")
 
 import pytest
 
+import main as main_module
 from main import LocalNodeRuntime
 from models.shard_runner import ShardModelRunner
 from p2p.serializer import (
     MAGIC_HEADER,
     ActivationFrame,
     DecodedTokenFrame,
+    deserialize_activation_tensor,
     serialize_activation_tensor,
     serialize_decoded_token,
 )
@@ -33,7 +35,15 @@ from p2p.transport import (
     receive_activations,
     send_activations,
 )
-from shard_engine.schemas import NodeState, PeerNodeInfo, PeerRole
+from shard_engine.schemas import (
+    NetworkStatus,
+    NodeState,
+    PeerNodeInfo,
+    PeerRole,
+    RoomLobbyItem,
+    StartNodeRequest,
+)
+from shard_engine.tracker_client import AnnounceAssignment
 
 
 def _get_bound_port(server: asyncio.AbstractServer) -> int:
@@ -658,3 +668,586 @@ async def test_drain_discards_late_step0_token_arriving_before_backup_retry() ->
     )
     assert discarded_failover == 1
     assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_failover_evicts_dead_primary_and_promotes_backup_without_repeat_timeouts() -> None:
+    """Issue #28: After Primary fails at step 2, Backup is promoted to PRIMARY and Primary is
+    evicted so steps 3..7 route directly to Backup with zero repeated timeout penalties.
+    """
+    head_node = LocalNodeRuntime()
+    head_node.state = NodeState.RUNNING
+    head_node.shard_layer_start = 0
+    head_node.shard_layer_end = 15
+    head_node.total_layers = 32
+    head_node.failover_token_timeout_seconds = 0.25
+    head_node.model_runner = ShardModelRunner(
+        shard_layer_start=0, shard_layer_end=15, total_layers=32
+    )
+    await head_node.start_p2p_listener(port=0)
+
+    primary_attempts: int = 0
+    backup_attempts: int = 0
+
+    async def _primary_stalls_at_step2(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal primary_attempts
+        try:
+            len_bytes = await reader.readexactly(FRAME_LEN_STRUCT.size)
+            (frame_len,) = FRAME_LEN_STRUCT.unpack(len_bytes)
+            raw_frame = await reader.readexactly(frame_len)
+            frame = deserialize_activation_tensor(raw_frame)
+            primary_attempts += 1
+
+            writer.write(ACK_BYTE)
+            await writer.drain()
+
+            if frame.step_index < 2:
+                token_packet = serialize_decoded_token(
+                    request_id=frame.request_id,
+                    step_index=frame.step_index,
+                    token_id=10 + frame.step_index,
+                    token_text=f"PRIMARY_STEP_{frame.step_index}",
+                    is_eos=False,
+                )
+                await send_activations(
+                    peer_ip=frame.origin_ip,
+                    byte_stream=token_packet,
+                    peer_port=frame.origin_port,
+                    timeout_seconds=2.0,
+                )
+            # For step_index >= 2: stall (never deliver decoded token)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _backup_on_activation(frame: ActivationFrame) -> None:
+        nonlocal backup_attempts
+        backup_attempts += 1
+        token_packet = serialize_decoded_token(
+            request_id=frame.request_id,
+            step_index=frame.step_index,
+            token_id=200 + frame.step_index,
+            token_text=f"BACKUP_STEP_{frame.step_index}",
+            is_eos=False,
+        )
+        await send_activations(
+            peer_ip=frame.origin_ip,
+            byte_stream=token_packet,
+            peer_port=frame.origin_port,
+            timeout_seconds=2.0,
+        )
+
+    primary_server = await asyncio.start_server(
+        _primary_stalls_at_step2, host="127.0.0.1", port=0
+    )
+    primary_port = _get_bound_port(primary_server)
+
+    backup_server = await receive_activations(
+        host="127.0.0.1",
+        port=0,
+        on_activation_frame=_backup_on_activation,
+    )
+    backup_port = _get_bound_port(backup_server)
+
+    head_node.peers = [
+        PeerNodeInfo(
+            peer_id="dead-primary-tail",
+            ip_address="127.0.0.1",
+            port=primary_port,
+            shard_layer_start=16,
+            shard_layer_end=31,
+            role=PeerRole.PRIMARY,
+        ),
+        PeerNodeInfo(
+            peer_id="backup-tail",
+            ip_address="127.0.0.1",
+            port=backup_port,
+            shard_layer_start=16,
+            shard_layer_end=31,
+            role=PeerRole.BACKUP,
+        ),
+    ]
+
+    try:
+        start_time = time.monotonic()
+        tokens: list[tuple[int, int, str]] = []
+        async for _req_id, step_idx, tok_id, tok_text, _is_eos in head_node.stream_p2p_pipeline_tokens(
+            prompt="Test persistent failover promotion",
+            max_tokens=8,
+        ):
+            tokens.append((step_idx, tok_id, tok_text))
+        elapsed = time.monotonic() - start_time
+
+        assert tokens == [
+            (0, 10, "PRIMARY_STEP_0"),
+            (1, 11, "PRIMARY_STEP_1"),
+            (2, 202, "BACKUP_STEP_2"),
+            (3, 203, "BACKUP_STEP_3"),
+            (4, 204, "BACKUP_STEP_4"),
+            (5, 205, "BACKUP_STEP_5"),
+            (6, 206, "BACKUP_STEP_6"),
+            (7, 207, "BACKUP_STEP_7"),
+        ]
+        # Steps 0, 1 succeeded + ONE failed attempt on step 2 -> ZERO attempts on steps 3..7
+        assert primary_attempts == 3
+        assert backup_attempts == 6
+        assert elapsed < 1.5, f"Expected single failover penalty (<1.5s), took {elapsed:.2f}s"
+
+        assert [p.peer_id for p in head_node.peers] == ["backup-tail"]
+        assert head_node.peers[0].role == PeerRole.PRIMARY
+        next_hop = head_node.find_next_hop_peer(15)
+        assert next_hop is not None
+        assert next_hop.peer_id == "backup-tail"
+        assert next_hop.role == PeerRole.PRIMARY
+        assert head_node.is_swarm_ready is True
+    finally:
+        primary_server.close()
+        backup_server.close()
+        await primary_server.wait_closed()
+        await backup_server.wait_closed()
+        await head_node.stop_p2p_listener()
+
+
+@pytest.mark.asyncio
+async def test_send_with_failover_promotes_backup_and_evicts_failed_primary_on_middle_node() -> None:
+    """Issue #28: Middle-node `send_with_failover` must evict the failed primary and promote
+    the healthy backup so subsequent hops route directly without retrying the dead peer.
+    """
+    middle = LocalNodeRuntime()
+    middle.state = NodeState.RUNNING
+    middle.shard_layer_start = 16
+    middle.shard_layer_end = 23
+    middle.total_layers = 32
+
+    dead_attempts: int = 0
+    backup_attempts: int = 0
+
+    async def _dead_nack_server(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal dead_attempts
+        try:
+            len_bytes = await reader.readexactly(FRAME_LEN_STRUCT.size)
+            (frame_len,) = FRAME_LEN_STRUCT.unpack(len_bytes)
+            await reader.readexactly(frame_len)
+            dead_attempts += 1
+            writer.write(NACK_BYTE)
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _healthy_backup(_frame: ActivationFrame) -> None:
+        nonlocal backup_attempts
+        backup_attempts += 1
+
+    dead_server = await asyncio.start_server(_dead_nack_server, host="127.0.0.1", port=0)
+    dead_port = _get_bound_port(dead_server)
+
+    backup_server = await receive_activations(
+        host="127.0.0.1",
+        port=0,
+        on_activation_frame=_healthy_backup,
+    )
+    backup_port = _get_bound_port(backup_server)
+
+    middle.peers = [
+        PeerNodeInfo(
+            peer_id="dead-primary-tail",
+            ip_address="127.0.0.1",
+            port=dead_port,
+            shard_layer_start=24,
+            shard_layer_end=31,
+            role=PeerRole.PRIMARY,
+        ),
+        PeerNodeInfo(
+            peer_id="healthy-backup-tail",
+            ip_address="127.0.0.1",
+            port=backup_port,
+            shard_layer_start=24,
+            shard_layer_end=31,
+            role=PeerRole.BACKUP,
+        ),
+    ]
+
+    try:
+        frame = _make_valid_activation_frame(current_layer=23, total_layers=32)
+
+        first = await middle.send_with_failover(
+            completed_layer=23,
+            frame_bytes=frame,
+            timeout_seconds=1.0,
+            ack_timeout_seconds=1.0,
+        )
+        assert first.peer_id == "healthy-backup-tail"
+        assert first.role == PeerRole.PRIMARY
+        assert dead_attempts == 1
+        assert backup_attempts == 1
+        assert [p.peer_id for p in middle.peers] == ["healthy-backup-tail"]
+        assert middle.peers[0].role == PeerRole.PRIMARY
+
+        second = await middle.send_with_failover(
+            completed_layer=23,
+            frame_bytes=frame,
+            timeout_seconds=1.0,
+            ack_timeout_seconds=1.0,
+        )
+        assert second.peer_id == "healthy-backup-tail"
+        assert second.role == PeerRole.PRIMARY
+        assert dead_attempts == 1
+        assert backup_attempts == 2
+    finally:
+        dead_server.close()
+        backup_server.close()
+        await dead_server.wait_closed()
+        await backup_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_cascading_failover_evicts_multiple_failed_candidates_and_promotes_working_backup() -> None:
+    """Issue #28: Cascading failover across `[P1, B1, B2]` must evict both `P1` and `B1`,
+    promote `B2` to PRIMARY, and preserve unrelated layer peers in `runtime.peers`.
+    """
+    runtime = LocalNodeRuntime()
+    runtime.state = NodeState.RUNNING
+    runtime.shard_layer_start = 16
+    runtime.shard_layer_end = 23
+    runtime.total_layers = 32
+
+    p1_attempts: int = 0
+    b1_attempts: int = 0
+    b2_attempts: int = 0
+
+    async def _make_nack_handler(counter_name: str) -> asyncio.AbstractServer:
+        async def _handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            nonlocal p1_attempts, b1_attempts
+            try:
+                len_bytes = await reader.readexactly(FRAME_LEN_STRUCT.size)
+                (frame_len,) = FRAME_LEN_STRUCT.unpack(len_bytes)
+                await reader.readexactly(frame_len)
+                if counter_name == "p1":
+                    p1_attempts += 1
+                else:
+                    b1_attempts += 1
+                writer.write(NACK_BYTE)
+                await writer.drain()
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        return await asyncio.start_server(_handler, host="127.0.0.1", port=0)
+
+    async def _b2_ok(_frame: ActivationFrame) -> None:
+        nonlocal b2_attempts
+        b2_attempts += 1
+
+    p1_server = await _make_nack_handler("p1")
+    b1_server = await _make_nack_handler("b1")
+    b2_server = await receive_activations(
+        host="127.0.0.1",
+        port=0,
+        on_activation_frame=_b2_ok,
+    )
+
+    unrelated_head = PeerNodeInfo(
+        peer_id="unrelated-head",
+        ip_address="127.0.0.1",
+        port=49100,
+        shard_layer_start=0,
+        shard_layer_end=15,
+        role=PeerRole.PRIMARY,
+    )
+    runtime.peers = [
+        unrelated_head,
+        PeerNodeInfo(
+            peer_id="p1",
+            ip_address="127.0.0.1",
+            port=_get_bound_port(p1_server),
+            shard_layer_start=24,
+            shard_layer_end=31,
+            role=PeerRole.PRIMARY,
+        ),
+        PeerNodeInfo(
+            peer_id="b1",
+            ip_address="127.0.0.1",
+            port=_get_bound_port(b1_server),
+            shard_layer_start=24,
+            shard_layer_end=31,
+            role=PeerRole.BACKUP,
+        ),
+        PeerNodeInfo(
+            peer_id="b2",
+            ip_address="127.0.0.1",
+            port=_get_bound_port(b2_server),
+            shard_layer_start=24,
+            shard_layer_end=31,
+            role=PeerRole.BACKUP,
+        ),
+    ]
+
+    try:
+        frame = _make_valid_activation_frame(current_layer=23, total_layers=32)
+        promoted = await runtime.send_with_failover(
+            completed_layer=23,
+            frame_bytes=frame,
+            timeout_seconds=1.0,
+            ack_timeout_seconds=1.0,
+        )
+        assert promoted.peer_id == "b2"
+        assert promoted.role == PeerRole.PRIMARY
+        assert [p.peer_id for p in runtime.peers] == ["unrelated-head", "b2"]
+        assert runtime.peers[0].role == PeerRole.PRIMARY
+        assert runtime.peers[1].role == PeerRole.PRIMARY
+
+        second = await runtime.send_with_failover(
+            completed_layer=23,
+            frame_bytes=frame,
+            timeout_seconds=1.0,
+            ack_timeout_seconds=1.0,
+        )
+        assert second.peer_id == "b2"
+        assert p1_attempts == 1
+        assert b1_attempts == 1
+        assert b2_attempts == 2
+    finally:
+        p1_server.close()
+        b1_server.close()
+        b2_server.close()
+        await p1_server.wait_closed()
+        await b1_server.wait_closed()
+        await b2_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_all_candidates_failed_preserves_peers_without_destructive_eviction() -> None:
+    """Issue #28: When every primary and backup candidate fails, raise RuntimeError without
+    destructively wiping `runtime.peers` or quarantining peers.
+    """
+    runtime = LocalNodeRuntime()
+    runtime.state = NodeState.RUNNING
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.model_runner = ShardModelRunner(
+        shard_layer_start=0, shard_layer_end=15, total_layers=32
+    )
+
+    async def _always_nack(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            len_bytes = await reader.readexactly(FRAME_LEN_STRUCT.size)
+            (frame_len,) = FRAME_LEN_STRUCT.unpack(len_bytes)
+            await reader.readexactly(frame_len)
+            writer.write(NACK_BYTE)
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    p1_server = await asyncio.start_server(_always_nack, host="127.0.0.1", port=0)
+    b1_server = await asyncio.start_server(_always_nack, host="127.0.0.1", port=0)
+
+    runtime.peers = [
+        PeerNodeInfo(
+            peer_id="p1",
+            ip_address="127.0.0.1",
+            port=_get_bound_port(p1_server),
+            shard_layer_start=16,
+            shard_layer_end=31,
+            role=PeerRole.PRIMARY,
+        ),
+        PeerNodeInfo(
+            peer_id="b1",
+            ip_address="127.0.0.1",
+            port=_get_bound_port(b1_server),
+            shard_layer_start=16,
+            shard_layer_end=31,
+            role=PeerRole.BACKUP,
+        ),
+    ]
+
+    try:
+        frame = _make_valid_activation_frame(current_layer=15, total_layers=32)
+        with pytest.raises(RuntimeError, match="All primary and backup peers failed"):
+            await runtime.send_with_failover(
+                completed_layer=15,
+                frame_bytes=frame,
+                timeout_seconds=1.0,
+                ack_timeout_seconds=1.0,
+            )
+
+        assert [p.peer_id for p in runtime.peers] == ["p1", "b1"]
+        assert runtime._evicted_peers == {}
+        assert runtime._promoted_peer_ids == {}
+
+        with pytest.raises(RuntimeError, match="All primary and backup peers failed"):
+            async for _ in runtime.stream_p2p_pipeline_tokens(
+                prompt="All peers down",
+                max_tokens=2,
+            ):
+                pass
+
+        assert [p.peer_id for p in runtime.peers] == ["p1", "b1"]
+        assert runtime._evicted_peers == {}
+        assert runtime._promoted_peer_ids == {}
+    finally:
+        p1_server.close()
+        b1_server.close()
+        await p1_server.wait_closed()
+        await b1_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_failover_quarantine_blocks_stale_refresh_and_allows_reentry_on_new_port_or_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #28: Background refreshes must respect dead-peer quarantine and backup promotion
+    during cooldown, while allowing re-entry on a new `(ip, port)`, after cooldown expiry, or
+    via `POST /peers/register`.
+    """
+    runtime = LocalNodeRuntime()
+    runtime.state = NodeState.RUNNING
+    runtime.node_id = "head-node"
+    runtime.model_id = "test/model"
+    runtime.room_id = "public"
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.p2p_listen_port = 49152
+    runtime._active_start_request = StartNodeRequest(
+        node_id="head-node",
+        model_id="test/model",
+        room_id="public",
+        ram_gb=4,
+        shared_ram_gb=4,
+        p2p_listen_port=49152,
+    )
+    runtime._last_heartbeat_at = time.monotonic()
+
+    p1_old = PeerNodeInfo(
+        peer_id="p1",
+        ip_address="127.0.0.1",
+        port=49201,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.PRIMARY,
+    )
+    b1_backup = PeerNodeInfo(
+        peer_id="b1",
+        ip_address="127.0.0.1",
+        port=49202,
+        shard_layer_start=16,
+        shard_layer_end=31,
+        role=PeerRole.BACKUP,
+    )
+    runtime.peers = [p1_old, b1_backup]
+
+    promoted = runtime._promote_failover_peer(promoted_peer=b1_backup, failed_peers=[p1_old])
+    assert promoted.role == PeerRole.PRIMARY
+    assert [p.peer_id for p in runtime.peers] == ["b1"]
+
+    tracker_peers_payload: list[PeerNodeInfo] = [p1_old, b1_backup]
+
+    async def _fake_rooms() -> list[RoomLobbyItem]:
+        return [
+            RoomLobbyItem(
+                room_id="public",
+                model="test/model",
+                nodes_online=2,
+                total_shared_ram_gb=8.0,
+                coverage_percent=100.0,
+            )
+        ]
+
+    async def _fake_fetch_peers(**_kwargs: Any) -> list[PeerNodeInfo]:
+        return list(tracker_peers_payload)
+
+    async def _fake_register_node(*_args: Any, **_kwargs: Any) -> AnnounceAssignment:
+        return AnnounceAssignment(
+            assigned_start_layer=0,
+            assigned_end_layer=15,
+            role=PeerRole.PRIMARY,
+            peers=list(tracker_peers_payload),
+        )
+
+    async def _no_lan_beacons(**_kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(main_module, "_is_tracker_enabled", lambda: True)
+    monkeypatch.setattr(main_module, "_scan_all_lan_beacons", _no_lan_beacons)
+    monkeypatch.setattr(runtime.tracker_client, "fetch_available_rooms", _fake_rooms)
+    monkeypatch.setattr(runtime.tracker_client, "fetch_peers", _fake_fetch_peers)
+    monkeypatch.setattr(
+        runtime.tracker_client, "register_node_with_assignment", _fake_register_node
+    )
+
+    # 1. Stale heartbeat and tracker refresh with p1 at same (ip, port) and b1 as BACKUP stay filtered
+    assert await runtime.maybe_send_tracker_heartbeat(force=True) is True
+    assert [p.peer_id for p in runtime.peers] == ["b1"]
+    assert runtime.peers[0].role == PeerRole.PRIMARY
+
+    await runtime.refresh_room_coverage()
+    assert [p.peer_id for p in runtime.peers] == ["b1"]
+    assert runtime.peers[0].role == PeerRole.PRIMARY
+
+    # 2. If p1 restarts on a NEW port, quarantine is lifted automatically
+    p1_restarted = p1_old.model_copy(update={"port": 49299})
+    tracker_peers_payload = [p1_restarted, b1_backup]
+    await runtime.refresh_room_coverage()
+    assert {p.peer_id for p in runtime.peers} == {"p1", "b1"}
+    assert "p1" not in runtime._evicted_peers
+    b1_in_table = next(p for p in runtime.peers if p.peer_id == "b1")
+    assert b1_in_table.role == PeerRole.PRIMARY
+
+    # 3. Cooldown expiry prunes both quarantine and promotion overrides
+    runtime.failed_peer_cooldown_seconds = 0.01
+    runtime._promote_failover_peer(promoted_peer=b1_backup, failed_peers=[p1_old])
+    assert "p1" in runtime._evicted_peers
+    assert "b1" in runtime._promoted_peer_ids
+    await asyncio.sleep(0.025)
+
+    after_expiry = runtime._apply_peer_failover_overrides([p1_old, b1_backup])
+    assert [p.peer_id for p in after_expiry] == ["p1", "b1"]
+    assert after_expiry[1].role == PeerRole.BACKUP
+    assert runtime._evicted_peers == {}
+    assert runtime._promoted_peer_ids == {}
+
+    # 4. Explicit /peers/register removes quarantine and _stop_node_unlocked clears failover state
+    orig_peers = list(main_module.runtime.peers)
+    orig_evicted = dict(main_module.runtime._evicted_peers)
+    orig_promoted = dict(main_module.runtime._promoted_peer_ids)
+    try:
+        main_module.runtime._evicted_peers["p1"] = (time.monotonic() + 60.0, "127.0.0.1", 49201)
+        registered = await main_module.register_peer(p1_old)
+        assert "p1" not in main_module.runtime._evicted_peers
+        assert any(p.peer_id == "p1" for p in registered)
+
+        main_module.runtime.state = NodeState.RUNNING
+        main_module.runtime._evicted_peers["p1"] = (time.monotonic() + 60.0, "127.0.0.1", 49201)
+        main_module.runtime._promoted_peer_ids["b1"] = time.monotonic() + 60.0
+        await main_module._stop_node_unlocked()
+        assert main_module.runtime._evicted_peers == {}
+        assert main_module.runtime._promoted_peer_ids == {}
+    finally:
+        main_module.runtime.peers = orig_peers
+        main_module.runtime._evicted_peers = orig_evicted
+        main_module.runtime._promoted_peer_ids = orig_promoted
+        main_module.runtime.state = NodeState.STOPPED
