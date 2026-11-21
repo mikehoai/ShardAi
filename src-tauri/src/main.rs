@@ -387,6 +387,7 @@ fn window_start_drag(window: tauri::Window) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(PythonCoreState::default())
         .setup(|app| {
             // 1. Auto-boot core-engine sidecar in the background as soon as the desktop app opens
@@ -462,4 +463,26 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running ShardAi Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_capabilities_include_dialog_permission() {
+        let caps_json = include_str!("../capabilities/default.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(caps_json).expect("capabilities/default.json must be valid JSON");
+        let perms = parsed["permissions"]
+            .as_array()
+            .expect("permissions must be a JSON array");
+        assert!(
+            perms.iter().any(|item| item.as_str() == Some("dialog:default")),
+            "capabilities/default.json must include dialog:default"
+        );
+    }
+
+    #[test]
+    fn dialog_plugin_initializes() {
+        let _plugin: tauri::plugin::TauriPlugin<tauri::Wry> = tauri_plugin_dialog::init();
+    }
 }
