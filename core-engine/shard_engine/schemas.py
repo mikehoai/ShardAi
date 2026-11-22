@@ -53,6 +53,21 @@ class ModelSourceType(StrEnum):
     LOCAL_FILE = "local_file"
 
 
+CatalogModelTask = Literal["text", "image", "video", "multimodal"]
+
+
+def validate_room_id(value: Any) -> str:
+    """Normalize blank/None `room_id` to `'public'` and reject `:` characters."""
+    if value is None:
+        return "public"
+    if not isinstance(value, str):
+        raise ValueError("room_id must be a string")
+    cleaned = value.strip()
+    if ":" in cleaned:
+        raise ValueError("room_id must not contain ':'")
+    return cleaned if cleaned else "public"
+
+
 class CatalogModelItem(BaseModel):
     """Single model entry synchronized from Cloud `GET /config/models` or local cache."""
 
@@ -62,6 +77,8 @@ class CatalogModelItem(BaseModel):
     filename: str | None = None
     estimated_ram_gb: float = Field(default=5.0, gt=0.0)
     enabled: bool = True
+    task: CatalogModelTask | None = None
+    category: str | None = None
 
 
 class ModelCatalogResponse(BaseModel):
@@ -199,11 +216,8 @@ class StartNodeRequest(BaseModel):
 
     @field_validator("room_id", mode="before")
     @classmethod
-    def _normalize_room_id(cls, value: str | None) -> str:
-        if value is None:
-            return "public"
-        cleaned = value.strip()
-        return cleaned if cleaned else "public"
+    def _normalize_room_id(cls, value: Any) -> str:
+        return validate_room_id(value)
 
     @field_validator("room_key", mode="before")
     @classmethod
@@ -304,11 +318,8 @@ class CheckRoomJoinRequest(BaseModel):
 
     @field_validator("room_id", mode="before")
     @classmethod
-    def _normalize_room_id(cls, value: str | None) -> str:
-        if value is None:
-            return "public"
-        cleaned = value.strip()
-        return cleaned if cleaned else "public"
+    def _normalize_room_id(cls, value: Any) -> str:
+        return validate_room_id(value)
 
     @field_validator("room_key", mode="before")
     @classmethod

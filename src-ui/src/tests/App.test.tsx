@@ -3927,4 +3927,94 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTestId("ai-chat-window")).toBeNull();
   });
+
+  it("supports optional task and category metadata on CatalogModelItem when loading /models/catalog", async () => {
+    const typedCatalog: CatalogModelItem[] = [
+      {
+        id: "llama-3.1-8b",
+        name: "Llama 3.1 8B",
+        repo_id: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        estimated_ram_gb: 5.1,
+        enabled: true,
+        task: "text",
+        category: "reasoning",
+      },
+      {
+        id: "flux-schnell",
+        name: "FLUX.1 Schnell",
+        repo_id: "black-forest-labs/FLUX.1-schnell",
+        filename: null,
+        estimated_ram_gb: 12.0,
+        enabled: true,
+        task: "image",
+        category: "image-generation",
+      },
+      {
+        id: "wan-2.1",
+        name: "Wan 2.1",
+        repo_id: "Wan-AI/Wan2.1-T2V-1.3B",
+        estimated_ram_gb: 8.5,
+        enabled: true,
+        task: "video",
+        category: "video-generation",
+      },
+      {
+        id: "qwen-vl",
+        name: "Qwen2.5-VL 7B",
+        repo_id: "Qwen/Qwen2.5-VL-7B-Instruct",
+        estimated_ram_gb: 7.2,
+        enabled: true,
+        task: "multimodal",
+        category: "vision-language",
+      },
+      {
+        id: "legacy-model",
+        name: "Legacy Model",
+        repo_id: "org/legacy-model",
+        estimated_ram_gb: 4.0,
+        enabled: true,
+        task: null,
+        category: null,
+      },
+    ];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: typedCatalog.length,
+            models: typedCatalog,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      const selectEl = screen.getByTestId("catalog-model-select") as HTMLSelectElement;
+      expect(selectEl.options.length).toBe(typedCatalog.length);
+      expect(selectEl.options[1].value).toBe("flux-schnell");
+      expect(selectEl.options[2].value).toBe("wan-2.1");
+      expect(selectEl.options[3].value).toBe("qwen-vl");
+    });
+  });
 });

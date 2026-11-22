@@ -46,9 +46,9 @@ from models.downloader import (
     compute_model_fingerprint,
     is_offline_mode,
     is_valid_gguf_file,
-    parse_estimated_ram_gb,
     read_hf_config_summary,
     sanitize_catalog_entries,
+    sanitize_catalog_entry,
 )
 from models.shard_runner import ShardModelRunner
 from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
@@ -91,6 +91,7 @@ from shard_engine.schemas import (
     RoomLobbyItem,
     StartNodeRequest,
     SystemMemoryResponse,
+    validate_room_id,
 )
 from shard_engine.tracker_client import (
     AnnounceAssignment,
@@ -1971,38 +1972,17 @@ async def get_model_catalog() -> ModelCatalogResponse:
     def _build_catalog_items(entries: list[dict[str, Any]]) -> list[CatalogModelItem]:
         built: list[CatalogModelItem] = []
         for entry in entries:
-            if not isinstance(entry, dict) or entry.get("enabled", True) is not True:
+            cleaned = sanitize_catalog_entry(entry)
+            if cleaned is None:
                 continue
-            raw_repo_id = entry.get("repo_id")
-            if not isinstance(raw_repo_id, str) or not raw_repo_id.strip():
-                continue
-            repo_id = raw_repo_id.strip()
-            raw_id = entry.get("id")
-            entry_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else repo_id
-            raw_name = entry.get("name")
-            entry_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else repo_id
-            raw_filename = entry.get("filename")
-            entry_filename = (
-                raw_filename.strip()
-                if isinstance(raw_filename, str) and raw_filename.strip()
-                else None
-            )
             try:
-                built.append(
-                    CatalogModelItem(
-                        id=entry_id,
-                        name=entry_name,
-                        repo_id=repo_id,
-                        filename=entry_filename,
-                        estimated_ram_gb=parse_estimated_ram_gb(
-                            entry.get("estimated_ram_gb"),
-                            default=5.0,
-                        ),
-                        enabled=True,
-                    )
-                )
+                built.append(CatalogModelItem.model_validate(cleaned))
             except Exception as exc:
-                logger.warning("Skipping malformed catalog entry '%s': %s", repo_id, exc)
+                logger.warning(
+                    "Skipping malformed catalog entry '%s': %s",
+                    cleaned.get("repo_id"),
+                    exc,
+                )
         return built
 
     items = _build_catalog_items(raw_models)
@@ -2033,7 +2013,15 @@ async def stream_model_download(
     _ipc_auth: None = Depends(verify_local_ipc_token),
 ) -> StreamingResponse:
     """Ensure any requested catalog, HF repo, direct URL, or local `.gguf` model is ready."""
-    cleaned_room_id = room_id.strip() if room_id is not None else ""
+    cleaned_room_id = ""
+    if room_id is not None and room_id.strip():
+        try:
+            cleaned_room_id = validate_room_id(room_id)
+        except ValueError as val_exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(val_exc),
+            ) from val_exc
     if cleaned_room_id:
         await _verify_cloud_room_join_permission(
             room_id=cleaned_room_id,

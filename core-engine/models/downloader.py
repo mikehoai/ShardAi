@@ -214,6 +214,9 @@ def parse_estimated_ram_gb(value: Any, default: float = 5.0) -> float:
     return max(0.1, parsed)
 
 
+VALID_CATALOG_TASKS: frozenset[str] = frozenset({"text", "image", "video", "multimodal"})
+
+
 def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
     """Normalize a raw catalog dictionary, returning `None` when disabled or missing `repo_id`."""
     if not isinstance(entry, dict):
@@ -235,6 +238,15 @@ def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
     raw_filename = entry.get("filename")
     filename = raw_filename.strip() if isinstance(raw_filename, str) and raw_filename.strip() else None
 
+    raw_task = entry.get("task")
+    normalized_task = raw_task.strip().lower() if isinstance(raw_task, str) else ""
+    task: str | None = normalized_task if normalized_task in VALID_CATALOG_TASKS else None
+
+    raw_category = entry.get("category")
+    category: str | None = (
+        raw_category.strip() if isinstance(raw_category, str) and raw_category.strip() else None
+    )
+
     return {
         "id": entry_id,
         "name": name,
@@ -242,6 +254,8 @@ def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
         "filename": filename,
         "estimated_ram_gb": parse_estimated_ram_gb(entry.get("estimated_ram_gb"), default=5.0),
         "enabled": True,
+        "task": task,
+        "category": category,
     }
 
 
@@ -264,6 +278,7 @@ DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
         "filename": "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf",
         "estimated_ram_gb": 5.2,
         "enabled": True,
+        "task": "text",
     },
     {
         "id": "deepseek-r1-distill-qwen-14b",
@@ -272,6 +287,7 @@ DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
         "filename": "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf",
         "estimated_ram_gb": 9.2,
         "enabled": True,
+        "task": "text",
     },
     {
         "id": "qwen-2.5-coder-7b",
@@ -280,6 +296,7 @@ DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
         "filename": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
         "estimated_ram_gb": 4.9,
         "enabled": True,
+        "task": "text",
     },
     {
         "id": "qwen-2.5-coder-32b",
@@ -288,6 +305,7 @@ DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
         "filename": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
         "estimated_ram_gb": 20.0,
         "enabled": True,
+        "task": "text",
     },
     {
         "id": "llama-3.1-8b",
@@ -296,6 +314,7 @@ DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
         "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
         "estimated_ram_gb": 5.1,
         "enabled": True,
+        "task": "text",
     },
     {
         "id": "gemma-2-9b",
@@ -304,6 +323,7 @@ DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
         "filename": "gemma-2-9b-it-Q4_K_M.gguf",
         "estimated_ram_gb": 5.8,
         "enabled": True,
+        "task": "text",
     },
 ]
 

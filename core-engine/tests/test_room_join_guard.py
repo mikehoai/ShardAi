@@ -7,10 +7,16 @@ from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 import httpx
+from pydantic import ValidationError
 import pytest
 
 from main import app, runtime
-from shard_engine.schemas import NetworkStatus, NodeState
+from shard_engine.schemas import (
+    CheckRoomJoinRequest,
+    NetworkStatus,
+    NodeState,
+    StartNodeRequest,
+)
 from shard_engine.tracker_client import (
     SignalingTrackerClient,
     extract_tracker_error_detail,
@@ -436,3 +442,91 @@ def test_extract_tracker_error_detail_handles_vietnamese_forbidden_and_fallback(
         extract_tracker_error_detail(unknown_vn_res, "Unable to join room.")
         == "Unable to join room."
     )
+
+
+@pytest.mark.parametrize("bad_room_id", ["studio:01", "team:alpha", "  room:42  ", ":"])
+def test_room_id_colon_rejected_at_schema_and_endpoint_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_room_id: str,
+) -> None:
+    """`room_id` containing `:` must fail with HTTP 422 before contacting the Signaling API or offline fallback."""
+    with pytest.raises(ValidationError, match="room_id must not contain ':'"):
+        StartNodeRequest(room_id=bad_room_id)
+    with pytest.raises(ValidationError, match="room_id must not contain ':'"):
+        CheckRoomJoinRequest(room_id=bad_room_id, model_id="meta-llama/Llama-3.1-8B-Instruct")
+
+    # Blank/None values continue normalizing to "public"; non-string fails validation cleanly
+    assert StartNodeRequest(room_id=None).room_id == "public"  # type: ignore[arg-type]
+    assert StartNodeRequest(room_id="   ").room_id == "public"
+    assert CheckRoomJoinRequest(room_id="  ", model_id="m").room_id == "public"
+    with pytest.raises(ValidationError, match="room_id must be a string"):
+        StartNodeRequest(room_id=123)  # type: ignore[arg-type]
+
+    _enable_tracker(monkeypatch)
+    tracker_calls = 0
+
+    def _fail_if_called(request: httpx.Request) -> httpx.Response:
+        nonlocal tracker_calls
+        tracker_calls += 1
+        return httpx.Response(status_code=500, json={"error": "should not be reached"})
+
+    runtime.tracker_client = _make_mock_tracker(_fail_if_called)
+    download_spy = AsyncMock()
+    monkeypatch.setattr(runtime.model_downloader, "ensure_model_downloaded", download_spy)
+
+    check_res = client.post(
+        "/rooms/check-join",
+        json={
+            "room_id": bad_room_id,
+            "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+            "network_mode": "internet",
+        },
+    )
+    assert check_res.status_code == 422
+    assert "room_id must not contain ':'" in str(check_res.json()["detail"])
+
+    start_res = client.post(
+        "/start-node",
+        json={
+            "node_id": "colon-reject-node",
+            "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+            "network_mode": "internet",
+            "room_id": bad_room_id,
+            "ram_gb": 4,
+            "p2p_listen_port": 49315,
+        },
+    )
+    assert start_res.status_code == 422
+    assert "room_id must not contain ':'" in str(start_res.json()["detail"])
+
+    stream_res = client.get(
+        "/models/download-stream",
+        params={
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "room_id": bad_room_id,
+            "network_mode": "internet",
+        },
+    )
+    assert stream_res.status_code == 422
+    assert "room_id must not contain ':'" in str(stream_res.json()["detail"])
+
+    assert tracker_calls == 0
+    download_spy.assert_not_awaited()
+    assert runtime.state == NodeState.STOPPED
+    assert runtime.network_status is None
+
+
+def test_download_stream_allows_blank_or_omitted_room_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /models/download-stream` still accepts omitted or whitespace-only `room_id`."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "true")
+    res = client.get(
+        "/models/download-stream",
+        params={
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "room_id": "   ",
+        },
+    )
+    assert res.status_code == 200
+    assert "data: [DONE]" in res.text
