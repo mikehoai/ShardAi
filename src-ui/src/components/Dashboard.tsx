@@ -7,7 +7,6 @@ import type {
   ModelSourceType,
   NetworkMode,
   NetworkStatus,
-  NetworkStatusResponse,
   NodeStatusResponse,
   PeerRole,
   RoomLobbyItem,
@@ -17,6 +16,9 @@ import type {
 import {
   checkRoomJoin,
   extractApiErrorDetail,
+  fetchNetworkStatus as requestNetworkStatus,
+  fetchNodeStatus as requestNodeStatus,
+  isAbortError,
   RoomJoinRejectedError,
 } from "../services/engineApi";
 import {
@@ -197,6 +199,31 @@ async function invokeTauriCommand<T>(
 }
 
 export const Dashboard: React.FC = () => {
+  // Lifecycle refs & unmount cleanup (declared first so StrictMode remount resets before data effects)
+  const isMountedRef = useRef<boolean>(true);
+  const mountAbortRef = useRef<AbortController>(new AbortController());
+  const downloadAbortRef = useRef<AbortController | null>(null);
+  const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    if (mountAbortRef.current.signal.aborted) {
+      mountAbortRef.current = new AbortController();
+    }
+    return () => {
+      isMountedRef.current = false;
+      mountAbortRef.current.abort();
+      if (downloadAbortRef.current) {
+        downloadAbortRef.current.abort();
+        downloadAbortRef.current = null;
+      }
+      if (copyTimeoutRef.current !== null) {
+        clearTimeout(copyTimeoutRef.current);
+        copyTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
   // Native Desktop Shell State (Navigation + OS/User Theme)
   const [activeSection, setActiveSection] = useState<NavSection>("overview");
   const [isSidebarHidden, setIsSidebarHidden] = useState<boolean>(() => {
@@ -281,6 +308,7 @@ export const Dashboard: React.FC = () => {
   const [modalRoomId, setModalRoomId] = useState<string>("studio-room-1");
   const [modalModelTab, setModalModelTab] = useState<ModelTab>("catalog");
   const [modalSelectedCatalogId, setModalSelectedCatalogId] = useState<string>("");
+  const modalSelectedCatalogIdRef = useRef<string>(modalSelectedCatalogId);
   const [modalModel, setModalModel] = useState<string>("meta-llama/Llama-3.1-8B-Instruct");
   const [modalCustomFilename, setModalCustomFilename] = useState<string>("");
   const [modalLocalFilePath, setModalLocalFilePath] = useState<string>("");
@@ -294,6 +322,17 @@ export const Dashboard: React.FC = () => {
   const [catalogSource, setCatalogSource] = useState<CatalogSource | null>(null);
   const [isLoadingCatalog, setIsLoadingCatalog] = useState<boolean>(false);
   const [selectedCatalogId, setSelectedCatalogId] = useState<string>("");
+  const selectedCatalogIdRef = useRef<string>(selectedCatalogId);
+
+  const updateSelectedCatalogId = useCallback((nextId: string): void => {
+    selectedCatalogIdRef.current = nextId;
+    setSelectedCatalogId(nextId);
+  }, []);
+
+  const updateModalSelectedCatalogId = useCallback((nextId: string): void => {
+    modalSelectedCatalogIdRef.current = nextId;
+    setModalSelectedCatalogId(nextId);
+  }, []);
   const [modelInput, setModelInput] = useState<string>(
     "meta-llama/Llama-3.1-8B-Instruct"
   );
@@ -415,16 +454,23 @@ export const Dashboard: React.FC = () => {
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
   const fetchAvailableRooms = useCallback(
-    async (options?: { reseed?: boolean }): Promise<void> => {
+    async (options?: { reseed?: boolean; signal?: AbortSignal }): Promise<void> => {
+      const signal = options?.signal ?? mountAbortRef.current.signal;
+      if (signal.aborted || !isMountedRef.current) {
+        return;
+      }
       setIsLoadingRooms(true);
       if (options?.reseed) {
         roomSessionSeedRef.current = createRoomSessionSeed();
       }
       try {
-        const res = await fetch(`${LOCAL_ENGINE_ROOT}/available-rooms`);
+        const res = await fetch(`${LOCAL_ENGINE_ROOT}/available-rooms`, { signal });
+        if (signal.aborted || !isMountedRef.current) {
+          return;
+        }
         if (res.ok) {
           const rooms = (await res.json()) as unknown;
-          if (Array.isArray(rooms)) {
+          if (!signal.aborted && isMountedRef.current && Array.isArray(rooms)) {
             setAvailableRooms(
               orderRoomsForSession(
                 rooms as RoomLobbyItem[],
@@ -433,10 +479,15 @@ export const Dashboard: React.FC = () => {
             );
           }
         }
-      } catch {
+      } catch (err: unknown) {
+        if (isAbortError(err) || signal.aborted) {
+          return;
+        }
         // Keep existing lobby state if local core engine is not yet running
       } finally {
-        setIsLoadingRooms(false);
+        if (!signal.aborted && isMountedRef.current) {
+          setIsLoadingRooms(false);
+        }
       }
     },
     []
@@ -444,11 +495,17 @@ export const Dashboard: React.FC = () => {
 
   const engineSyncedRef = useRef<boolean>(false);
 
-  const fetchNetworkStatus = useCallback(async (): Promise<boolean> => {
-    try {
-      const res = await fetch(`${LOCAL_ENGINE_ROOT}/network-status`);
-      if (res.ok) {
-        const data = (await res.json()) as Partial<NetworkStatusResponse>;
+  const fetchNetworkStatus = useCallback(
+    async (options?: { signal?: AbortSignal }): Promise<boolean> => {
+      const signal = options?.signal ?? mountAbortRef.current.signal;
+      if (signal.aborted || !isMountedRef.current) {
+        return false;
+      }
+      try {
+        const data = await requestNetworkStatus({ signal });
+        if (signal.aborted || !isMountedRef.current) {
+          return false;
+        }
         if (
           data.network_status === "online" ||
           data.network_status === "lan_only" ||
@@ -460,69 +517,106 @@ export const Dashboard: React.FC = () => {
           );
           return true;
         }
+      } catch (err: unknown) {
+        if (isAbortError(err) || signal.aborted) {
+          return false;
+        }
+        // Engine still booting/unpacking; keep waiting silently
       }
-    } catch {
-      // Engine still booting/unpacking; keep waiting silently
-    }
-    return false;
-  }, []);
+      return false;
+    },
+    []
+  );
 
-  const fetchModelCatalog = useCallback(async (): Promise<void> => {
-    setIsLoadingCatalog(true);
-    try {
-      const res = await fetch(`${LOCAL_ENGINE_ROOT}/models/catalog`);
-      if (res.ok) {
-        const data = (await res.json()) as Partial<ModelCatalogResponse>;
-        if (Array.isArray(data.models) && data.models.length > 0) {
-          setCatalogModels(data.models);
-          if (
-            data.source === "cloud" ||
-            data.source === "cache" ||
-            data.source === "default"
-          ) {
-            setCatalogSource(data.source);
+  const fetchModelCatalog = useCallback(
+    async (options?: { signal?: AbortSignal }): Promise<void> => {
+      const signal = options?.signal ?? mountAbortRef.current.signal;
+      if (signal.aborted || !isMountedRef.current) {
+        return;
+      }
+      setIsLoadingCatalog(true);
+      try {
+        const res = await fetch(`${LOCAL_ENGINE_ROOT}/models/catalog`, { signal });
+        if (signal.aborted || !isMountedRef.current) {
+          return;
+        }
+        if (res.ok) {
+          const data = (await res.json()) as Partial<ModelCatalogResponse>;
+          if (signal.aborted || !isMountedRef.current) {
+            return;
           }
-          setSelectedCatalogId((prev) => {
-            if (prev && data.models?.some((m) => m.id === prev)) {
-              return prev;
+          if (Array.isArray(data.models) && data.models.length > 0) {
+            setCatalogModels(data.models);
+            if (
+              data.source === "cloud" ||
+              data.source === "cache" ||
+              data.source === "default"
+            ) {
+              setCatalogSource(data.source);
             }
-            const first = data.models?.[0];
-            if (first) {
+            const first = data.models[0];
+            const currentCatalogId = selectedCatalogIdRef.current;
+            const hasValidMainSelection =
+              Boolean(currentCatalogId) &&
+              data.models.some((m) => m.id === currentCatalogId);
+            if (!hasValidMainSelection && first) {
+              updateSelectedCatalogId(first.id);
               setModelInput(first.repo_id);
-              return first.id;
             }
-            return prev;
-          });
-          setModalSelectedCatalogId((prev) => {
-            if (prev && data.models?.some((m) => m.id === prev)) {
-              return prev;
-            }
-            const first = data.models?.[0];
-            if (first) {
+
+            const currentModalCatalogId = modalSelectedCatalogIdRef.current;
+            const hasValidModalSelection =
+              Boolean(currentModalCatalogId) &&
+              data.models.some((m) => m.id === currentModalCatalogId);
+            if (!hasValidModalSelection && first) {
+              updateModalSelectedCatalogId(first.id);
               setModalModel(first.repo_id);
-              return first.id;
             }
-            return prev;
-          });
+          }
+        }
+      } catch (err: unknown) {
+        if (isAbortError(err) || signal.aborted) {
+          return;
+        }
+        // Engine may not be reachable yet
+      } finally {
+        if (!signal.aborted && isMountedRef.current) {
+          setIsLoadingCatalog(false);
         }
       }
-    } catch {
-      // Engine may not be reachable yet
-    } finally {
-      setIsLoadingCatalog(false);
-    }
-  }, []);
+    },
+    [updateSelectedCatalogId, updateModalSelectedCatalogId]
+  );
 
   // Network Status Indicator: fast 2s poll while engine is unpacking, 10s once connected
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+    const controller = new AbortController();
     const pollMs = networkStatus === null ? 2000 : NETWORK_STATUS_POLL_MS;
 
     const tick = async (): Promise<void> => {
-      const connected = await fetchNetworkStatus();
-      if (!cancelled && connected && !engineSyncedRef.current) {
-        engineSyncedRef.current = true;
-        void Promise.all([fetchAvailableRooms(), fetchModelCatalog()]);
+      if (cancelled || inFlight || controller.signal.aborted) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const connected = await fetchNetworkStatus({ signal: controller.signal });
+        if (
+          !cancelled &&
+          !controller.signal.aborted &&
+          isMountedRef.current &&
+          connected &&
+          !engineSyncedRef.current
+        ) {
+          engineSyncedRef.current = true;
+          void Promise.all([
+            fetchAvailableRooms({ signal: controller.signal }),
+            fetchModelCatalog({ signal: controller.signal }),
+          ]);
+        }
+      } finally {
+        inFlight = false;
       }
     };
 
@@ -532,6 +626,7 @@ export const Dashboard: React.FC = () => {
     }, pollMs);
     return () => {
       cancelled = true;
+      controller.abort();
       window.clearInterval(timerId);
     };
   }, [networkStatus, fetchNetworkStatus, fetchAvailableRooms, fetchModelCatalog]);
@@ -565,6 +660,7 @@ export const Dashboard: React.FC = () => {
   // Inspect host RAM and fetch initial Room Lobby on mount
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     const initDashboard = async (): Promise<void> => {
       let freeGb: number | null = null;
@@ -575,9 +671,11 @@ export const Dashboard: React.FC = () => {
           freeGb = null;
         }
       }
-      if (freeGb === null) {
+      if (freeGb === null && !cancelled && !controller.signal.aborted) {
         try {
-          const res = await fetch(`${LOCAL_ENGINE_ROOT}/system/memory`);
+          const res = await fetch(`${LOCAL_ENGINE_ROOT}/system/memory`, {
+            signal: controller.signal,
+          });
           if (res.ok) {
             const mem = (await res.json()) as SystemMemoryResponse;
             freeGb = mem.available_ram_gb;
@@ -587,51 +685,69 @@ export const Dashboard: React.FC = () => {
         }
       }
 
-      if (!cancelled && freeGb !== null && Number.isFinite(freeGb)) {
+      if (
+        !cancelled &&
+        !controller.signal.aborted &&
+        isMountedRef.current &&
+        freeGb !== null &&
+        Number.isFinite(freeGb)
+      ) {
         const safeMax = Math.max(MIN_RAM_GB, Math.floor(freeGb - 1));
         setAvailableRamGb(freeGb);
         setMaxRamGb(safeMax);
         setSharedRamGb((prev) => Math.min(prev, safeMax));
       }
 
-      if (!cancelled) {
+      if (!cancelled && !controller.signal.aborted && isMountedRef.current) {
         try {
-          const statusRes = await fetch(`${LOCAL_ENGINE_ROOT}/status`);
-          if (statusRes.ok) {
-            const statusData = (await statusRes.json()) as NodeStatusResponse;
-            if (!cancelled && statusData.state === "RUNNING" && statusData.session_token) {
-              setIsSharing(true);
-              setSessionToken(statusData.session_token);
-              setApiBaseUrl(statusData.api_base_url ?? DEFAULT_API_BASE_URL);
-              setActiveModelId((prev) => statusData.model_id ?? prev);
-              setRoomId(statusData.room_id ?? "public");
-              setAssignedRole(statusData.role === "backup" ? "backup" : "primary");
-              if (
-                typeof statusData.shard_layer_start === "number" &&
-                typeof statusData.shard_layer_end === "number"
-              ) {
-                setAssignedLayerRange([
-                  statusData.shard_layer_start,
-                  statusData.shard_layer_end,
-                ]);
-              }
-              const pct = statusData.coverage_percent ?? 100;
-              setCoveragePercent(pct);
-              setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
-              setStatusMessage(statusData.message || "Active & Connected");
-              applyNodeNetworkFields(statusData);
+          const statusData = await requestNodeStatus({ signal: controller.signal });
+          if (
+            !cancelled &&
+            !controller.signal.aborted &&
+            isMountedRef.current &&
+            statusData.state === "RUNNING" &&
+            statusData.session_token
+          ) {
+            setIsSharing(true);
+            setSessionToken(statusData.session_token);
+            setApiBaseUrl(statusData.api_base_url ?? DEFAULT_API_BASE_URL);
+            setActiveModelId((prev) => statusData.model_id ?? prev);
+            setRoomId(statusData.room_id ?? "public");
+            setAssignedRole(statusData.role === "backup" ? "backup" : "primary");
+            if (
+              typeof statusData.shard_layer_start === "number" &&
+              typeof statusData.shard_layer_end === "number"
+            ) {
+              setAssignedLayerRange([
+                statusData.shard_layer_start,
+                statusData.shard_layer_end,
+              ]);
             }
+            const pct = statusData.coverage_percent ?? 100;
+            setCoveragePercent(pct);
+            setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
+            setStatusMessage(statusData.message || "Active & Connected");
+            applyNodeNetworkFields(statusData);
           }
-        } catch {
+        } catch (err: unknown) {
+          if (isAbortError(err) || controller.signal.aborted) {
+            return;
+          }
           // Core engine may not be started yet
         }
-        await Promise.all([fetchAvailableRooms(), fetchModelCatalog()]);
+        if (!cancelled && !controller.signal.aborted && isMountedRef.current) {
+          await Promise.all([
+            fetchAvailableRooms({ signal: controller.signal }),
+            fetchModelCatalog({ signal: controller.signal }),
+          ]);
+        }
       }
     };
 
     void initDashboard();
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [fetchAvailableRooms, fetchModelCatalog]);
 
@@ -639,13 +755,20 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     if (!isSharing) return;
     let cancelled = false;
+    let inFlight = false;
+    const controller = new AbortController();
 
     const pollStatus = async (): Promise<void> => {
+      if (cancelled || inFlight || controller.signal.aborted) {
+        return;
+      }
+      inFlight = true;
       try {
-        const res = await fetch(`${LOCAL_ENGINE_ROOT}/status`);
-        if (!res.ok) return;
-        const statusData = (await res.json()) as NodeStatusResponse;
-        if (!cancelled && statusData.state === "RUNNING") {
+        const statusData = await requestNodeStatus({ signal: controller.signal });
+        if (cancelled || controller.signal.aborted || !isMountedRef.current) {
+          return;
+        }
+        if (statusData.state === "RUNNING") {
           const pct = statusData.coverage_percent ?? 100;
           setCoveragePercent(pct);
           setIsSwarmReady(Boolean(statusData.is_swarm_ready ?? pct >= 100));
@@ -660,10 +783,7 @@ export const Dashboard: React.FC = () => {
               statusData.shard_layer_end,
             ]);
           }
-        } else if (
-          !cancelled &&
-          (statusData.state === "STOPPED" || statusData.state === "ERROR")
-        ) {
+        } else if (statusData.state === "STOPPED" || statusData.state === "ERROR") {
           resetSharingState();
           if (statusData.network_status) {
             setNetworkStatus(statusData.network_status);
@@ -683,8 +803,13 @@ export const Dashboard: React.FC = () => {
           }
           void Promise.all([fetchAvailableRooms(), fetchNetworkStatus()]);
         }
-      } catch {
+      } catch (err: unknown) {
+        if (isAbortError(err) || controller.signal.aborted) {
+          return;
+        }
         // Ignore transient poll errors while engine restarts
+      } finally {
+        inFlight = false;
       }
     };
 
@@ -694,6 +819,7 @@ export const Dashboard: React.FC = () => {
 
     return () => {
       cancelled = true;
+      controller.abort();
       window.clearInterval(timerId);
     };
   }, [isSharing, resetSharingState, fetchAvailableRooms, fetchNetworkStatus]);
@@ -701,12 +827,30 @@ export const Dashboard: React.FC = () => {
   const handleCopy = async (field: string, text: string): Promise<void> => {
     try {
       await navigator.clipboard.writeText(text);
+      if (!isMountedRef.current) {
+        return;
+      }
       setCopiedField(field);
-      setTimeout(() => {
-        setCopiedField((prev) => (prev === field ? null : prev));
+      if (copyTimeoutRef.current !== null) {
+        clearTimeout(copyTimeoutRef.current);
+      }
+      copyTimeoutRef.current = setTimeout(() => {
+        copyTimeoutRef.current = null;
+        if (isMountedRef.current) {
+          setCopiedField((prev) => (prev === field ? null : prev));
+        }
       }, 1800);
     } catch {
-      setErrorMessage("Clipboard access denied by browser.");
+      if (isMountedRef.current) {
+        setErrorMessage("Clipboard access denied by browser.");
+      }
+    }
+  };
+
+  const handleCancelDownload = (): void => {
+    if (downloadAbortRef.current) {
+      downloadAbortRef.current.abort();
+      downloadAbortRef.current = null;
     }
   };
 
@@ -720,85 +864,124 @@ export const Dashboard: React.FC = () => {
       roomKey?: string | null;
     }
   ): Promise<void> => {
+    if (!isMountedRef.current) {
+      throw new DOMException("Model download aborted.", "AbortError");
+    }
+
+    if (downloadAbortRef.current) {
+      downloadAbortRef.current.abort();
+      downloadAbortRef.current = null;
+    }
+    const controller = new AbortController();
+    downloadAbortRef.current = controller;
+
     setDownloadProgress(0);
     setDownloadStatusMsg(`Checking cache / preparing ${modelId}...`);
 
-    let backendAvailable = true;
     try {
-      const probe = await fetch(`${LOCAL_ENGINE_ROOT}/health`);
-      if (!probe.ok) backendAvailable = false;
-    } catch {
-      backendAvailable = false;
-    }
-
-    if (!backendAvailable && !isTauriEnvironment()) {
-      for (const pct of [25, 60, 90, 100]) {
-        await new Promise((resolve) => setTimeout(resolve, 60));
-        setDownloadProgress(pct);
-        setDownloadStatusMsg(`Simulating model preparation (${pct}%)...`);
+      let backendAvailable = true;
+      try {
+        const probe = await fetch(`${LOCAL_ENGINE_ROOT}/health`, {
+          signal: controller.signal,
+        });
+        if (!probe.ok) backendAvailable = false;
+      } catch (err: unknown) {
+        if (isAbortError(err) || controller.signal.aborted) {
+          throw err instanceof Error
+            ? err
+            : new DOMException("Model download aborted.", "AbortError");
+        }
+        backendAvailable = false;
       }
-      return;
-    }
 
-    const params = new URLSearchParams({
-      model_id: modelId,
-      ram_gb: String(sharedRamGb),
-      source_type: sourceType,
-    });
-    if (filename) {
-      params.set("filename", filename);
-    }
-    if (roomContext?.roomId) {
-      params.set("room_id", roomContext.roomId);
-      params.set("network_mode", roomContext.networkMode);
-      if (roomContext.roomKey) {
-        params.set("room_key", roomContext.roomKey);
+      if (controller.signal.aborted || !isMountedRef.current) {
+        throw new DOMException("Model download aborted.", "AbortError");
       }
-    }
 
-    const response = await fetch(
-      `${LOCAL_ENGINE_ROOT}/models/download-stream?${params.toString()}`
-    );
-    if (response.status === 403 || response.status === 409) {
-      const detail = await extractApiErrorDetail(
-        response,
-        `Cannot join room '${roomContext?.roomId ?? roomId}' (HTTP ${response.status}).`
+      if (!backendAvailable && !isTauriEnvironment()) {
+        for (const pct of [25, 60, 90, 100]) {
+          await new Promise<void>((resolve, reject) => {
+            if (controller.signal.aborted || !isMountedRef.current) {
+              reject(new DOMException("Model download aborted.", "AbortError"));
+              return;
+            }
+            const onAbort = (): void => {
+              window.clearTimeout(timerId);
+              reject(new DOMException("Model download aborted.", "AbortError"));
+            };
+            const timerId = window.setTimeout(() => {
+              controller.signal.removeEventListener("abort", onAbort);
+              resolve();
+            }, 60);
+            controller.signal.addEventListener("abort", onAbort, { once: true });
+          });
+          if (controller.signal.aborted || !isMountedRef.current) {
+            throw new DOMException("Model download aborted.", "AbortError");
+          }
+          setDownloadProgress(pct);
+          setDownloadStatusMsg(`Simulating model preparation (${pct}%)...`);
+        }
+        return;
+      }
+
+      const params = new URLSearchParams({
+        model_id: modelId,
+        ram_gb: String(sharedRamGb),
+        source_type: sourceType,
+      });
+      if (filename) {
+        params.set("filename", filename);
+      }
+      if (roomContext?.roomId) {
+        params.set("room_id", roomContext.roomId);
+        params.set("network_mode", roomContext.networkMode);
+        if (roomContext.roomKey) {
+          params.set("room_key", roomContext.roomKey);
+        }
+      }
+
+      const response = await fetch(
+        `${LOCAL_ENGINE_ROOT}/models/download-stream?${params.toString()}`,
+        { signal: controller.signal }
       );
-      throw new RoomJoinRejectedError(response.status, detail);
-    }
-    if (!response.ok || !response.body) {
-      const detail = !response.ok
-        ? await extractApiErrorDetail(
-            response,
-            `Failed to stream model download: HTTP ${response.status}`
-          )
-        : `Failed to stream model download: HTTP ${response.status}`;
-      throw new Error(detail);
-    }
+      if (controller.signal.aborted || !isMountedRef.current) {
+        throw new DOMException("Model download aborted.", "AbortError");
+      }
+      if (response.status === 403 || response.status === 409) {
+        const detail = await extractApiErrorDetail(
+          response,
+          `Cannot join room '${roomContext?.roomId ?? roomId}' (HTTP ${response.status}).`
+        );
+        throw new RoomJoinRejectedError(response.status, detail);
+      }
+      if (!response.ok || !response.body) {
+        const detail = !response.ok
+          ? await extractApiErrorDetail(
+              response,
+              `Failed to stream model download: HTTP ${response.status}`
+            )
+          : `Failed to stream model download: HTTP ${response.status}`;
+        throw new Error(detail);
+      }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
 
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() ?? "";
-
-        for (const rawEvent of events) {
-          const line = rawEvent.trim();
+      const processEventBlock = async (rawBlock: string): Promise<boolean> => {
+        const lines = rawBlock.split(/\r?\n/);
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
           if (!line.startsWith("data:")) continue;
           const dataStr = line.slice(5).trim();
+          if (!dataStr) continue;
           if (dataStr === "[DONE]") {
             try {
               await reader.cancel();
             } catch {
               // Ignore cancel errors while releasing stream lock
             }
-            return;
+            return true;
           }
           let payload: SseDownloadEvent;
           try {
@@ -814,12 +997,53 @@ export const Dashboard: React.FC = () => {
             }
             throw new Error(payload.message || "Model download failed.");
           }
-          setDownloadProgress(payload.progress);
-          setDownloadStatusMsg(payload.message || `${payload.progress.toFixed(0)}%`);
+          if (!controller.signal.aborted && isMountedRef.current) {
+            setDownloadProgress(payload.progress);
+            setDownloadStatusMsg(payload.message || `${payload.progress.toFixed(0)}%`);
+          }
         }
+        return false;
+      };
+
+      const onAbort = (): void => {
+        void Promise.resolve(reader.cancel()).catch(() => undefined);
+      };
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+
+      try {
+        while (true) {
+          if (controller.signal.aborted || !isMountedRef.current) {
+            throw new DOMException("Model download aborted.", "AbortError");
+          }
+          const { value, done } = await reader.read();
+          if (controller.signal.aborted || !isMountedRef.current) {
+            throw new DOMException("Model download aborted.", "AbortError");
+          }
+          if (done) {
+            buffer += decoder.decode();
+            if (buffer.trim()) {
+              await processEventBlock(buffer);
+            }
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split(/\r?\n\r?\n/);
+          buffer = events.pop() ?? "";
+
+          for (const rawEvent of events) {
+            if (await processEventBlock(rawEvent)) {
+              return;
+            }
+          }
+        }
+      } finally {
+        controller.signal.removeEventListener("abort", onAbort);
+        reader.releaseLock();
       }
     } finally {
-      reader.releaseLock();
+      if (downloadAbortRef.current === controller) {
+        downloadAbortRef.current = null;
+      }
     }
   };
 
@@ -846,7 +1070,7 @@ export const Dashboard: React.FC = () => {
     );
     if (matchedCatalog) {
       setModelTab("catalog");
-      setSelectedCatalogId(matchedCatalog.id);
+      updateSelectedCatalogId(matchedCatalog.id);
       setModelInput(matchedCatalog.repo_id);
       return {
         model: matchedCatalog.repo_id,
@@ -906,7 +1130,7 @@ export const Dashboard: React.FC = () => {
 
   const openCreateRoomModal = (): void => {
     setModalModelTab(modelTab);
-    setModalSelectedCatalogId(selectedCatalogId);
+    updateModalSelectedCatalogId(selectedCatalogId);
     setModalModel(modelInput);
     setModalCustomFilename(customFilename);
     setModalLocalFilePath(localFilePath);
@@ -946,21 +1170,31 @@ export const Dashboard: React.FC = () => {
     setErrorMessage(null);
     setDownloadProgress(null);
     setDownloadStatusMsg("");
+    const lifecycleSignal = mountAbortRef.current.signal;
 
     try {
       setStatusMessage("Starting local Python core engine...");
       await invokeTauriCommand<string>("start_python_core");
+      if (lifecycleSignal.aborted || !isMountedRef.current) {
+        return;
+      }
 
       // Pre-flight room admission check BEFORE downloading any model weights
       setStatusMessage(`Checking room '${targetRoom}' availability...`);
       try {
-        await checkRoomJoin({
-          room_id: targetRoom,
-          model_id: targetModel,
-          network_mode: targetMode,
-          room_key: targetKey || null,
-        });
+        await checkRoomJoin(
+          {
+            room_id: targetRoom,
+            model_id: targetModel,
+            network_mode: targetMode,
+            room_key: targetKey || null,
+          },
+          { signal: lifecycleSignal }
+        );
       } catch (checkErr: unknown) {
+        if (isAbortError(checkErr) || lifecycleSignal.aborted || !isMountedRef.current) {
+          throw checkErr;
+        }
         if (checkErr instanceof RoomJoinRejectedError) {
           throw checkErr;
         }
@@ -969,12 +1203,20 @@ export const Dashboard: React.FC = () => {
         }
       }
 
+      if (lifecycleSignal.aborted || !isMountedRef.current) {
+        return;
+      }
+
       setStatusMessage("Checking and preparing model weights...");
       await streamModelDownload(targetModel, targetSourceType, targetFilename, {
         roomId: targetRoom,
         networkMode: targetMode,
         roomKey: targetKey || null,
       });
+
+      if (lifecycleSignal.aborted || !isMountedRef.current) {
+        return;
+      }
 
       setStatusMessage(
         `Joining ${targetMode.toUpperCase()} room '${targetRoom}' & allocating ${sharedRamGb} GB RAM...`
@@ -1006,11 +1248,19 @@ export const Dashboard: React.FC = () => {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
+          signal: lifecycleSignal,
         });
       } catch (fetchErr: unknown) {
+        if (isAbortError(fetchErr) || lifecycleSignal.aborted || !isMountedRef.current) {
+          throw fetchErr;
+        }
         if (isTauriEnvironment()) {
           throw fetchErr;
         }
+      }
+
+      if (lifecycleSignal.aborted || !isMountedRef.current) {
+        return;
       }
 
       let data: NodeStatusResponse;
@@ -1058,6 +1308,10 @@ export const Dashboard: React.FC = () => {
         data = (await response.json()) as NodeStatusResponse;
       }
 
+      if (lifecycleSignal.aborted || !isMountedRef.current) {
+        return;
+      }
+
       setIsSharing(true);
       setSessionToken(data.session_token ?? null);
       setApiBaseUrl(data.api_base_url ?? DEFAULT_API_BASE_URL);
@@ -1090,6 +1344,14 @@ export const Dashboard: React.FC = () => {
       );
       await fetchAvailableRooms();
     } catch (err: unknown) {
+      if (isAbortError(err) || !isMountedRef.current) {
+        if (isMountedRef.current) {
+          setDownloadProgress(null);
+          setDownloadStatusMsg("");
+          setStatusMessage("Model download cancelled.");
+        }
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       setErrorMessage(message);
       setDownloadProgress(null);
@@ -1100,11 +1362,17 @@ export const Dashboard: React.FC = () => {
         setStatusMessage("Failed to start P2P AI Gateway.");
       }
     } finally {
-      setIsBusy(false);
+      if (isMountedRef.current) {
+        setIsBusy(false);
+      }
     }
   };
 
   const handleStopSharing = async (): Promise<void> => {
+    if (downloadAbortRef.current) {
+      downloadAbortRef.current.abort();
+      downloadAbortRef.current = null;
+    }
     setIsBusy(true);
     setErrorMessage(null);
     try {
@@ -1114,23 +1382,35 @@ export const Dashboard: React.FC = () => {
         const stopRes = await fetch(`${LOCAL_ENGINE_ROOT}/stop-node`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: mountAbortRef.current.signal,
         });
         stoppedViaApi = stopRes.ok;
-      } catch {
+      } catch (stopErr: unknown) {
+        if (isAbortError(stopErr) || !isMountedRef.current) {
+          return;
+        }
         // Proceed to terminate Python process if HTTP endpoint is unreachable
       }
 
       const stopMsg = stoppedViaApi
         ? "Node stopped & shards released (Core Engine ready)."
         : await invokeTauriCommand<string>("stop_python_core");
+      if (!isMountedRef.current) {
+        return;
+      }
       resetSharingState();
       setStatusMessage(`Stopped — ${stopMsg}`);
       await Promise.all([fetchAvailableRooms(), fetchNetworkStatus()]);
     } catch (err: unknown) {
+      if (isAbortError(err) || !isMountedRef.current) {
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       setErrorMessage(message);
     } finally {
-      setIsBusy(false);
+      if (isMountedRef.current) {
+        setIsBusy(false);
+      }
     }
   };
 
@@ -1214,7 +1494,7 @@ export const Dashboard: React.FC = () => {
         catalogModels.find((m) => m.id === modalSelectedCatalogId) ??
         catalogModels.find((m) => m.repo_id === resolvedModel.model);
       if (matchedCatalog) {
-        setSelectedCatalogId(matchedCatalog.id);
+        updateSelectedCatalogId(matchedCatalog.id);
         setModelInput(matchedCatalog.repo_id);
       } else {
         setModelInput(resolvedModel.model);
@@ -1325,9 +1605,11 @@ export const Dashboard: React.FC = () => {
             inTauri &&
             !(e.target as HTMLElement).closest("button")
           ) {
-            void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) =>
-              setIsMaximized(Boolean(max))
-            );
+            void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) => {
+              if (isMountedRef.current) {
+                setIsMaximized(Boolean(max));
+              }
+            });
           }
         }}
       >
@@ -1497,9 +1779,11 @@ export const Dashboard: React.FC = () => {
                 aria-label="Maximize window"
                 className="window-caption-btn"
                 onClick={() =>
-                  void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) =>
-                    setIsMaximized(Boolean(max))
-                  )
+                  void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) => {
+                    if (isMountedRef.current) {
+                      setIsMaximized(Boolean(max));
+                    }
+                  })
                 }
               >
                 {isMaximized ? (
@@ -1770,7 +2054,7 @@ export const Dashboard: React.FC = () => {
                     setDownloadStatusMsg("");
                   }}
                   onSelectCatalogModel={(chosenId, found) => {
-                    setSelectedCatalogId(chosenId);
+                    updateSelectedCatalogId(chosenId);
                     if (found) {
                       setModelInput(found.repo_id);
                     }
@@ -1958,22 +2242,50 @@ export const Dashboard: React.FC = () => {
                       style={{
                         display: "flex",
                         justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: "8px",
                         fontSize: "11.5px",
                         marginBottom: "5px",
                       }}
                     >
                       <span
                         data-testid="model-download-status-msg"
-                        style={{ color: "var(--text-secondary)" }}
+                        style={{
+                          color: "var(--text-secondary)",
+                          minWidth: 0,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
                       >
                         {downloadStatusMsg || "Preparing model..."}
                       </span>
-                      <span
-                        data-testid="model-download-percent"
-                        style={{ fontWeight: 700, color: "var(--accent-text)" }}
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          flexShrink: 0,
+                        }}
                       >
-                        {downloadProgress.toFixed(0)}%
-                      </span>
+                        <span
+                          data-testid="model-download-percent"
+                          style={{ fontWeight: 700, color: "var(--accent-text)" }}
+                        >
+                          {downloadProgress.toFixed(0)}%
+                        </span>
+                        {isBusy && !isSharing && (
+                          <button
+                            type="button"
+                            data-testid="cancel-download-btn"
+                            className="native-btn"
+                            aria-label="Cancel model download"
+                            onClick={handleCancelDownload}
+                            style={{ padding: "2px 8px", fontSize: "11px" }}
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <div
                       role="progressbar"
@@ -2381,7 +2693,7 @@ export const Dashboard: React.FC = () => {
                           setErrorMessage(null);
                         }}
                         onSelectCatalogModel={(chosenId, found) => {
-                          setModalSelectedCatalogId(chosenId);
+                          updateModalSelectedCatalogId(chosenId);
                           if (found) {
                             setModalModel(found.repo_id);
                           }

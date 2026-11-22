@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -2895,5 +2896,668 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
 
     expect(releaseLockSpy).toHaveBeenCalledTimes(1);
     expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("parses CRLF-delimited (\\r\\n\\r\\n) and chunk-split SSE download progress frames cleanly", async () => {
+    const encoder = new TextEncoder();
+    const startPayloads: StartNodeRequest[] = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: 1,
+            models: [
+              {
+                id: "llama3",
+                name: "Llama 3.1 8B",
+                repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+                filename: "llama.gguf",
+                estimated_ram_gb: 6,
+                enabled: true,
+              },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        const chunk1 = `event: progress\r\ndata: ${JSON.stringify({
+          model_id: "meta-llama/Llama-3.1-8B-Instruct",
+          status: "downloading",
+          progress: 35,
+          downloaded_bytes: 35,
+          total_bytes: 100,
+          local_path: null,
+          message: "CRLF chunk 35%",
+        })}\r\n`;
+        const chunk2 = `\r\ndata: ${JSON.stringify({
+          model_id: "meta-llama/Llama-3.1-8B-Instruct",
+          status: "ready",
+          progress: 100,
+          downloaded_bytes: 100,
+          total_bytes: 100,
+          local_path: "/models/llama.gguf",
+          message: "CRLF complete 100%",
+        })}\r\n\r\ndata: [DONE]\r\n\r\n`;
+
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(chunk1));
+            setTimeout(() => {
+              controller.enqueue(encoder.encode(chunk2));
+              controller.close();
+            }, 15);
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        const statusResp: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: parsed.node_id,
+          model_id: parsed.model_id,
+          room_id: parsed.room_id,
+          is_private: false,
+          is_unlisted: false,
+          backend: parsed.backend,
+          n_layers: 32,
+          total_layers: 32,
+          allocated_ram_mb: parsed.max_ram_mb,
+          allocated_vram_mb: parsed.max_vram_mb,
+          p2p_listen_port: parsed.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-crlf-ok",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Active",
+        };
+        return new Response(JSON.stringify(statusResp), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("model-download-percent").textContent).toBe("100%");
+      expect(screen.getByTestId("model-download-status-msg").textContent).toBe(
+        "CRLF complete 100%"
+      );
+    });
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+      expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
+    });
+  });
+
+  it("aborts SSE download stream on unmount and on Cancel click without post-unmount state errors", async () => {
+    const encoder = new TextEncoder();
+
+    const setupScenario = () => {
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const downloadSignals: AbortSignal[] = [];
+      const cancelSpy = vi.fn(async () => undefined);
+      const releaseLockSpy = vi.fn();
+      let startNodeCalled = false;
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/available-rooms")) {
+          return new Response("[]", { status: 200 });
+        }
+        if (url.includes("/network-status")) {
+          return new Response(
+            JSON.stringify({
+              network_status: "online",
+              tracker_reachable: true,
+              tracker_url: "https://network.shardai.online",
+              lan_peers_count: 0,
+              zeroconf_available: false,
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes("/models/catalog")) {
+          return new Response(
+            JSON.stringify({
+              source: "cloud",
+              count: 1,
+              models: [
+                {
+                  id: "llama3",
+                  name: "Llama 3.1 8B",
+                  repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+                  filename: "llama.gguf",
+                  estimated_ram_gb: 6,
+                  enabled: true,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes("/rooms/check-join")) {
+          return new Response(
+            JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+            { status: 200 }
+          );
+        }
+        if (url.endsWith("/health")) {
+          return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+        }
+        if (url.includes("/models/download-stream")) {
+          if (init?.signal) {
+            downloadSignals.push(init.signal);
+          }
+          let readCount = 0;
+          const abortableReader = {
+            read: vi.fn(
+              () =>
+                new Promise<{ value?: Uint8Array; done: boolean }>((resolve, reject) => {
+                  readCount += 1;
+                  if (readCount === 1) {
+                    resolve({
+                      done: false,
+                      value: encoder.encode(
+                        `data: ${JSON.stringify({
+                          model_id: "meta-llama/Llama-3.1-8B-Instruct",
+                          status: "downloading",
+                          progress: 45,
+                          downloaded_bytes: 45,
+                          total_bytes: 100,
+                          local_path: null,
+                          message: "Downloading 45%",
+                        })}\r\n\r\n`
+                      ),
+                    });
+                    return;
+                  }
+                  const sig = init?.signal;
+                  if (sig?.aborted) {
+                    reject(new DOMException("Aborted", "AbortError"));
+                    return;
+                  }
+                  sig?.addEventListener(
+                    "abort",
+                    () => reject(new DOMException("Aborted", "AbortError")),
+                    { once: true }
+                  );
+                })
+            ),
+            cancel: cancelSpy,
+            releaseLock: releaseLockSpy,
+            closed: Promise.resolve(undefined),
+          };
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ "Content-Type": "text/event-stream" }),
+            body: { getReader: () => abortableReader },
+          } as unknown as Response;
+        }
+        if (url.endsWith("/start-node")) {
+          startNodeCalled = true;
+        }
+        return new Response("{}", { status: 200 });
+      });
+
+      return {
+        consoleErrorSpy,
+        downloadSignals,
+        cancelSpy,
+        releaseLockSpy,
+        wasStartNodeCalled: () => startNodeCalled,
+      };
+    };
+
+    // Sub-case A: User clicks Cancel button mid-download
+    const scenarioA = setupScenario();
+    const cancelRender = render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("model-download-percent").textContent).toBe("45%");
+      expect(screen.getByTestId("cancel-download-btn")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("cancel-download-btn"));
+    await waitFor(() => {
+      expect(scenarioA.downloadSignals[0]?.aborted).toBe(true);
+      expect(screen.queryByTestId("model-download-progress-bar")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByTestId("status-message").textContent).toBe(
+        "Model download cancelled."
+      );
+    });
+    expect(scenarioA.wasStartNodeCalled()).toBe(false);
+    expect(scenarioA.cancelSpy).toHaveBeenCalledTimes(1);
+    expect(scenarioA.releaseLockSpy).toHaveBeenCalledTimes(1);
+    expect(scenarioA.consoleErrorSpy).not.toHaveBeenCalled();
+    cancelRender.unmount();
+
+    // Sub-case B: Component unmounts mid-download
+    vi.restoreAllMocks();
+    const scenarioB = setupScenario();
+    const unmountRender = render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("model-download-percent").textContent).toBe("45%");
+    });
+
+    unmountRender.unmount();
+    await waitFor(() => {
+      expect(scenarioB.downloadSignals[0]?.aborted).toBe(true);
+      expect(scenarioB.cancelSpy).toHaveBeenCalledTimes(1);
+      expect(scenarioB.releaseLockSpy).toHaveBeenCalledTimes(1);
+    });
+    expect(scenarioB.wasStartNodeCalled()).toBe(false);
+    expect(scenarioB.consoleErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it("prevents overlapping slow /network-status and /status polling requests and aborts signals on unmount", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    let netStatusPollCount = 0;
+    let statusPollCount = 0;
+    const netSignals: AbortSignal[] = [];
+    const statusPollSignals: AbortSignal[] = [];
+
+    let resolveSlowNetPoll!: (res: Response) => void;
+    let resolveSlowStatusPoll!: (res: Response) => void;
+    let holdNetPoll = true;
+    let holdStatusPoll = false;
+
+    const runningStatus: NodeStatusResponse = {
+      state: "RUNNING",
+      node_id: "node-poll-guard",
+      model_id: "meta-llama/Llama-3.1-8B-Instruct",
+      room_id: "public",
+      is_private: false,
+      is_unlisted: false,
+      backend: "llama_cpp",
+      n_layers: 32,
+      total_layers: 32,
+      allocated_ram_mb: 4096,
+      allocated_vram_mb: 0,
+      p2p_listen_port: 49152,
+      connected_peers_count: 1,
+      peers: [],
+      session_token: "sk-poll-guard",
+      api_base_url: "http://127.0.0.1:8000/v1",
+      coverage_percent: 100,
+      is_swarm_ready: true,
+      message: "Gateway Active",
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/network-status")) {
+        netStatusPollCount += 1;
+        if (init?.signal) {
+          netSignals.push(init.signal);
+        }
+        if (holdNetPoll) {
+          return new Promise<Response>((resolve, reject) => {
+            resolveSlowNetPoll = resolve;
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true }
+            );
+          });
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              network_status: "online",
+              tracker_reachable: true,
+              tracker_url: "https://network.shardai.online",
+              lan_peers_count: 0,
+              zeroconf_available: false,
+            }),
+            { status: 200 }
+          )
+        );
+      }
+      if (url.endsWith("/status")) {
+        statusPollCount += 1;
+        if (init?.signal) {
+          statusPollSignals.push(init.signal);
+        }
+        if (holdStatusPoll) {
+          return new Promise<Response>((resolve, reject) => {
+            resolveSlowStatusPoll = resolve;
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true }
+            );
+          });
+        }
+        return Promise.resolve(new Response(JSON.stringify(runningStatus), { status: 200 }));
+      }
+      if (url.includes("/available-rooms")) {
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }
+      if (url.includes("/models/catalog")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ source: "cloud", count: 0, models: [] }), {
+            status: 200,
+          })
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              total_ram_gb: 16,
+              available_ram_gb: 12,
+              max_shareable_ram_gb: 11,
+            }),
+            { status: 200 }
+          )
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
+
+    const { unmount } = render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(netStatusPollCount).toBe(1);
+      expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
+    });
+
+    // Advance 2x the 2000ms fast-poll interval while first /network-status is still in flight
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4500);
+    });
+    expect(netStatusPollCount).toBe(1);
+
+    // Resolve slow network poll -> switches to online (10s poll) and clears hold
+    holdNetPoll = false;
+    await act(async () => {
+      resolveSlowNetPoll(
+        new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        )
+      );
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("network-status-indicator").getAttribute("data-status")).toBe(
+        "online"
+      );
+    });
+
+    // Now test slow (>5s) /status poller non-overlap
+    holdStatusPoll = true;
+    const statusCountBeforeTicks = statusPollCount;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(statusPollCount).toBe(statusCountBeforeTicks + 1);
+
+    // Advance another 10s (two more 5s intervals) while slow /status request is still pending
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(statusPollCount).toBe(statusCountBeforeTicks + 1);
+
+    // Unmount while /status poll is still in flight -> AbortSignal must fire immediately
+    const activeStatusSignal = statusPollSignals[statusPollSignals.length - 1];
+    const activeNetSignal = netSignals[netSignals.length - 1];
+    expect(activeStatusSignal?.aborted).toBe(false);
+
+    unmount();
+
+    expect(activeStatusSignal?.aborted).toBe(true);
+    expect(activeNetSignal?.aborted).toBe(true);
+    // Reference resolveSlowStatusPoll so TypeScript strict mode confirms no unused closure variable
+    expect(typeof resolveSlowStatusPoll).toBe("function");
+  });
+
+  it("initializes fetchModelCatalog and updates selection cleanly under React StrictMode without nested setState in updaters", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const catalogPayload: CatalogModelItem[] = [
+      {
+        id: "llama3",
+        name: "Llama 3.1 8B",
+        repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+        filename: "llama.gguf",
+        estimated_ram_gb: 6,
+        enabled: true,
+      },
+      {
+        id: "qwen7b",
+        name: "Qwen 2.5 7B",
+        repo_id: "Qwen/Qwen2.5-7B-Instruct",
+        filename: "qwen.gguf",
+        estimated_ram_gb: 5,
+        enabled: true,
+      },
+    ];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: catalogPayload.length,
+            models: catalogPayload,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    const { unmount } = render(
+      <StrictMode>
+        <Dashboard />
+      </StrictMode>
+    );
+
+    await waitFor(() => {
+      const selectEl = screen.getByTestId("catalog-model-select") as HTMLSelectElement;
+      expect(selectEl.disabled).toBe(false);
+      expect(selectEl.value).toBe("llama3");
+    });
+
+    // Switch to custom tab and verify modelInput was synced to first catalog repo_id
+    fireEvent.click(screen.getByTestId("tab-custom"));
+    expect((screen.getByTestId("model-input") as HTMLInputElement).value).toBe(
+      "meta-llama/Llama-3.1-8B-Instruct"
+    );
+
+    // Switch back to catalog, pick second model, refresh catalog, and ensure selection is preserved
+    fireEvent.click(screen.getByTestId("tab-catalog"));
+    fireEvent.change(screen.getByTestId("catalog-model-select"), {
+      target: { value: "qwen7b" },
+    });
+    expect((screen.getByTestId("catalog-model-select") as HTMLSelectElement).value).toBe(
+      "qwen7b"
+    );
+
+    fireEvent.click(screen.getByTestId("refresh-catalog-btn"));
+    await waitFor(() => {
+      expect((screen.getByTestId("refresh-catalog-btn") as HTMLButtonElement).disabled).toBe(
+        false
+      );
+    });
+    expect((screen.getByTestId("catalog-model-select") as HTMLSelectElement).value).toBe(
+      "qwen7b"
+    );
+
+    fireEvent.click(screen.getByTestId("tab-custom"));
+    expect((screen.getByTestId("model-input") as HTMLInputElement).value).toBe(
+      "Qwen/Qwen2.5-7B-Instruct"
+    );
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    unmount();
+  });
+
+  it("clears handleCopy timeout on unmount and rapid consecutive copies", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const writeTextMock = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: writeTextMock },
+    });
+
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+
+    const runningStatus: NodeStatusResponse = {
+      state: "RUNNING",
+      node_id: "node-copy-test",
+      model_id: "meta-llama/Llama-3.1-8B-Instruct",
+      room_id: "public",
+      is_private: false,
+      is_unlisted: false,
+      backend: "llama_cpp",
+      n_layers: 32,
+      total_layers: 32,
+      allocated_ram_mb: 4096,
+      allocated_vram_mb: 0,
+      p2p_listen_port: 49152,
+      connected_peers_count: 1,
+      peers: [],
+      session_token: "sk-copy-test-token",
+      api_base_url: "http://127.0.0.1:8000/v1",
+      coverage_percent: 100,
+      is_swarm_ready: true,
+      network_status: "online",
+      message: "Active",
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/status")) {
+        return new Response(JSON.stringify(runningStatus), { status: 200 });
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    const { unmount } = render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
+    });
+
+    const copyButtons = screen.getAllByRole("button", { name: "Copy" });
+    expect(copyButtons.length).toBeGreaterThanOrEqual(2);
+
+    await act(async () => {
+      fireEvent.click(copyButtons[0]);
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "Copied!" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(copyButtons[1]);
+      await Promise.resolve();
+    });
+    expect(clearTimeoutSpy).toHaveBeenCalled();
+
+    const clearCallsBeforeUnmount = clearTimeoutSpy.mock.calls.length;
+    unmount();
+    expect(clearTimeoutSpy.mock.calls.length).toBeGreaterThan(clearCallsBeforeUnmount);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
   });
 });

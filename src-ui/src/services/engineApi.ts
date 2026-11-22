@@ -1,12 +1,22 @@
 import type {
   CheckRoomJoinRequest,
   CheckRoomJoinResponse,
+  NetworkStatusResponse,
   NodeStatusResponse,
   OpenAIChatMessagePayload,
   StartNodeRequest,
 } from "../types/node";
 
 export const LOCAL_ENGINE_BASE_URL = "http://127.0.0.1:8000";
+
+export function isAbortError(err: unknown): boolean {
+  return (
+    (typeof DOMException !== "undefined" &&
+      err instanceof DOMException &&
+      err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
 
 export class RoomJoinRejectedError extends Error {
   public readonly statusCode: number;
@@ -92,12 +102,14 @@ export async function extractApiErrorDetail(
 }
 
 export async function checkRoomJoin(
-  payload: CheckRoomJoinRequest
+  payload: CheckRoomJoinRequest,
+  options?: { signal?: AbortSignal }
 ): Promise<CheckRoomJoinResponse> {
   const response = await fetch(`${LOCAL_ENGINE_BASE_URL}/rooms/check-join`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    ...(options?.signal ? { signal: options.signal } : {}),
   });
   if (response.status === 403 || response.status === 409) {
     const detail = await extractApiErrorDetail(
@@ -116,15 +128,32 @@ export async function checkRoomJoin(
   return (await response.json()) as CheckRoomJoinResponse;
 }
 
-export async function fetchNodeStatus(): Promise<NodeStatusResponse> {
+export async function fetchNodeStatus(options?: {
+  signal?: AbortSignal;
+}): Promise<NodeStatusResponse> {
   const response = await fetch(`${LOCAL_ENGINE_BASE_URL}/status`, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
+    ...(options?.signal ? { signal: options.signal } : {}),
   });
   if (!response.ok) {
     throw new Error(`Failed to fetch node status: HTTP ${response.status}`);
   }
   return (await response.json()) as NodeStatusResponse;
+}
+
+export async function fetchNetworkStatus(options?: {
+  signal?: AbortSignal;
+}): Promise<NetworkStatusResponse> {
+  const response = await fetch(`${LOCAL_ENGINE_BASE_URL}/network-status`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    ...(options?.signal ? { signal: options.signal } : {}),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch network status: HTTP ${response.status}`);
+  }
+  return (await response.json()) as NetworkStatusResponse;
 }
 
 export async function startLocalNode(
