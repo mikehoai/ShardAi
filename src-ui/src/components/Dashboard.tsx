@@ -330,6 +330,9 @@ export const Dashboard: React.FC = () => {
   const [isSwarmReady, setIsSwarmReady] = useState<boolean>(false);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
   const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
+  const handleCloseChat = useCallback((): void => {
+    setIsChatOpen(false);
+  }, []);
   const [statusMessage, setStatusMessage] = useState<string>(
     "Idle — Select a room from the Lobby or configure your own node below."
   );
@@ -2805,7 +2808,7 @@ export const Dashboard: React.FC = () => {
           apiBaseUrl={apiBaseUrl}
           sessionToken={sessionToken}
           modelId={activeModelId}
-          onClose={() => setIsChatOpen(false)}
+          onClose={handleCloseChat}
         />
       )}
 

@@ -12,8 +12,11 @@ export interface ChatWindowProps {
   onClose: () => void;
 }
 
+let messageSeq = 0;
+
 function createMessageId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  messageSeq += 1;
+  return `${prefix}-${Date.now()}-${messageSeq}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export const ChatWindow: React.FC<ChatWindowProps> = ({
@@ -30,13 +33,32 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [chatError, setChatError] = useState<string | null>(null);
 
+  const isMountedRef = useRef<boolean>(true);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const onCloseRef = useRef<() => void>(onClose);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const prevModelSessionRef = useRef<{ modelId: string; sessionToken: string }>({
     modelId,
     sessionToken,
   });
+
+  // Track mount lifecycle (StrictMode-safe) and abort any in-flight stream on unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Keep latest onClose callback without re-triggering open-focus or keydown effects
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   // Reset chat history when switching active model or gateway session token
   useEffect(() => {
@@ -55,37 +77,39 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     setInputValue("");
   }, [modelId, sessionToken]);
 
-  // Abort any in-flight stream when closing or unmounting
+  // Abort any in-flight stream when closing
   useEffect(() => {
-    if (!isOpen && abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-      setIsStreaming(false);
-    }
-    return () => {
+    if (!isOpen) {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
-    };
+      setIsStreaming(false);
+    }
   }, [isOpen]);
 
-  // Focus input when opened and listen for Escape to close
+  // Focus composer textarea only when ChatWindow opens
+  useEffect(() => {
+    if (isOpen) {
+      textareaRef.current?.focus();
+    }
+  }, [isOpen]);
+
+  // Listen for Escape to close without tearing down/re-attaching on parent re-renders
   useEffect(() => {
     if (!isOpen) return;
-    textareaRef.current?.focus();
 
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isOpen, onClose]);
+  }, [isOpen]);
 
   // Auto-scroll message list on updates
   useEffect(() => {
@@ -157,6 +181,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         messages: requestHistory,
         signal: controller.signal,
         onToken: (token) => {
+          if (!isMountedRef.current || abortControllerRef.current !== controller) {
+            return;
+          }
           setMessages((prev) =>
             prev.map((item) =>
               item.id === assistantMsgId
@@ -167,7 +194,11 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         },
       });
     } catch (err) {
+      if (!isMountedRef.current || abortControllerRef.current !== controller) {
+        return;
+      }
       const isAbortError =
+        controller.signal.aborted ||
         (err instanceof DOMException && err.name === "AbortError") ||
         (err instanceof Error && err.name === "AbortError");
       if (!isAbortError) {
@@ -182,13 +213,23 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         );
       }
     } finally {
-      if (abortControllerRef.current === controller) {
+      const isLatestController = abortControllerRef.current === controller;
+      if (isLatestController) {
         abortControllerRef.current = null;
+        if (isMountedRef.current) {
+          setIsStreaming(false);
+        }
       }
-      setMessages((prev) =>
-        prev.filter((item) => !(item.id === assistantMsgId && item.content.trim() === ""))
-      );
-      setIsStreaming(false);
+      if (isMountedRef.current && (isLatestController || controller.signal.aborted)) {
+        setMessages((prev) => {
+          const hasEmptyPlaceholder = prev.some(
+            (item) => item.id === assistantMsgId && item.content.trim() === ""
+          );
+          return hasEmptyPlaceholder
+            ? prev.filter((item) => !(item.id === assistantMsgId && item.content.trim() === ""))
+            : prev;
+        });
+      }
     }
   };
 

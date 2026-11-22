@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -2895,5 +2896,371 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
 
     expect(releaseLockSpy).toHaveBeenCalledTimes(1);
     expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents stale aborted ChatWindow stream from clobbering a rapid resend stream or StrictMode mount state", async () => {
+    const encoder = new TextEncoder();
+    let requestIndex = 0;
+    const abortSignals: AbortSignal[] = [];
+    let rejectDeferredA: ((reason?: unknown) => void) | null = null;
+    let sseControllerB: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let rejectDeferredC: ((reason?: unknown) => void) | null = null;
+    let sseControllerD: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (!url.includes("/chat/completions")) {
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      }
+
+      requestIndex += 1;
+      const currentReq = requestIndex;
+      if (init?.signal) {
+        abortSignals.push(init.signal);
+      }
+
+      if (currentReq === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          rejectDeferredA = reject;
+        });
+      }
+
+      if (currentReq === 2) {
+        const streamB = new ReadableStream<Uint8Array>({
+          start(controller) {
+            sseControllerB = controller;
+          },
+        });
+        return Promise.resolve(
+          new Response(streamB, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          })
+        );
+      }
+
+      if (currentReq === 3) {
+        return new Promise<Response>((_resolve, reject) => {
+          rejectDeferredC = reject;
+        });
+      }
+
+      if (currentReq === 4) {
+        const streamD = new ReadableStream<Uint8Array>({
+          start(controller) {
+            sseControllerD = controller;
+          },
+        });
+        return Promise.resolve(
+          new Response(streamD, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          })
+        );
+      }
+
+      return new Promise<Response>(() => {
+        // Pending stream E to verify unmount abort
+      });
+    });
+
+    const { unmount } = render(
+      <StrictMode>
+        <ChatWindow
+          isOpen={true}
+          isModelReady={true}
+          coveragePercent={100}
+          apiBaseUrl="http://127.0.0.1:8000/v1"
+          sessionToken="sk-race-test"
+          modelId="Qwen/Qwen2.5-7B-Instruct"
+          onClose={vi.fn()}
+        />
+      </StrictMode>
+    );
+
+    // 1. Start Stream A (pending deferred promise)
+    const input = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "Prompt A" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-stop-btn")).toBeTruthy();
+      expect(abortSignals).toHaveLength(1);
+    });
+
+    // 2. Click Stop -> immediately submit Prompt B before Stream A's promise settles
+    fireEvent.click(screen.getByTestId("chat-stop-btn"));
+    expect(abortSignals[0].aborted).toBe(true);
+    expect(screen.queryByTestId("chat-stop-btn")).toBeNull();
+
+    fireEvent.change(input, { target: { value: "Prompt B" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-stop-btn")).toBeTruthy();
+      expect(screen.getByTestId("chat-thinking-indicator")).toBeTruthy();
+      expect(abortSignals).toHaveLength(2);
+    });
+    expect(abortSignals[1].aborted).toBe(false);
+
+    // 3. Reject stale Stream A asynchronously while Stream B is active
+    await act(async () => {
+      rejectDeferredA?.(new DOMException("The operation was aborted.", "AbortError"));
+      await Promise.resolve();
+    });
+
+    // Stream B MUST stay in streaming state with Stop button still visible
+    expect(screen.getByTestId("chat-stop-btn")).toBeTruthy();
+    expect(screen.queryByTestId("chat-send-btn")).toBeNull();
+    expect(screen.getByTestId("chat-thinking-indicator")).toBeTruthy();
+    expect(screen.queryByTestId("chat-error-banner")).toBeNull();
+    expect((screen.getByTestId("chat-input") as HTMLTextAreaElement).disabled).toBe(true);
+
+    // 4. Stream B delivers tokens and finishes normally
+    act(() => {
+      const ctrlB = sseControllerB as ReadableStreamDefaultController<Uint8Array> | null;
+      ctrlB?.enqueue(
+        encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "Stream B " } }] })}\n\n`)
+      );
+      ctrlB?.enqueue(
+        encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "completed." } }] })}\n\n`)
+      );
+      ctrlB?.enqueue(encoder.encode("data: [DONE]\n\n"));
+      ctrlB?.close();
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-stop-btn")).toBeNull();
+      expect(screen.getByTestId("chat-send-btn")).toBeTruthy();
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Stream B completed."
+      );
+    });
+
+    // 5. Repeat with non-abort stale rejection from Stream C while Stream D is active
+    fireEvent.change(input, { target: { value: "Prompt C" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => expect(abortSignals).toHaveLength(3));
+
+    fireEvent.click(screen.getByTestId("chat-stop-btn"));
+    expect(abortSignals[2].aborted).toBe(true);
+
+    fireEvent.change(input, { target: { value: "Prompt D" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => expect(abortSignals).toHaveLength(4));
+
+    await act(async () => {
+      rejectDeferredC?.(new Error("Stale network reset after abort"));
+      await Promise.resolve();
+    });
+
+    // Stale Stream C error must NOT set error banner or clobber Stream D
+    expect(screen.getByTestId("chat-stop-btn")).toBeTruthy();
+    expect(screen.queryByTestId("chat-error-banner")).toBeNull();
+
+    act(() => {
+      const ctrlD = sseControllerD as ReadableStreamDefaultController<Uint8Array> | null;
+      ctrlD?.enqueue(
+        encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "Stream D OK" } }] })}\n\n`)
+      );
+      ctrlD?.enqueue(encoder.encode("data: [DONE]\n\n"));
+      ctrlD?.close();
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-stop-btn")).toBeNull();
+      const assistantBubbles = screen.getAllByTestId("chat-message-assistant");
+      expect(assistantBubbles[assistantBubbles.length - 1].textContent).toContain("Stream D OK");
+    });
+
+    // 6. Start Stream E and unmount -> active controller must be aborted cleanly
+    fireEvent.change(input, { target: { value: "Prompt E" } });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => expect(abortSignals).toHaveLength(5));
+    expect(abortSignals[4].aborted).toBe(false);
+
+    unmount();
+    expect(abortSignals[4].aborted).toBe(true);
+  });
+
+  it("keeps ChatWindow focus and keydown listener stable across parent re-renders with changing onClose references", () => {
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const removeSpy = vi.spyOn(window, "removeEventListener");
+
+    const countKeydownCalls = (spy: typeof addSpy): number =>
+      spy.mock.calls.filter(([eventType]) => eventType === "keydown").length;
+
+    const firstOnClose = vi.fn();
+    const secondOnClose = vi.fn();
+    const thirdOnClose = vi.fn();
+
+    const { rerender } = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={95}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-focus-unit"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={firstOnClose}
+      />
+    );
+
+    const textarea = screen.getByTestId("chat-input");
+    const closeBtn = screen.getByTestId("chat-close-btn");
+    expect(document.activeElement).toBe(textarea);
+
+    const initialAddCount = countKeydownCalls(addSpy);
+    const initialRemoveCount = countKeydownCalls(removeSpy);
+
+    // User moves focus to the Close button
+    closeBtn.focus();
+    expect(document.activeElement).toBe(closeBtn);
+
+    // Parent re-renders with new inline onClose callbacks and updated coveragePercent
+    rerender(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={98}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-focus-unit"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={secondOnClose}
+      />
+    );
+    expect(document.activeElement).toBe(closeBtn);
+
+    rerender(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-focus-unit"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={thirdOnClose}
+      />
+    );
+    expect(document.activeElement).toBe(closeBtn);
+
+    // Keydown listener was never torn down or re-attached across re-renders
+    expect(countKeydownCalls(addSpy)).toBe(initialAddCount);
+    expect(countKeydownCalls(removeSpy)).toBe(initialRemoveCount);
+
+    // Escape invokes the latest onClose reference via onCloseRef
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(firstOnClose).not.toHaveBeenCalled();
+    expect(secondOnClose).not.toHaveBeenCalled();
+    expect(thirdOnClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves focus inside ChatWindow across Dashboard 5-second /status polling ticks", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    let statusPollCount = 0;
+    const baseRunningStatus: NodeStatusResponse = {
+      state: "RUNNING",
+      node_id: "node-focus-poll",
+      model_id: "Qwen/Qwen2.5-7B-Instruct",
+      room_id: "public",
+      is_private: false,
+      is_unlisted: false,
+      role: "primary",
+      backend: "llama_cpp",
+      n_layers: 32,
+      total_layers: 32,
+      shard_layer_start: 0,
+      shard_layer_end: 31,
+      allocated_ram_mb: 6144,
+      allocated_vram_mb: 0,
+      p2p_listen_port: 49152,
+      connected_peers_count: 1,
+      peers: [],
+      session_token: "sk-focus-poll-token",
+      api_base_url: "http://127.0.0.1:8000/v1",
+      coverage_percent: 100,
+      is_swarm_ready: true,
+      network_status: "online",
+      message: "Swarm ready",
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/status")) {
+        statusPollCount += 1;
+        return new Response(
+          JSON.stringify({
+            ...baseRunningStatus,
+            connected_peers_count: statusPollCount,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 1,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("open-chat-window-btn")).toBeTruthy();
+    });
+
+    // Open AI Chat modal -> initial open focuses chat-input
+    fireEvent.click(screen.getByTestId("open-chat-window-btn"));
+    expect(screen.getByTestId("ai-chat-window")).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByTestId("chat-input"));
+
+    // User moves focus to the Close button
+    const closeBtn = screen.getByTestId("chat-close-btn");
+    closeBtn.focus();
+    expect(document.activeElement).toBe(closeBtn);
+
+    const pollsBeforeTicks = statusPollCount;
+
+    // Advance across two 5-second /status poll ticks that update Dashboard state
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    await waitFor(() => {
+      expect(statusPollCount).toBeGreaterThanOrEqual(pollsBeforeTicks + 2);
+    });
+
+    // Focus must remain on Close button and never be stolen back to textarea
+    expect(document.activeElement).toBe(closeBtn);
+    expect(document.activeElement).not.toBe(screen.getByTestId("chat-input"));
+
+    // Escape closes the modal cleanly via memoized handleCloseChat
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("ai-chat-window")).toBeNull();
   });
 });
