@@ -537,6 +537,64 @@ extern "system" {
     fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
 }
 
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const DEFAULT_MACOS_PAGE_SIZE_BYTES: u64 = 4096;
+
+/// Parses the host virtual memory page size in bytes from `vm_stat` output (`page size of <N> bytes`).
+/// Falls back to `4096` bytes when the header is missing, malformed, non-integer, or zero.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn parse_vm_stat_page_size(vm_stat_output: &str) -> u64 {
+    for line in vm_stat_output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(start) = lower.find("page size of ") {
+            let after = &lower[start + "page size of ".len()..];
+            if let Some(token) = after.split_whitespace().next() {
+                let clean = token.trim_end_matches(')');
+                if let Ok(page_size) = clean.parse::<u64>() {
+                    if page_size > 0 {
+                        return page_size;
+                    }
+                }
+            }
+            return DEFAULT_MACOS_PAGE_SIZE_BYTES;
+        }
+    }
+    DEFAULT_MACOS_PAGE_SIZE_BYTES
+}
+
+/// Parses available physical RAM in gigabytes (GB) from macOS `vm_stat` output.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn parse_vm_stat_available_ram_gb(vm_stat_output: &str) -> Result<f64, String> {
+    let page_size = parse_vm_stat_page_size(vm_stat_output);
+    let mut free_pages: u64 = 0;
+    let mut found_page_metric = false;
+
+    for line in vm_stat_output.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Pages free:") || trimmed.starts_with("Pages inactive:") {
+            if let Some(val_part) = trimmed.split(':').nth(1) {
+                let num_str = val_part.trim().trim_end_matches('.');
+                if let Ok(pages) = num_str.parse::<u64>() {
+                    free_pages = free_pages.saturating_add(pages);
+                    found_page_metric = true;
+                }
+            }
+        }
+    }
+
+    if !found_page_metric {
+        return Err("Could not parse free or inactive pages from vm_stat output.".to_string());
+    }
+
+    let avail_bytes = (free_pages as f64) * (page_size as f64);
+    let gb = avail_bytes / (1024.0 * 1024.0 * 1024.0);
+    if !gb.is_finite() {
+        return Err("Calculated available RAM is not finite.".to_string());
+    }
+
+    Ok((gb * 100.0).round() / 100.0)
+}
+
 /// Returns the host OS's currently free physical RAM in gigabytes (GB).
 #[tauri::command]
 fn get_available_ram_gb() -> Result<f64, String> {
@@ -558,7 +616,7 @@ fn get_available_ram_gb() -> Result<f64, String> {
             return Err("GlobalMemoryStatusEx failed to read Windows physical memory.".to_string());
         }
         let gb = (status.ull_avail_phys as f64) / (1024.0 * 1024.0 * 1024.0);
-        return Ok((gb * 100.0).round() / 100.0);
+        Ok((gb * 100.0).round() / 100.0)
     }
 
     #[cfg(target_os = "linux")]
@@ -575,7 +633,7 @@ fn get_available_ram_gb() -> Result<f64, String> {
                 return Ok((gb * 100.0).round() / 100.0);
             }
         }
-        return Err("MemAvailable not found in /proc/meminfo.".to_string());
+        Err("MemAvailable not found in /proc/meminfo.".to_string())
     }
 
     #[cfg(target_os = "macos")]
@@ -583,19 +641,16 @@ fn get_available_ram_gb() -> Result<f64, String> {
         let output = Command::new("vm_stat")
             .output()
             .map_err(|e| format!("Failed to execute vm_stat: {e}"))?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut free_pages: u64 = 0;
-        for line in text.lines() {
-            if line.contains("Pages free:") || line.contains("Pages inactive:") {
-                if let Some(val_part) = line.split(':').nth(1) {
-                    let num_str = val_part.trim().trim_end_matches('.');
-                    free_pages += num_str.parse::<u64>().unwrap_or(0);
-                }
-            }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "vm_stat exited with status {}: {}",
+                output.status,
+                stderr.trim()
+            ));
         }
-        let avail_bytes = (free_pages as f64) * 4096.0;
-        let gb = avail_bytes / (1024.0 * 1024.0 * 1024.0);
-        return Ok((gb * 100.0).round() / 100.0);
+        let text = String::from_utf8_lossy(&output.stdout);
+        parse_vm_stat_available_ram_gb(&text)
     }
 }
 
@@ -1112,5 +1167,97 @@ mod tests {
         assert!(shutdown_err.contains("shutting down"));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!is_process_alive(pid));
+    }
+
+    #[test]
+    fn test_parse_vm_stat_apple_silicon_16kb_pages() {
+        let vm_stat = "\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              400000.
+Pages active:                            312000.
+Pages inactive:                          255360.
+Pages speculative:                         1000.
+";
+        assert_eq!(parse_vm_stat_page_size(vm_stat), 16384);
+        let gb = parse_vm_stat_available_ram_gb(vm_stat).expect("expected Apple Silicon RAM GB");
+        assert!(
+            (gb - 10.0).abs() < 1e-9,
+            "expected 10.0 GB for 655360 x 16KB pages, got {gb}"
+        );
+    }
+
+    #[test]
+    fn test_parse_vm_stat_intel_4kb_pages() {
+        let vm_stat = "\
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                              400000.
+Pages active:                            312000.
+Pages inactive:                          255360.
+";
+        assert_eq!(parse_vm_stat_page_size(vm_stat), 4096);
+        let gb = parse_vm_stat_available_ram_gb(vm_stat).expect("expected Intel Mac RAM GB");
+        assert!(
+            (gb - 2.5).abs() < 1e-9,
+            "expected 2.5 GB for 655360 x 4KB pages, got {gb}"
+        );
+    }
+
+    #[test]
+    fn test_parse_vm_stat_missing_or_malformed_header_falls_back_to_4096() {
+        let missing_header = "\
+Pages free:                              400000.
+Pages inactive:                          255360.
+";
+        assert_eq!(parse_vm_stat_page_size(missing_header), 4096);
+        let gb = parse_vm_stat_available_ram_gb(missing_header)
+            .expect("expected 4096 fallback when header missing");
+        assert!((gb - 2.5).abs() < 1e-9);
+
+        let malformed_headers = [
+            "Mach Virtual Memory Statistics: (page size of bytes)\nPages free: 400000.\nPages inactive: 255360.",
+            "Mach Virtual Memory Statistics: (page size of )\nPages free: 400000.\nPages inactive: 255360.",
+            "Unexpected vm_stat banner\nPages free: 400000.\nPages inactive: 255360.",
+        ];
+        for sample in malformed_headers {
+            assert_eq!(parse_vm_stat_page_size(sample), 4096);
+            let parsed = parse_vm_stat_available_ram_gb(sample)
+                .expect("expected 4096 fallback on malformed header");
+            assert!((parsed - 2.5).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_parse_vm_stat_non_integer_and_zero_page_size_falls_back_safely() {
+        let invalid_page_sizes = [
+            "Mach Virtual Memory Statistics: (page size of 0 bytes)\nPages free: 400000.\nPages inactive: 255360.",
+            "Mach Virtual Memory Statistics: (page size of 16.5 bytes)\nPages free: 400000.\nPages inactive: 255360.",
+            "Mach Virtual Memory Statistics: (page size of 16kb bytes)\nPages free: 400000.\nPages inactive: 255360.",
+            "Mach Virtual Memory Statistics: (page size of -16384 bytes)\nPages free: 400000.\nPages inactive: 255360.",
+            "Mach Virtual Memory Statistics: (page size of NaN bytes)\nPages free: 400000.\nPages inactive: 255360.",
+        ];
+        for sample in invalid_page_sizes {
+            assert_eq!(parse_vm_stat_page_size(sample), 4096);
+            let gb = parse_vm_stat_available_ram_gb(sample)
+                .expect("expected safe 4096 fallback instead of zero or NaN");
+            assert!(gb.is_finite() && (gb - 2.5).abs() < 1e-9, "got {gb}");
+        }
+    }
+
+    #[test]
+    fn test_parse_vm_stat_edge_cases_empty_and_zero_free_pages() {
+        assert!(parse_vm_stat_available_ram_gb("").is_err());
+        assert!(parse_vm_stat_available_ram_gb(
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        )
+        .is_err());
+
+        let zero_pages = "\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                   0.
+Pages inactive:                               0.
+";
+        let zero_gb = parse_vm_stat_available_ram_gb(zero_pages)
+            .expect("expected Ok(0.0) when free and inactive pages are explicitly 0");
+        assert!(zero_gb.is_finite() && zero_gb.abs() < 1e-9);
     }
 }
