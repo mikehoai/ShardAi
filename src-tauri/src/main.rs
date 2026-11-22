@@ -4,35 +4,77 @@
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, State, WindowEvent,
+    Manager, RunEvent, State, WindowEvent,
 };
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as UnixCommandExt;
+
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
 
 const LOCAL_ENGINE_ADDR: &str = "127.0.0.1:8000";
 // PyInstaller --onefile bundles PyTorch/Transformers (~200 MB) and can take 30-45s on cold Windows Defender unpack
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(75);
 
-/// Thread-safe container holding the background Python FastAPI child process.
+/// Thread-safe container holding the background Python FastAPI child process and shutdown state.
 pub struct PythonCoreState {
     pub child: Mutex<Option<Child>>,
+    pub shutting_down: AtomicBool,
 }
 
 impl Default for PythonCoreState {
     fn default() -> Self {
         Self {
             child: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
         }
+    }
+}
+
+impl PythonCoreState {
+    /// Marks the desktop shell as shutting down so background boot threads refuse to spawn.
+    pub fn mark_shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns true once application shutdown has been initiated.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Takes and terminates any tracked child process under the mutex, recovering from poison on panic.
+    fn terminate_child_inner(&self) -> Option<u32> {
+        let mut guard = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take().map(kill_and_reap_child)
+    }
+}
+
+impl Drop for PythonCoreState {
+    fn drop(&mut self) {
+        self.mark_shutting_down();
+        let _ = self.terminate_child_inner();
     }
 }
 
@@ -116,33 +158,69 @@ fn resolve_python_executable(engine_dir: &Path) -> (PathBuf, bool) {
     }
 }
 
+/// Configures background command stdio, Windows console suppression, and Unix process group isolation.
+fn configure_background_command(cmd: &mut Command) {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(unix)]
+    {
+        // Spawn in a dedicated process group (PGID = child PID) so PyInstaller --onefile
+        // bootloaders and their forked Python servers can be killed together via -pgid.
+        cmd.process_group(0);
+    }
+}
+
+/// Forcefully kills a child process (and its process tree/group) and reaps its exit status.
+fn kill_and_reap_child(mut child: Child) -> u32 {
+    let pid = child.id();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Kill the entire process tree on Windows so Uvicorn child workers do not become orphans
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    {
+        // Kill the entire Unix process group (-pgid) so forked child processes are terminated
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 0 {
+                unsafe {
+                    let _ = kill(-pgid, SIGKILL);
+                }
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    pid
+}
+
 /// Terminates the background Python process and reaps its exit status to prevent zombie processes.
 fn terminate_child_process(state: &PythonCoreState) -> Result<String, String> {
-    let mut guard = state
-        .child
-        .lock()
-        .map_err(|_| "Failed to acquire lock on PythonCoreState".to_string())?;
-
-    if let Some(mut child) = guard.take() {
-        let pid = child.id();
-
-        #[cfg(target_os = "windows")]
-        {
-            // Kill the entire process tree on Windows so Uvicorn child workers do not become orphans
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-
-        let _ = child.kill();
-        let _ = child.wait();
-        Ok(format!("Python core process (PID {pid}) stopped cleanly."))
-    } else {
-        Ok("Python core process is not running.".to_string())
+    match state.terminate_child_inner() {
+        Some(pid) => Ok(format!("Python core process (PID {pid}) stopped cleanly.")),
+        None => Ok("Python core process is not running.".to_string()),
     }
+}
+
+/// Marks the state as shutting down and terminates any tracked child process tree.
+fn shutdown_python_core(state: &PythonCoreState) -> Result<String, String> {
+    state.mark_shutting_down();
+    terminate_child_process(state)
 }
 
 /// Resolves a packaged PyInstaller Tauri Sidecar binary placed next to the desktop executable.
@@ -270,8 +348,39 @@ fn is_engine_listening() -> bool {
         .unwrap_or(false)
 }
 
+/// Checks shutdown state under the held child mutex right before and after spawning.
+fn spawn_and_register_child(
+    state: &PythonCoreState,
+    slot: &mut Option<Child>,
+    mut cmd: Command,
+    launch_label: &str,
+) -> Result<String, String> {
+    if state.is_shutting_down() {
+        return Err("Application is shutting down; aborting Python core spawn.".to_string());
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Python core ({}): {e}", launch_label))?;
+
+    if state.is_shutting_down() {
+        let pid = kill_and_reap_child(child);
+        return Err(format!(
+            "Application began shutting down during spawn; terminated Python core (PID {pid})."
+        ));
+    }
+
+    let pid = child.id();
+    *slot = Some(child);
+    Ok(format!("Spawned Python core ({launch_label}, PID {pid})."))
+}
+
 /// Ensures the sidecar (or dev Python core) process is spawned without blocking on HTTP readiness.
 fn ensure_core_spawned(state: &PythonCoreState) -> Result<String, String> {
+    if state.is_shutting_down() {
+        return Err("Application is shutting down; refusing to start Python core.".to_string());
+    }
+
     if is_engine_listening() {
         return Ok("Python core is already listening.".to_string());
     }
@@ -280,6 +389,10 @@ fn ensure_core_spawned(state: &PythonCoreState) -> Result<String, String> {
         .child
         .lock()
         .map_err(|_| "Failed to acquire lock on PythonCoreState".to_string())?;
+
+    if state.is_shutting_down() {
+        return Err("Application is shutting down; refusing to spawn Python core.".to_string());
+    }
 
     if let Some(existing_child) = guard.as_mut() {
         match existing_child.try_wait() {
@@ -323,22 +436,63 @@ fn ensure_core_spawned(state: &PythonCoreState) -> Result<String, String> {
     };
 
     cmd.args(["--mode", "daemon", "--port", "8000"])
-        .env("SHARDAI_ENGINE_PORT", "8000")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("SHARDAI_ENGINE_PORT", "8000");
+    configure_background_command(&mut cmd);
 
-    #[cfg(target_os = "windows")]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
+    spawn_and_register_child(state, &mut guard, cmd, &launch_label)
+}
+
+/// Polls until the local engine starts listening, exits prematurely, shuts down, or times out.
+/// On timeout, terminates and reaps the hung child without setting `shutting_down` so retries succeed.
+fn wait_for_engine_or_terminate<F>(
+    state: &PythonCoreState,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut check_listening: F,
+) -> Result<String, String>
+where
+    F: FnMut() -> bool,
+{
+    let start_instant = Instant::now();
+    loop {
+        if state.is_shutting_down() {
+            let _ = terminate_child_process(state);
+            return Err("Application is shutting down before Python core became ready.".to_string());
+        }
+
+        if check_listening() {
+            return Ok(format!("Python core is ready on http://{LOCAL_ENGINE_ADDR}."));
+        }
+
+        // Re-check process health without holding the Mutex during sleep
+        {
+            let mut guard = state
+                .child
+                .lock()
+                .map_err(|_| "Failed to acquire lock on PythonCoreState".to_string())?;
+            if let Some(child) = guard.as_mut() {
+                if let Ok(Some(exit_status)) = child.try_wait() {
+                    *guard = None;
+                    return Err(format!(
+                        "Python core exited prematurely with status: {exit_status}"
+                    ));
+                }
+            }
+        }
+
+        let elapsed = start_instant.elapsed();
+        if elapsed >= timeout {
+            break;
+        }
+
+        let remaining = timeout.saturating_sub(elapsed);
+        thread::sleep(poll_interval.min(remaining));
     }
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn Python core ({}): {e}", launch_label))?;
-    let pid = child.id();
-    *guard = Some(child);
-    Ok(format!("Spawned Python core ({launch_label}, PID {pid})."))
+    let _ = terminate_child_process(state);
+    Err(format!(
+        "Timed out waiting for Python core to listen on http://{LOCAL_ENGINE_ADDR}."
+    ))
 }
 
 /// Spawns the bundled PyInstaller sidecar (release) or `core-engine/main.py` (dev) and waits for `127.0.0.1:8000`.
@@ -347,35 +501,12 @@ async fn start_python_core(app_handle: tauri::AppHandle) -> Result<String, Strin
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle.state::<PythonCoreState>();
         ensure_core_spawned(&state)?;
-
-        let start_instant = Instant::now();
-        while start_instant.elapsed() < STARTUP_TIMEOUT {
-            if is_engine_listening() {
-                return Ok(format!("Python core is ready on http://{LOCAL_ENGINE_ADDR}."));
-            }
-
-            // Re-check process health without holding the Mutex during sleep
-            {
-                let mut guard = state
-                    .child
-                    .lock()
-                    .map_err(|_| "Failed to acquire lock on PythonCoreState".to_string())?;
-                if let Some(child) = guard.as_mut() {
-                    if let Ok(Some(exit_status)) = child.try_wait() {
-                        *guard = None;
-                        return Err(format!(
-                            "Python core exited prematurely with status: {exit_status}"
-                        ));
-                    }
-                }
-            }
-
-            thread::sleep(Duration::from_millis(250));
-        }
-
-        Err(format!(
-            "Timed out waiting for Python core to listen on http://{LOCAL_ENGINE_ADDR}."
-        ))
+        wait_for_engine_or_terminate(
+            &state,
+            STARTUP_TIMEOUT,
+            Duration::from_millis(250),
+            is_engine_listening,
+        )
     })
     .await
     .map_err(|e| format!("Failed joining core startup task: {e}"))?
@@ -488,7 +619,7 @@ fn window_toggle_maximize(window: tauri::Window) -> Result<bool, String> {
 #[tauri::command]
 fn window_close(app_handle: tauri::AppHandle) -> Result<(), String> {
     let state = app_handle.state::<PythonCoreState>();
-    let _ = terminate_child_process(&state);
+    let _ = shutdown_python_core(&state);
     app_handle.exit(0);
     Ok(())
 }
@@ -499,7 +630,7 @@ fn window_start_drag(window: tauri::Window) -> Result<(), String> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(PythonCoreState::default())
         .setup(|app| {
@@ -528,7 +659,7 @@ fn main() {
                     }
                     "tray_quit" => {
                         let state = app.state::<PythonCoreState>();
-                        let _ = terminate_child_process(&state);
+                        let _ = shutdown_python_core(&state);
                         app.exit(0);
                     }
                     _ => {}
@@ -574,8 +705,15 @@ fn main() {
                 let _ = terminate_child_process(&state);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running ShardAi Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building ShardAi Tauri application");
+
+    app.run(|app_handle, event| {
+        if let RunEvent::Exit = event {
+            let state = app_handle.state::<PythonCoreState>();
+            let _ = shutdown_python_core(&state);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -704,5 +842,275 @@ mod tests {
     #[test]
     fn dialog_plugin_initializes() {
         let _plugin: tauri::plugin::TauriPlugin<tauri::Wry> = tauri_plugin_dialog::init();
+    }
+
+    fn spawn_dummy_long_running_child() -> Child {
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+
+        configure_background_command(&mut cmd);
+        cmd.spawn().expect("spawn dummy long-running child process")
+    }
+
+    fn spawn_dummy_failing_child() -> Child {
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit", "1"]);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 1"]);
+            c
+        };
+
+        configure_background_command(&mut cmd);
+        cmd.spawn().expect("spawn dummy failing child process")
+    }
+
+    fn is_process_alive(pid: u32) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmd = Command::new("tasklist");
+            cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .creation_flags(CREATE_NO_WINDOW);
+            let output = cmd.output().expect("run tasklist to inspect PID");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&format!("\"{pid}\""))
+        }
+        #[cfg(unix)]
+        {
+            match i32::try_from(pid) {
+                Ok(pgid) if pgid > 0 => unsafe { kill(pgid, 0) == 0 },
+                _ => false,
+            }
+        }
+    }
+
+    #[test]
+    fn test_ensure_core_spawned_aborts_immediately_when_shutting_down() {
+        let state = PythonCoreState::default();
+        assert!(!state.is_shutting_down());
+
+        state.mark_shutting_down();
+        assert!(state.is_shutting_down());
+
+        let err = ensure_core_spawned(&state).expect_err("expected shutdown rejection");
+        assert!(
+            err.contains("shutting down"),
+            "expected shutdown message, got: {err}"
+        );
+        assert!(
+            state.child.lock().expect("lock child mutex").is_none(),
+            "child must not be spawned during shutdown"
+        );
+
+        let mut slot: Option<Child> = None;
+        let cmd = Command::new("nonexistent-binary-must-not-spawn");
+        let spawn_err = spawn_and_register_child(&state, &mut slot, cmd, "dummy")
+            .expect_err("expected pre-spawn mutex check to abort");
+        assert!(
+            spawn_err.contains("shutting down"),
+            "expected pre-spawn shutdown message, got: {spawn_err}"
+        );
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn test_drop_python_core_state_kills_and_reaps_child() {
+        let state = PythonCoreState::default();
+        let mut child = spawn_dummy_long_running_child();
+        let pid = child.id();
+
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "dummy child must be running before Drop"
+        );
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(child);
+        }
+        assert!(
+            is_process_alive(pid),
+            "dummy child PID {pid} should be alive before Drop"
+        );
+
+        drop(state);
+
+        assert!(
+            !is_process_alive(pid),
+            "dummy child PID {pid} must be terminated and reaped when PythonCoreState drops"
+        );
+    }
+
+    #[test]
+    fn test_drop_python_core_state_recovers_from_poisoned_mutex() {
+        let state = std::sync::Arc::new(PythonCoreState::default());
+        let state_clone = std::sync::Arc::clone(&state);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let mut guard = state_clone.child.lock().expect("lock child mutex");
+            let child = spawn_dummy_long_running_child();
+            let pid = child.id();
+            *guard = Some(child);
+            tx.send(pid).expect("send child PID");
+            panic!("simulated panic while holding PythonCoreState mutex");
+        });
+
+        let pid = rx.recv().expect("receive spawned child PID");
+        assert!(handle.join().is_err(), "panicking thread should fail join");
+        assert!(
+            state.child.is_poisoned(),
+            "child mutex should be poisoned after panic"
+        );
+        assert!(
+            is_process_alive(pid),
+            "dummy child PID {pid} should still be alive prior to state Drop"
+        );
+
+        drop(state);
+
+        assert!(
+            !is_process_alive(pid),
+            "dummy child PID {pid} must be killed and reaped on Drop even after mutex poison"
+        );
+    }
+
+    #[test]
+    fn test_startup_timeout_terminates_and_reaps_hung_child_so_retries_succeed() {
+        let state = PythonCoreState::default();
+        let mut hung_child = spawn_dummy_long_running_child();
+        let hung_pid = hung_child.id();
+
+        assert!(
+            matches!(hung_child.try_wait(), Ok(None)),
+            "hung dummy child must be running"
+        );
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(hung_child);
+        }
+        assert!(is_process_alive(hung_pid));
+
+        let timeout_err = wait_for_engine_or_terminate(
+            &state,
+            Duration::from_millis(60),
+            Duration::from_millis(15),
+            || false,
+        )
+        .expect_err("expected startup timeout error");
+
+        assert!(
+            timeout_err.contains("Timed out"),
+            "unexpected timeout error: {timeout_err}"
+        );
+        assert!(
+            !state.is_shutting_down(),
+            "startup timeout must keep shutting_down=false so retries are allowed"
+        );
+        assert!(
+            state.child.lock().expect("lock child mutex").is_none(),
+            "hung child handle must be cleared on startup timeout"
+        );
+        assert!(
+            !is_process_alive(hung_pid),
+            "hung child PID {hung_pid} must be killed and reaped on startup timeout"
+        );
+
+        // Verify a subsequent retry is not blocked by the previous hung child
+        let retry_child = spawn_dummy_long_running_child();
+        let retry_pid = retry_child.id();
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(retry_child);
+        }
+        let ready_msg = wait_for_engine_or_terminate(
+            &state,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+            || true,
+        )
+        .expect("retry after startup timeout should succeed when listening");
+        assert!(ready_msg.contains("ready"));
+
+        let _ = terminate_child_process(&state);
+        assert!(!is_process_alive(retry_pid));
+    }
+
+    #[test]
+    fn test_terminate_child_process_preserves_restart_ability_unlike_shutdown() {
+        let state = PythonCoreState::default();
+        let child = spawn_dummy_long_running_child();
+        let pid = child.id();
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(child);
+        }
+
+        let stop_msg = terminate_child_process(&state).expect("stop_python_core cleanup succeeds");
+        assert!(stop_msg.contains("stopped cleanly"));
+        assert!(
+            !state.is_shutting_down(),
+            "stop_python_core must not set shutting_down=true"
+        );
+        assert!(!is_process_alive(pid));
+
+        let shutdown_msg = shutdown_python_core(&state).expect("shutdown helper succeeds");
+        assert!(shutdown_msg.contains("not running"));
+        assert!(state.is_shutting_down());
+    }
+
+    #[test]
+    fn test_wait_for_engine_aborts_on_premature_exit_and_shutdown() {
+        let state = PythonCoreState::default();
+        let failing_child = spawn_dummy_failing_child();
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(failing_child);
+        }
+        let exit_err = wait_for_engine_or_terminate(
+            &state,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || false,
+        )
+        .expect_err("expected premature exit error");
+        assert!(
+            exit_err.contains("exited prematurely"),
+            "unexpected premature exit error: {exit_err}"
+        );
+        assert!(state.child.lock().expect("lock child mutex").is_none());
+
+        let child = spawn_dummy_long_running_child();
+        let pid = child.id();
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(child);
+        }
+        state.mark_shutting_down();
+        let started = Instant::now();
+        let shutdown_err = wait_for_engine_or_terminate(
+            &state,
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+            || true,
+        )
+        .expect_err("expected early abort on shutdown");
+        assert!(shutdown_err.contains("shutting down"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!is_process_alive(pid));
     }
 }
