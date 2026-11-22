@@ -3560,7 +3560,6 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       await vi.advanceTimersByTimeAsync(2000);
     });
   });
-  });
 
   it("prevents stale aborted ChatWindow stream from clobbering a rapid resend stream or StrictMode mount state", async () => {
     const encoder = new TextEncoder();
