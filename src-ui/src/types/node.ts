@@ -13,6 +13,8 @@ export type PeerRole = "primary" | "backup";
 
 export type ModelSourceType = "catalog" | "huggingface" | "direct_url" | "local_file";
 
+export type CatalogModelTask = "text" | "image" | "video" | "multimodal";
+
 export interface CatalogModelItem {
   id: string;
   name: string;
@@ -20,6 +22,8 @@ export interface CatalogModelItem {
   filename?: string | null;
   estimated_ram_gb: number;
   enabled: boolean;
+  task?: CatalogModelTask | null;
+  category?: string | null;
 }
 
 export interface ModelCatalogResponse {

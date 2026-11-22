@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import struct
 import threading
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
@@ -23,14 +23,16 @@ from models.downloader import (
     DEFAULT_CATALOG_MODELS,
     FINGERPRINT_HEAD_BYTES,
     GGUF_MAGIC,
+    VALID_CATALOG_TASKS,
     DownloadProgressEvent,
     ModelDownloader,
     compute_model_fingerprint,
     compute_model_fingerprint_async,
     has_gguf_magic,
     is_valid_gguf_file,
+    sanitize_catalog_entry,
 )
-from shard_engine.schemas import NodeState
+from shard_engine.schemas import CatalogModelItem, CatalogModelTask, NodeState
 from shard_engine.tracker_client import SignalingTrackerClient
 
 client = TestClient(app)
@@ -889,3 +891,164 @@ async def test_start_node_fingerprint_step1_error_fallback_and_step4_error_clean
         finally:
             if runtime.state != NodeState.STOPPED:
                 await async_client.post("/stop-node")
+
+
+def test_sanitize_catalog_entry_preserves_task_and_category_and_handles_invalid_inputs() -> None:
+    """`sanitize_catalog_entry()` normalizes valid `task`/`category` and drops corrupt values safely."""
+    assert VALID_CATALOG_TASKS == frozenset(get_args(CatalogModelTask))
+
+    for task_input, expected_task in [
+        ("text", "text"),
+        ("  IMAGE  ", "image"),
+        ("Video", "video"),
+        ("multimodal", "multimodal"),
+    ]:
+        cleaned = sanitize_catalog_entry(
+            {
+                "id": f"model-{expected_task}",
+                "name": f"Model {expected_task}",
+                "repo_id": f"org/model-{expected_task}",
+                "task": task_input,
+                "category": "  image-generation  ",
+                "enabled": True,
+            }
+        )
+        assert cleaned is not None
+        assert cleaned["task"] == expected_task
+        assert cleaned["category"] == "image-generation"
+        validated = CatalogModelItem.model_validate(cleaned)
+        assert validated.task == expected_task
+        assert validated.category == "image-generation"
+
+    for bad_task in ("audio", "", "   ", 123, True, ["image"], None):
+        for bad_category in ("", "   ", 456, False, {"x": 1}, None):
+            cleaned_bad = sanitize_catalog_entry(
+                {
+                    "id": "safe-fallback-entry",
+                    "name": "Safe Fallback Entry",
+                    "repo_id": "org/safe-fallback",
+                    "task": bad_task,
+                    "category": bad_category,
+                    "enabled": True,
+                }
+            )
+            assert cleaned_bad is not None
+            assert cleaned_bad["task"] is None
+            assert cleaned_bad["category"] is None
+            validated_bad = CatalogModelItem.model_validate(cleaned_bad)
+            assert validated_bad.task is None
+            assert validated_bad.category is None
+
+
+def test_catalog_endpoint_and_cache_preserve_task_and_category_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /models/catalog` and `models_cache.json` persist and return `task` and `category`."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+    monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+    downloader = _make_downloader(tmp_path)
+    runtime.model_downloader = downloader
+
+    remote_models = [
+        {
+            "id": "llama-3.1-8b",
+            "name": "Llama 3.1 8B",
+            "repo_id": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+            "estimated_ram_gb": 5.1,
+            "enabled": True,
+            "task": "TEXT",
+            "category": "reasoning",
+        },
+        {
+            "id": "flux-schnell",
+            "name": "FLUX.1 Schnell",
+            "repo_id": "black-forest-labs/FLUX.1-schnell",
+            "estimated_ram_gb": 12.0,
+            "enabled": True,
+            "task": "image",
+            "category": "  image-generation  ",
+        },
+        {
+            "id": "wan-2.1",
+            "name": "Wan 2.1",
+            "repo_id": "Wan-AI/Wan2.1-T2V-1.3B",
+            "estimated_ram_gb": 8.5,
+            "enabled": True,
+            "task": "video",
+            "category": "video-generation",
+        },
+        {
+            "id": "qwen-vl",
+            "name": "Qwen2.5-VL 7B",
+            "repo_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+            "estimated_ram_gb": 7.2,
+            "enabled": True,
+            "task": "multimodal",
+            "category": "vision-language",
+        },
+        {
+            "id": "unknown-meta",
+            "name": "Unknown Meta",
+            "repo_id": "org/unknown-meta",
+            "estimated_ram_gb": 4.0,
+            "enabled": True,
+            "task": "audio",
+            "category": "   ",
+        },
+    ]
+
+    def _cloud_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/config/models"):
+            return httpx.Response(status_code=200, json={"models": remote_models})
+        return httpx.Response(status_code=404)
+
+    runtime.tracker_client = _make_mock_tracker(_cloud_handler)
+
+    # 1. Cloud sync preserves task & category in HTTP response and writes them to models_cache.json
+    cloud_res = client.get("/models/catalog")
+    assert cloud_res.status_code == 200
+    cloud_body = cloud_res.json()
+    assert cloud_body["source"] == "cloud"
+    assert cloud_body["count"] == 5
+
+    by_id = {item["id"]: item for item in cloud_body["models"]}
+    assert by_id["llama-3.1-8b"]["task"] == "text"
+    assert by_id["llama-3.1-8b"]["category"] == "reasoning"
+    assert by_id["flux-schnell"]["task"] == "image"
+    assert by_id["flux-schnell"]["category"] == "image-generation"
+    assert by_id["wan-2.1"]["task"] == "video"
+    assert by_id["wan-2.1"]["category"] == "video-generation"
+    assert by_id["qwen-vl"]["task"] == "multimodal"
+    assert by_id["qwen-vl"]["category"] == "vision-language"
+    assert by_id["unknown-meta"]["task"] is None
+    assert by_id["unknown-meta"]["category"] is None
+
+    persisted_cache = json.loads(downloader.catalog_cache_path.read_text(encoding="utf-8"))
+    persisted_by_id = {item["id"]: item for item in persisted_cache["models"]}
+    assert persisted_by_id["flux-schnell"]["task"] == "image"
+    assert persisted_by_id["flux-schnell"]["category"] == "image-generation"
+    assert persisted_by_id["unknown-meta"]["task"] is None
+    assert persisted_by_id["unknown-meta"]["category"] is None
+
+    # 2. Cached reload when tracker disabled still preserves task & category
+    monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "false")
+    cached_res = client.get("/models/catalog")
+    assert cached_res.status_code == 200
+    cached_body = cached_res.json()
+    assert cached_body["source"] == "cache"
+    cached_by_id = {item["id"]: item for item in cached_body["models"]}
+    assert cached_by_id["flux-schnell"]["task"] == "image"
+    assert cached_by_id["flux-schnell"]["category"] == "image-generation"
+    assert cached_by_id["wan-2.1"]["task"] == "video"
+    assert cached_by_id["qwen-vl"]["task"] == "multimodal"
+
+    # 3. Default catalog fallback includes task="text"
+    downloader.catalog_cache_path.unlink()
+    default_res = client.get("/models/catalog")
+    assert default_res.status_code == 200
+    default_body = default_res.json()
+    assert default_body["source"] == "default"
+    assert default_body["count"] == len(DEFAULT_CATALOG_MODELS)
+    assert all(item["task"] == "text" for item in default_body["models"])
