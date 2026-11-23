@@ -12,12 +12,6 @@
   </p>
 
   <p>
-    🌐 <strong>Official Homepage:</strong> <a href="https://shardai.online">https://shardai.online</a>
-  </p>
-
-  <br />
-
-  <p>
     <a href="https://www.nvidia.com/en-us/startups/" target="_blank" rel="noopener noreferrer">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="assets/nvidia-inception-program-badge-rgb-white-bg.jpg" />
