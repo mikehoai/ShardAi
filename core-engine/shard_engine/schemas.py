@@ -54,6 +54,7 @@ class ModelSourceType(StrEnum):
 
 
 CatalogModelTask = Literal["text", "image", "video", "multimodal"]
+CatalogModelModality = Literal["text", "vision", "audio", "multimodal"]
 
 
 def validate_room_id(value: Any) -> str:
@@ -75,9 +76,11 @@ class CatalogModelItem(BaseModel):
     name: str
     repo_id: str
     filename: str | None = None
+    mmproj_filename: str | None = None
     estimated_ram_gb: float = Field(default=5.0, gt=0.0)
     enabled: bool = True
     task: CatalogModelTask | None = None
+    modality: CatalogModelModality | None = None
     category: str | None = None
 
 
@@ -141,6 +144,11 @@ class StartNodeRequest(BaseModel):
         default=None,
         max_length=512,
         description="Optional specific .gguf filename in a Hugging Face repo",
+    )
+    mmproj_filename: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Optional multimodal projector (.gguf) filename for Vision models",
     )
     network_mode: NetworkMode = Field(
         default=NetworkMode.INTERNET,
@@ -244,7 +252,7 @@ class StartNodeRequest(BaseModel):
                 return f"{parts[0]}/{parts[1]}"
         return cleaned
 
-    @field_validator("filename", mode="before")
+    @field_validator("filename", "mmproj_filename", mode="before")
     @classmethod
     def _normalize_filename(cls, value: str | None) -> str | None:
         if value is None:
@@ -275,6 +283,7 @@ class RoomLobbyItem(BaseModel):
 
     room_id: str
     model: str
+    modality: CatalogModelModality | None = None
     nodes_online: int = Field(..., ge=1)
     total_shared_ram_gb: float = Field(..., ge=0.0)
     is_private: bool = False
@@ -350,6 +359,7 @@ class NodeStatusResponse(BaseModel):
     node_id: str | None = None
     model_id: str | None = None
     model_path: str | None = None
+    mmproj_path: str | None = None
     network_mode: NetworkMode | None = None
     room_id: str | None = None
     is_private: bool = False

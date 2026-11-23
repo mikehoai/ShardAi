@@ -215,6 +215,7 @@ def parse_estimated_ram_gb(value: Any, default: float = 5.0) -> float:
 
 
 VALID_CATALOG_TASKS: frozenset[str] = frozenset({"text", "image", "video", "multimodal"})
+VALID_CATALOG_MODALITIES: frozenset[str] = frozenset({"text", "vision", "audio", "multimodal"})
 
 
 def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
@@ -238,9 +239,24 @@ def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
     raw_filename = entry.get("filename")
     filename = raw_filename.strip() if isinstance(raw_filename, str) and raw_filename.strip() else None
 
+    raw_mmproj = entry.get("mmproj_filename")
+    mmproj_filename = (
+        raw_mmproj.strip() if isinstance(raw_mmproj, str) and raw_mmproj.strip() else None
+    )
+
     raw_task = entry.get("task")
     normalized_task = raw_task.strip().lower() if isinstance(raw_task, str) else ""
     task: str | None = normalized_task if normalized_task in VALID_CATALOG_TASKS else None
+
+    raw_modality = entry.get("modality")
+    normalized_modality = (
+        raw_modality.strip().lower() if isinstance(raw_modality, str) else ""
+    )
+    modality: str | None = (
+        normalized_modality
+        if normalized_modality in VALID_CATALOG_MODALITIES
+        else ("vision" if mmproj_filename is not None else None)
+    )
 
     raw_category = entry.get("category")
     category: str | None = (
@@ -252,9 +268,11 @@ def sanitize_catalog_entry(entry: Any) -> dict[str, Any] | None:
         "name": name,
         "repo_id": repo_id,
         "filename": filename,
+        "mmproj_filename": mmproj_filename,
         "estimated_ram_gb": parse_estimated_ram_gb(entry.get("estimated_ram_gb"), default=5.0),
         "enabled": True,
         "task": task,
+        "modality": modality,
         "category": category,
     }
 
@@ -456,6 +474,49 @@ def select_best_gguf_filename(repo_files: list[str]) -> str | None:
     return min(pool, key=_score)
 
 
+def select_best_mmproj_filename(repo_files: list[str]) -> str | None:
+    """Pick the best multimodal projector (`*mmproj*.gguf`) file from a Hugging Face repo."""
+    mmproj_files = [
+        f
+        for f in repo_files
+        if f.lower().endswith(".gguf")
+        and not f.lower().endswith(".gguf.part")
+        and "mmproj" in Path(f).name.lower()
+    ]
+    if not mmproj_files:
+        return None
+
+    precision_ranks: tuple[str, ...] = ("f16", "bf16", "q8_0", "f32")
+
+    def _score(filename: str) -> tuple[int, str]:
+        lowered = Path(filename).name.lower()
+        rank = len(precision_ranks)
+        for idx, token in enumerate(precision_ranks):
+            if re.search(rf"(?:^|[^a-z0-9]){re.escape(token)}(?:[^a-z0-9]|$)", lowered):
+                rank = idx
+                break
+        return (rank, filename)
+
+    return min(mmproj_files, key=_score)
+
+
+def _is_vision_repo_hint(repo_id: str) -> bool:
+    """Return True when a custom Hugging Face repo ID appears to host a vision/multimodal model."""
+    lowered = repo_id.strip().lower()
+    markers: tuple[str, ...] = (
+        "-vl",
+        "_vl",
+        "llava",
+        "vision",
+        "minicpm-v",
+        "pixtral",
+        "internvl",
+        "gemma-3",
+        "gemma3",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _list_hf_repo_files(repo_id: str) -> list[str]:
     """List files in a Hugging Face repo via `HfApi().list_repo_files(repo_id)`."""
     if HfApi is not None:
@@ -463,6 +524,14 @@ def _list_hf_repo_files(repo_id: str) -> list[str]:
     if list_repo_files is not None:
         return list(list_repo_files(repo_id=repo_id))
     raise RuntimeError("`huggingface_hub` is not installed.")
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadedModelArtifacts:
+    """Resolved local paths for a primary model artifact and optional vision mmproj GGUF."""
+
+    model_path: Path
+    mmproj_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +545,7 @@ class DownloadProgressEvent:
     total_bytes: int = 0
     local_path: str | None = None
     message: str = ""
+    mmproj_path: str | None = None
 
 
 class _HfTqdmProgressBridge:
@@ -708,6 +778,17 @@ class ModelDownloader:
         ]
         self._subscribers: list[asyncio.Queue[DownloadProgressEvent]] = []
         self._latest_event: dict[str, DownloadProgressEvent] = {}
+        self._resolved_mmproj_paths: dict[str, Path | None] = {}
+
+    def get_resolved_mmproj_path(self, model_id: str) -> Path | None:
+        """Return the cached/downloaded mmproj GGUF path resolved for `model_id`, if any."""
+        cleaned = model_id.strip()
+        if not cleaned:
+            return None
+        if cleaned in self._resolved_mmproj_paths:
+            return self._resolved_mmproj_paths[cleaned]
+        normalized = normalize_hf_repo_id(cleaned)
+        return self._resolved_mmproj_paths.get(normalized)
 
     def get_approved_local_roots(self) -> list[Path]:
         """Return canonical directories permitted for local model file/directory loading."""
@@ -1406,6 +1487,98 @@ class ModelDownloader:
         )
         return target_path
 
+    async def _ensure_mmproj_downloaded(
+        self,
+        *,
+        model_id: str,
+        repo_id: str,
+        mmproj_filename: str | None,
+        repo_files: list[str] | None,
+        is_vision_catalog: bool,
+        _emit: Callable[[DownloadProgressEvent], None],
+    ) -> Path | None:
+        """Ensure an associated vision `mmproj-*.gguf` file is cached or downloaded if applicable."""
+        effective_mmproj: str | None = (
+            mmproj_filename.strip()
+            if mmproj_filename and mmproj_filename.strip()
+            else None
+        )
+        if effective_mmproj is None and repo_files is not None:
+            effective_mmproj = select_best_mmproj_filename(repo_files)
+        if (
+            effective_mmproj is None
+            and repo_files is None
+            and not is_offline_mode()
+            and hf_hub_download is not None
+            and (is_vision_catalog or _is_vision_repo_hint(repo_id))
+        ):
+            try:
+                listed_files = await asyncio.to_thread(_list_hf_repo_files, repo_id)
+                effective_mmproj = select_best_mmproj_filename(listed_files)
+            except Exception as exc:
+                logger.debug("Skipping mmproj auto-discovery for '%s': %s", repo_id, exc)
+
+        if effective_mmproj is None:
+            return None
+
+        target_path = self.resolve_gguf_in_models_dir(repo_id, effective_mmproj)
+        if is_offline_mode():
+            if is_valid_gguf_file(target_path, min_bytes=len(GGUF_MAGIC)):
+                return target_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(
+                b"GGUF\x03\x00\x00\x00" + effective_mmproj.encode("utf-8")
+            )
+            return target_path
+
+        if hf_hub_download is None:
+            raise RuntimeError("`huggingface_hub` is not installed.")
+
+        if is_valid_gguf_file(target_path, min_bytes=MIN_ONLINE_GGUF_BYTES):
+            return target_path
+
+        if target_path.is_file():
+            logger.warning(
+                "Cached mmproj GGUF '%s' failed validation (size=%d); re-downloading.",
+                target_path.name,
+                target_path.stat().st_size,
+            )
+            target_path.unlink(missing_ok=True)
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_running_loop()
+
+        def _mmproj_progress_hook(downloaded: int, total: int) -> None:
+            ratio = (downloaded / float(total)) if total > 0 else 0.0
+            pct = min(99.9, round(90.0 + (ratio * 9.9), 1))
+            evt = DownloadProgressEvent(
+                model_id=model_id,
+                status="downloading",
+                progress_percent=pct,
+                downloaded_bytes=downloaded,
+                total_bytes=total,
+                message=f"Downloading vision projector {effective_mmproj} ({pct:.1f}%)...",
+            )
+            loop.call_soon_threadsafe(_emit, evt)
+
+        tqdm_bridge_cls = _HfTqdmProgressBridge.with_callback(_mmproj_progress_hook)
+        downloaded_str: str = await asyncio.to_thread(
+            hf_hub_download,
+            repo_id=repo_id,
+            filename=effective_mmproj,
+            local_dir=str(self.models_dir),
+            tqdm_class=tqdm_bridge_cls,
+        )
+        final_mmproj_path = Path(downloaded_str).resolve()
+        if not has_gguf_magic(final_mmproj_path):
+            if final_mmproj_path.is_file() and final_mmproj_path.is_relative_to(self.models_dir):
+                final_mmproj_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Downloaded mmproj file '{final_mmproj_path.name}' is not a valid GGUF binary "
+                "(missing 4-byte GGUF magic header)."
+            )
+        return final_mmproj_path
+
     async def _ensure_hf_or_catalog_downloaded(
         self,
         model_id: str,
@@ -1413,8 +1586,9 @@ class ModelDownloader:
         shard_layer_start: int | None,
         shard_layer_end: int | None,
         _emit: Callable[[DownloadProgressEvent], None],
-    ) -> Path:
-        """Download `.gguf` (via `HfApi().list_repo_files` + `hf_hub_download`) or Safetensors."""
+        mmproj_filename: str | None = None,
+    ) -> DownloadedModelArtifacts:
+        """Download `.gguf` (+ optional `mmproj-*.gguf`) or Safetensors from Hugging Face/Catalog."""
         catalog_entry = self.lookup_catalog_entry(model_id)
         repo_id = normalize_hf_repo_id(
             str(catalog_entry["repo_id"]) if catalog_entry else model_id.strip()
@@ -1426,6 +1600,22 @@ class ModelDownloader:
                 str(catalog_entry["filename"]).strip()
                 if catalog_entry and catalog_entry.get("filename")
                 else None
+            )
+        )
+        resolved_mmproj = (
+            mmproj_filename.strip()
+            if mmproj_filename and mmproj_filename.strip()
+            else (
+                str(catalog_entry["mmproj_filename"]).strip()
+                if catalog_entry and catalog_entry.get("mmproj_filename")
+                else None
+            )
+        )
+        is_vision_catalog = bool(
+            catalog_entry
+            and (
+                str(catalog_entry.get("modality") or "").strip().lower() == "vision"
+                or bool(catalog_entry.get("mmproj_filename"))
             )
         )
 
@@ -1440,6 +1630,18 @@ class ModelDownloader:
                     message=f"Checking local cache for {target_path.name}...",
                 )
             )
+            mmproj_path = await self._ensure_mmproj_downloaded(
+                model_id=model_id,
+                repo_id=repo_id,
+                mmproj_filename=resolved_mmproj,
+                repo_files=None,
+                is_vision_catalog=is_vision_catalog,
+                _emit=_emit,
+            )
+            self._resolved_mmproj_paths[model_id] = mmproj_path
+            self._resolved_mmproj_paths[repo_id] = mmproj_path
+            mmproj_str = str(mmproj_path) if mmproj_path is not None else None
+
             if is_valid_gguf_file(target_path, min_bytes=len(GGUF_MAGIC)):
                 size_bytes = target_path.stat().st_size
                 _emit(
@@ -1450,10 +1652,11 @@ class ModelDownloader:
                         downloaded_bytes=size_bytes,
                         total_bytes=size_bytes,
                         local_path=str(target_path),
+                        mmproj_path=mmproj_str,
                         message=f"Model '{model_id}' ready from cache ({target_path.name}).",
                     )
                 )
-                return target_path
+                return DownloadedModelArtifacts(model_path=target_path, mmproj_path=mmproj_path)
             if target_path.is_file():
                 logger.warning(
                     "Offline cached GGUF '%s' failed validation (size=%d); regenerating stub.",
@@ -1472,15 +1675,18 @@ class ModelDownloader:
                         downloaded_bytes=size_bytes,
                         total_bytes=size_bytes,
                         local_path=str(existing_path),
+                        mmproj_path=mmproj_str,
                         message=f"Model '{model_id}' ready from cache ({existing_path.name}).",
                     )
                 )
-                return existing_path
-            return await self._simulate_offline_gguf(model_id, target_path, _emit)
+                return DownloadedModelArtifacts(model_path=existing_path, mmproj_path=mmproj_path)
+            sim_path = await self._simulate_offline_gguf(model_id, target_path, _emit)
+            return DownloadedModelArtifacts(model_path=sim_path, mmproj_path=mmproj_path)
 
         if hf_hub_download is None:
             raise RuntimeError("`huggingface_hub` is not installed.")
 
+        repo_files: list[str] | None = None
         # Auto-discover best .gguf (Q4_K_M priority) if caller only gave repo_id
         if resolved_filename is None:
             _emit(
@@ -1496,12 +1702,15 @@ class ModelDownloader:
             if best_gguf is not None:
                 resolved_filename = best_gguf
             elif "config.json" in repo_files:
-                return await self.ensure_pytorch_shard_downloaded(
+                pytorch_dir = await self.ensure_pytorch_shard_downloaded(
                     model_id=repo_id,
                     shard_layer_start=shard_layer_start,
                     shard_layer_end=shard_layer_end,
                     on_event=_emit,
                 )
+                self._resolved_mmproj_paths[model_id] = None
+                self._resolved_mmproj_paths[repo_id] = None
+                return DownloadedModelArtifacts(model_path=pytorch_dir, mmproj_path=None)
             else:
                 raise FileNotFoundError(
                     f"No .gguf or Safetensors weights found in Hugging Face repo '{repo_id}'."
@@ -1518,6 +1727,16 @@ class ModelDownloader:
             )
         )
         if is_valid_gguf_file(target_path, min_bytes=MIN_ONLINE_GGUF_BYTES):
+            mmproj_path = await self._ensure_mmproj_downloaded(
+                model_id=model_id,
+                repo_id=repo_id,
+                mmproj_filename=resolved_mmproj,
+                repo_files=repo_files,
+                is_vision_catalog=is_vision_catalog,
+                _emit=_emit,
+            )
+            self._resolved_mmproj_paths[model_id] = mmproj_path
+            self._resolved_mmproj_paths[repo_id] = mmproj_path
             size_bytes = target_path.stat().st_size
             _emit(
                 DownloadProgressEvent(
@@ -1527,10 +1746,11 @@ class ModelDownloader:
                     downloaded_bytes=size_bytes,
                     total_bytes=size_bytes,
                     local_path=str(target_path),
+                    mmproj_path=str(mmproj_path) if mmproj_path is not None else None,
                     message=f"Model '{resolved_filename}' ready from ~/.shardai/models.",
                 )
             )
-            return target_path
+            return DownloadedModelArtifacts(model_path=target_path, mmproj_path=mmproj_path)
 
         if target_path.is_file():
             logger.warning(
@@ -1571,6 +1791,18 @@ class ModelDownloader:
                 f"Downloaded file '{final_path.name}' is not a valid GGUF binary "
                 "(missing 4-byte GGUF magic header)."
             )
+
+        mmproj_path = await self._ensure_mmproj_downloaded(
+            model_id=model_id,
+            repo_id=repo_id,
+            mmproj_filename=resolved_mmproj,
+            repo_files=repo_files,
+            is_vision_catalog=is_vision_catalog,
+            _emit=_emit,
+        )
+        self._resolved_mmproj_paths[model_id] = mmproj_path
+        self._resolved_mmproj_paths[repo_id] = mmproj_path
+
         final_size = final_path.stat().st_size if final_path.is_file() else 0
         _emit(
             DownloadProgressEvent(
@@ -1580,12 +1812,13 @@ class ModelDownloader:
                 downloaded_bytes=final_size,
                 total_bytes=final_size,
                 local_path=str(final_path),
+                mmproj_path=str(mmproj_path) if mmproj_path is not None else None,
                 message=f"Downloaded {final_path.name} into ~/.shardai/models.",
             )
         )
-        return final_path
+        return DownloadedModelArtifacts(model_path=final_path, mmproj_path=mmproj_path)
 
-    async def ensure_model_downloaded(
+    async def ensure_model_artifacts_downloaded(
         self,
         model_id: str,
         on_event: Callable[[DownloadProgressEvent], None] | None = None,
@@ -1593,8 +1826,9 @@ class ModelDownloader:
         shard_layer_end: int | None = None,
         source_type: str = "catalog",
         filename: str | None = None,
-    ) -> Path:
-        """Prepare any model source (`catalog`, `huggingface`, `direct_url`, or `local_file`)."""
+        mmproj_filename: str | None = None,
+    ) -> DownloadedModelArtifacts:
+        """Prepare model artifacts (`model_path` and optional `mmproj_path`) for any source."""
         cleaned_id: str = model_id.strip()
         if not cleaned_id:
             raise ValueError("model_id cannot be empty.")
@@ -1622,6 +1856,7 @@ class ModelDownloader:
         if effective_source == "local_file":
             local_path = self.resolve_safe_local_model_path(cleaned_id)
             if local_path.is_dir():
+                self._resolved_mmproj_paths[cleaned_id] = None
                 _emit(
                     DownloadProgressEvent(
                         model_id=model_id,
@@ -1631,7 +1866,33 @@ class ModelDownloader:
                         message=f"Local model directory ready ({local_path.name}).",
                     )
                 )
-                return local_path
+                return DownloadedModelArtifacts(model_path=local_path, mmproj_path=None)
+
+            resolved_local_mmproj: Path | None = None
+            if mmproj_filename and mmproj_filename.strip():
+                raw_mmproj = Path(mmproj_filename.strip())
+                candidate_mmproj = (
+                    raw_mmproj
+                    if raw_mmproj.is_absolute()
+                    else (local_path.parent / raw_mmproj.name)
+                )
+                resolved_local_mmproj = self.resolve_safe_local_model_path(str(candidate_mmproj))
+            elif "mmproj" not in local_path.name.lower():
+                sibling_names = [
+                    p.name
+                    for p in sorted(local_path.parent.glob("*.gguf"))
+                    if p.resolve() != local_path and "mmproj" in p.name.lower()
+                ]
+                best_sibling = select_best_mmproj_filename(sibling_names)
+                if best_sibling is not None:
+                    try:
+                        resolved_local_mmproj = self.resolve_safe_local_model_path(
+                            str(local_path.parent / best_sibling)
+                        )
+                    except Exception as exc:
+                        logger.debug("Ignoring invalid sibling mmproj '%s': %s", best_sibling, exc)
+
+            self._resolved_mmproj_paths[cleaned_id] = resolved_local_mmproj
             size_bytes = local_path.stat().st_size
             _emit(
                 DownloadProgressEvent(
@@ -1641,22 +1902,31 @@ class ModelDownloader:
                     downloaded_bytes=size_bytes,
                     total_bytes=size_bytes,
                     local_path=str(local_path),
+                    mmproj_path=(
+                        str(resolved_local_mmproj) if resolved_local_mmproj is not None else None
+                    ),
                     message=f"Local GGUF ready ({local_path.name}).",
                 )
             )
-            return local_path
+            return DownloadedModelArtifacts(
+                model_path=local_path,
+                mmproj_path=resolved_local_mmproj,
+            )
 
         if effective_source == "direct_url":
-            return await self._ensure_direct_url_downloaded(
+            direct_path = await self._ensure_direct_url_downloaded(
                 url=cleaned_id,
                 filename=filename,
                 _emit=_emit,
             )
+            self._resolved_mmproj_paths[cleaned_id] = None
+            return DownloadedModelArtifacts(model_path=direct_path, mmproj_path=None)
 
         # Support already-downloaded local HF Safetensors directories inside approved roots
         local_candidate = Path(cleaned_id)
         if local_candidate.is_dir() and (local_candidate / "config.json").is_file():
             resolved_dir = self.resolve_safe_local_model_path(cleaned_id)
+            self._resolved_mmproj_paths[cleaned_id] = None
             _emit(
                 DownloadProgressEvent(
                     model_id=model_id,
@@ -1666,12 +1936,37 @@ class ModelDownloader:
                     message=f"Local model directory ready ({resolved_dir.name}).",
                 )
             )
-            return resolved_dir
+            return DownloadedModelArtifacts(model_path=resolved_dir, mmproj_path=None)
 
-        return await self._ensure_hf_or_catalog_downloaded(
+        artifacts = await self._ensure_hf_or_catalog_downloaded(
             model_id=cleaned_id,
             filename=filename,
             shard_layer_start=shard_layer_start,
             shard_layer_end=shard_layer_end,
             _emit=_emit,
+            mmproj_filename=mmproj_filename,
         )
+        self._resolved_mmproj_paths[cleaned_id] = artifacts.mmproj_path
+        return artifacts
+
+    async def ensure_model_downloaded(
+        self,
+        model_id: str,
+        on_event: Callable[[DownloadProgressEvent], None] | None = None,
+        shard_layer_start: int | None = None,
+        shard_layer_end: int | None = None,
+        source_type: str = "catalog",
+        filename: str | None = None,
+        mmproj_filename: str | None = None,
+    ) -> Path:
+        """Prepare any model source (`catalog`, `huggingface`, `direct_url`, or `local_file`)."""
+        artifacts = await self.ensure_model_artifacts_downloaded(
+            model_id=model_id,
+            on_event=on_event,
+            shard_layer_start=shard_layer_start,
+            shard_layer_end=shard_layer_end,
+            source_type=source_type,
+            filename=filename,
+            mmproj_filename=mmproj_filename,
+        )
+        return artifacts.model_path

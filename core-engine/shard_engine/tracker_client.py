@@ -459,10 +459,22 @@ class SignalingTrackerClient:
                 if room.get("redundancy_factor") is not None
                 else 1
             )
+            raw_modality = room.get("modality")
+            normalized_modality = (
+                raw_modality.strip().lower()
+                if isinstance(raw_modality, str)
+                else ""
+            )
+            modality = (
+                normalized_modality
+                if normalized_modality in {"text", "vision", "audio", "multimodal"}
+                else None
+            )
             parsed.append(
                 RoomLobbyItem(
                     room_id=str(room.get("room_id") or "public"),
                     model=str(room.get("model") or ""),
+                    modality=modality,
                     nodes_online=max(1, nodes_count),
                     total_shared_ram_gb=max(0.0, shared_ram),
                     is_private=bool(room.get("is_private", False)),

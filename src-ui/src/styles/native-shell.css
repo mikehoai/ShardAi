@@ -768,6 +768,29 @@ pre {
   white-space: nowrap;
 }
 
+.modality-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.modality-badge--vision {
+  background: var(--info-bg);
+  color: var(--info-fg);
+  border: 1px solid var(--info-border);
+}
+
+.room-model-cell .modality-badge {
+  margin-left: 6px;
+}
+
 .room-resource-text,
 .room-status-text {
   display: inline;

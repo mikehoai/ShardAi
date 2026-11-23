@@ -23,6 +23,7 @@ import {
 } from "../services/engineApi";
 import {
   inferCustomSourceType,
+  isVisionModel,
   ModelSelector,
   resolveModelSelection,
   type CatalogSource,
@@ -170,6 +171,7 @@ interface StartConfigOverride {
   model: string;
   sourceType?: ModelSourceType;
   filename?: string | null;
+  mmprojFilename?: string | null;
   room: string;
   key: string;
   unlisted: boolean;
@@ -1039,7 +1041,8 @@ export const Dashboard: React.FC = () => {
       roomId: string;
       networkMode: NetworkMode;
       roomKey?: string | null;
-    }
+    },
+    mmprojFilename?: string | null
   ): Promise<void> => {
     if (!isMountedRef.current) {
       throw new DOMException("Model download aborted.", "AbortError");
@@ -1108,6 +1111,9 @@ export const Dashboard: React.FC = () => {
       });
       if (filename) {
         params.set("filename", filename);
+      }
+      if (mmprojFilename) {
+        params.set("mmproj_filename", mmprojFilename);
       }
       if (roomContext?.roomId) {
         params.set("room_id", roomContext.roomId);
@@ -1240,6 +1246,7 @@ export const Dashboard: React.FC = () => {
     model: string;
     sourceType: ModelSourceType;
     filename: string | null;
+    mmprojFilename: string | null;
   } => {
     const trimmed = targetModel.trim();
     const matchedCatalog = catalogModels.find(
@@ -1253,6 +1260,7 @@ export const Dashboard: React.FC = () => {
         model: matchedCatalog.repo_id,
         sourceType: "catalog",
         filename: matchedCatalog.filename ?? null,
+        mmprojFilename: matchedCatalog.mmproj_filename ?? null,
       };
     }
     setModelTab("custom");
@@ -1262,6 +1270,7 @@ export const Dashboard: React.FC = () => {
       model: trimmed,
       sourceType: inferCustomSourceType(trimmed),
       filename: null,
+      mmprojFilename: null,
     };
   };
 
@@ -1329,6 +1338,12 @@ export const Dashboard: React.FC = () => {
         : override?.model
           ? null
           : activeSelection.filename;
+    const targetMmprojFilename: string | null =
+      override?.mmprojFilename !== undefined
+        ? override.mmprojFilename
+        : override?.model
+          ? null
+          : activeSelection.mmprojFilename;
     const targetRoom = (override?.room ?? roomId).trim() || "public";
     const targetKey = (override?.key ?? roomKey).trim();
     const targetUnlisted = override?.unlisted ?? isUnlisted;
@@ -1385,11 +1400,17 @@ export const Dashboard: React.FC = () => {
       }
 
       setStatusMessage("Checking and preparing model weights...");
-      await streamModelDownload(targetModel, targetSourceType, targetFilename, {
-        roomId: targetRoom,
-        networkMode: targetMode,
-        roomKey: targetKey || null,
-      });
+      await streamModelDownload(
+        targetModel,
+        targetSourceType,
+        targetFilename,
+        {
+          roomId: targetRoom,
+          networkMode: targetMode,
+          roomKey: targetKey || null,
+        },
+        targetMmprojFilename
+      );
 
       if (lifecycleSignal.aborted || !isMountedRef.current) {
         return;
@@ -1404,6 +1425,7 @@ export const Dashboard: React.FC = () => {
         model_id: targetModel,
         source_type: targetSourceType,
         filename: targetFilename,
+        ...(targetMmprojFilename ? { mmproj_filename: targetMmprojFilename } : {}),
         network_mode: targetMode,
         room_id: targetRoom,
         room_key: targetKey || null,
@@ -1609,6 +1631,7 @@ export const Dashboard: React.FC = () => {
       model: syncedModel.model,
       sourceType: syncedModel.sourceType,
       filename: syncedModel.filename,
+      mmprojFilename: syncedModel.mmprojFilename,
       room: room.room_id,
       key: "",
       unlisted: false,
@@ -1635,6 +1658,7 @@ export const Dashboard: React.FC = () => {
       model: syncedModel.model,
       sourceType: syncedModel.sourceType,
       filename: syncedModel.filename,
+      mmprojFilename: syncedModel.mmprojFilename,
       room: target.room_id,
       key: secret,
       unlisted: false,
@@ -1692,6 +1716,7 @@ export const Dashboard: React.FC = () => {
       model: resolvedModel.model,
       sourceType: resolvedModel.sourceType,
       filename: resolvedModel.filename,
+      mmprojFilename: resolvedModel.mmprojFilename,
       room: cleanRoom,
       key: cleanKey,
       unlisted: modalUnlisted,
@@ -1714,11 +1739,26 @@ export const Dashboard: React.FC = () => {
       model: activeSelection.model,
       sourceType: activeSelection.sourceType,
       filename: activeSelection.filename,
+      mmprojFilename: activeSelection.mmprojFilename,
       room: parsedRoom,
       key: parsedKey ?? "",
       unlisted: true,
       mode: networkMode,
     });
+  };
+
+  const isRoomVisionModel = (room: RoomLobbyItem): boolean => {
+    if (room.modality?.trim().toLowerCase() === "vision") {
+      return true;
+    }
+    const normalizedRoomModel = room.model.trim();
+    if (!normalizedRoomModel) {
+      return false;
+    }
+    const matchedCatalog = catalogModels.find(
+      (m) => m.repo_id === normalizedRoomModel || m.id === normalizedRoomModel
+    );
+    return Boolean(matchedCatalog && isVisionModel(matchedCatalog));
   };
 
   const generatedInviteString: string = modalRoomKey.trim()
@@ -2669,7 +2709,16 @@ export const Dashboard: React.FC = () => {
                                       className="room-model-cell"
                                       title={room.model}
                                     >
-                                      {formatCompactModelName(room.model)}
+                                      <span>{formatCompactModelName(room.model)}</span>
+                                      {isRoomVisionModel(room) && (
+                                        <span
+                                          data-testid={`room-vision-badge-${room.room_id}`}
+                                          className="modality-badge modality-badge--vision"
+                                          title="Vision / Video Multimodal Model"
+                                        >
+                                          👁️ Vision / Video
+                                        </span>
+                                      )}
                                     </td>
                                     <td>{room.nodes_online}</td>
                                     <td>{room.total_shared_ram_gb} GB</td>

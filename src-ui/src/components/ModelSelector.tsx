@@ -8,6 +8,17 @@ export interface ResolvedModelSelection {
   model: string;
   sourceType: ModelSourceType;
   filename: string | null;
+  mmprojFilename: string | null;
+}
+
+export function isVisionModel(model: {
+  modality?: string | null;
+  mmproj_filename?: string | null;
+}): boolean {
+  return (
+    model.modality?.trim().toLowerCase() === "vision" ||
+    Boolean(model.mmproj_filename?.trim())
+  );
 }
 
 export function inferCustomSourceType(rawInput: string): ModelSourceType {
@@ -48,12 +59,14 @@ export function resolveModelSelection(params: {
         model: selected.repo_id,
         sourceType: "catalog",
         filename: selected.filename ?? null,
+        mmprojFilename: selected.mmproj_filename ?? null,
       };
     }
     return {
       model: modelInput.trim(),
       sourceType: "catalog",
       filename: null,
+      mmprojFilename: null,
     };
   }
 
@@ -62,6 +75,7 @@ export function resolveModelSelection(params: {
       model: localFilePath.trim(),
       sourceType: "local_file",
       filename: null,
+      mmprojFilename: null,
     };
   }
 
@@ -71,6 +85,7 @@ export function resolveModelSelection(params: {
     model: customModel,
     sourceType: detectedType,
     filename: detectedType === "huggingface" ? customFilename.trim() || null : null,
+    mmprojFilename: null,
   };
 }
 
@@ -125,6 +140,11 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     isDesktopShell ??
     (typeof window !== "undefined" &&
       ("__TAURI_INTERNALS__" in window || "__TAURI__" in window));
+  const selectedCatalogItem =
+    catalogModels.find((m) => m.id === selectedCatalogId) ?? catalogModels[0];
+  const isSelectedCatalogVision = Boolean(
+    selectedCatalogItem && isVisionModel(selectedCatalogItem)
+  );
 
   return (
     <div style={{ marginBottom }}>
@@ -138,9 +158,20 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           marginBottom: "6px",
         }}
       >
-        <span className="native-label" style={{ marginBottom: 0 }}>
-          {label}
-        </span>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <span className="native-label" style={{ marginBottom: 0 }}>
+            {label}
+          </span>
+          {modelTab === "catalog" && isSelectedCatalogVision && (
+            <span
+              data-testid={tid("vision-modality-badge")}
+              className="modality-badge modality-badge--vision"
+              title="Vision / Video Multimodal Model (supports images & video frames)"
+            >
+              👁️ Vision / Video
+            </span>
+          )}
+        </div>
         {catalogSource !== null && modelTab === "catalog" && (() => {
           const catalogTooltip =
             catalogSource === "cloud"
@@ -237,7 +268,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
             ) : (
               catalogModels.map((item) => (
                 <option key={item.id} value={item.id}>
-                  {item.name} (~{item.estimated_ram_gb} GB)
+                  {item.name}
+                  {isVisionModel(item) ? " — 👁️ Vision / Video" : ""} (~
+                  {item.estimated_ram_gb} GB)
                 </option>
               ))
             )}

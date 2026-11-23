@@ -96,6 +96,44 @@ def _extract_eos_token_ids(config: Any, tokenizer: Any) -> set[int]:
     return eos_ids
 
 
+def select_llama_chat_handler(model_id: str, mmproj_path: str) -> Any | None:
+    """Select and instantiate the appropriate `llama_cpp` multimodal chat handler for `mmproj_path`."""
+    try:
+        from llama_cpp import llama_chat_format  # type: ignore[import-not-found]
+    except Exception as exc:
+        logger.warning("llama_cpp.llama_chat_format unavailable for vision mmproj: %s", exc)
+        return None
+
+    combined = f"{model_id} {Path(mmproj_path).name}".lower()
+    candidate_names: list[str]
+    if any(
+        token in combined
+        for token in ("qwen2.5-vl", "qwen2_5_vl", "qwen2.5_vl", "qwen25-vl", "qwen2-vl", "qwen2_vl")
+    ):
+        candidate_names = ["Qwen25VLChatHandler", "Llava15ChatHandler"]
+    elif any(token in combined for token in ("llava-1.6", "llava-v1.6", "llava16")):
+        candidate_names = ["Llava16ChatHandler", "Llava15ChatHandler"]
+    elif "minicpm" in combined:
+        candidate_names = ["MiniCPMv26ChatHandler", "Llava15ChatHandler"]
+    else:
+        candidate_names = ["Llava15ChatHandler"]
+
+    for cls_name in candidate_names:
+        handler_cls = getattr(llama_chat_format, cls_name, None)
+        if handler_cls is None:
+            continue
+        try:
+            return handler_cls(clip_model_path=mmproj_path, verbose=False)
+        except Exception as exc:
+            logger.warning(
+                "Failed initializing %s with mmproj %s: %s",
+                cls_name,
+                mmproj_path,
+                exc,
+            )
+    return None
+
+
 class ShardModelRunner:
     """Executes forward passes across the transformer layers assigned to this node."""
 
@@ -103,6 +141,7 @@ class ShardModelRunner:
         self,
         model_id: str = "meta-llama/Llama-3.1-8B-Instruct",
         model_path: str | None = None,
+        mmproj_path: str | None = None,
         shard_layer_start: int = 0,
         shard_layer_end: int = 15,
         total_layers: int = DEFAULT_TOTAL_LAYERS,
@@ -117,6 +156,7 @@ class ShardModelRunner:
     ) -> None:
         self.model_id: str = model_id
         self.model_path: str | None = model_path
+        self.mmproj_path: str | None = mmproj_path
         self.shard_layer_start: int = shard_layer_start
         self.shard_layer_end: int = shard_layer_end
         self.total_layers: int = total_layers
@@ -414,22 +454,34 @@ class ShardModelRunner:
         try:
             from llama_cpp import Llama  # type: ignore[import-not-found]
 
-            self._native_handle = Llama(
-                model_path=gguf_path,
-                n_gpu_layers=n_layers,
-                n_ctx=2048,
-                embeddings=True,
+            use_vision_projector = bool(
+                self.is_head_node
+                and self.mmproj_path
+                and Path(self.mmproj_path).is_file()
+            )
+            llama_kwargs: dict[str, Any] = {
+                "model_path": gguf_path,
+                "n_gpu_layers": n_layers,
+                "n_ctx": 4096 if use_vision_projector else 2048,
+                "embeddings": True,
                 # use_mmap=True -> pages missing weights from SSD (Disk Offload, no OOM);
                 # use_mlock must stay False so the OS is free to evict mapped pages.
-                use_mmap=self.use_mmap,
-                use_mlock=False,
-                verbose=False,
-            )
+                "use_mmap": self.use_mmap,
+                "use_mlock": False,
+                "verbose": False,
+            }
+            if use_vision_projector and self.mmproj_path is not None:
+                chat_handler = select_llama_chat_handler(self.model_id, self.mmproj_path)
+                if chat_handler is not None:
+                    llama_kwargs["chat_handler"] = chat_handler
+
+            self._native_handle = Llama(**llama_kwargs)
             logger.info(
-                "Initialized llama_cpp with %s (n_layers=%d, use_mmap=%s)",
+                "Initialized llama_cpp with %s (n_layers=%d, use_mmap=%s, vision=%s)",
                 gguf_path,
                 n_layers,
                 self.use_mmap,
+                "chat_handler" in llama_kwargs,
             )
         except Exception as exc:
             logger.info(
@@ -454,7 +506,7 @@ class ShardModelRunner:
     def stream_native(
         self,
         prompt: str,
-        messages: list[dict[str, str]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
         max_tokens: int = 256,
         temperature: float = 0.7,
         stop_event: threading.Event | None = None,
@@ -555,12 +607,39 @@ class ShardModelRunner:
         """Drop KV-cache and decoding history for a completed/aborted request."""
         self._sessions.pop(request_id, None)
 
-    def tokenize_chat(self, messages: list[dict[str, str]]) -> list[int]:
+    @staticmethod
+    def _flatten_message_content(content: Any) -> str:
+        """Flatten string or OpenAI multimodal content blocks into plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = str(block.get("type") or "").strip().lower()
+                if btype == "image_url":
+                    parts.append("[image]")
+                elif "text" in block:
+                    text_val = str(block.get("text") or "").strip()
+                    if text_val:
+                        parts.append(text_val)
+            return " ".join(parts).strip()
+        return str(content) if content is not None else ""
+
+    def tokenize_chat(self, messages: list[dict[str, Any]]) -> list[int]:
         """Apply chat template (when available) and tokenize chat messages into token IDs."""
+        text_messages: list[dict[str, str]] = [
+            {
+                "role": str(m.get("role") or "user"),
+                "content": self._flatten_message_content(m.get("content")),
+            }
+            for m in messages
+        ]
         if self._tokenizer is not None:
             if getattr(self._tokenizer, "chat_template", None):
                 encoded = self._tokenizer.apply_chat_template(
-                    messages,
+                    text_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                 )
@@ -572,10 +651,10 @@ class ShardModelRunner:
                     encoded = encoded[0]
                 return [int(t) for t in encoded]
 
-            joined = "\n".join(f"[{m['role']}] {m['content']}" for m in messages)
+            joined = "\n".join(f"[{m['role']}] {m['content']}" for m in text_messages)
             return [int(t) for t in self._tokenizer.encode(joined, add_special_tokens=True)]
 
-        joined_fallback = "\n".join(f"[{m['role']}] {m['content']}" for m in messages)
+        joined_fallback = "\n".join(f"[{m['role']}] {m['content']}" for m in text_messages)
         return self.tokenize(joined_fallback)
 
     def tokenize(self, prompt: str) -> list[int]:

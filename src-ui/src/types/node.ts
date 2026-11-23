@@ -14,15 +14,18 @@ export type PeerRole = "primary" | "backup";
 export type ModelSourceType = "catalog" | "huggingface" | "direct_url" | "local_file";
 
 export type CatalogModelTask = "text" | "image" | "video" | "multimodal";
+export type CatalogModelModality = "text" | "vision" | "audio" | "multimodal";
 
 export interface CatalogModelItem {
   id: string;
   name: string;
   repo_id: string;
   filename?: string | null;
+  mmproj_filename?: string | null;
   estimated_ram_gb: number;
   enabled: boolean;
   task?: CatalogModelTask | null;
+  modality?: CatalogModelModality | null;
   category?: string | null;
 }
 
@@ -57,6 +60,7 @@ export interface PeerNodeInfo {
 export interface RoomLobbyItem {
   room_id: string;
   model: string;
+  modality?: CatalogModelModality | null;
   nodes_online: number;
   total_shared_ram_gb: number;
   is_private: boolean;
@@ -89,6 +93,7 @@ export interface StartNodeRequest {
   model_id: string;
   source_type?: ModelSourceType;
   filename?: string | null;
+  mmproj_filename?: string | null;
   network_mode: NetworkMode;
   room_id: string;
   room_key?: string | null;
@@ -109,6 +114,7 @@ export interface NodeStatusResponse {
   node_id: string | null;
   model_id: string | null;
   model_path?: string | null;
+  mmproj_path?: string | null;
   network_mode?: NetworkMode | null;
   room_id?: string | null;
   is_private?: boolean;

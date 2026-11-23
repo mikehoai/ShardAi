@@ -152,29 +152,76 @@ class _ClosableStreamingResponse(StreamingResponse):
                     pass
 
 
-def _extract_chat_messages_dicts(messages: list[ChatMessage]) -> list[dict[str, str]]:
-    """Convert OpenAI `ChatMessage` models into simple `{role, content}` dicts."""
-    normalized: list[dict[str, str]] = []
+def _extract_chat_messages_dicts(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """Convert OpenAI `ChatMessage` models into normalized `{role, content}` dicts.
+
+    Preserves OpenAI Vision multimodal content arrays containing `image_url` parts while
+    keeping plain string `content` for text-only messages.
+    """
+    normalized: list[dict[str, Any]] = []
     for msg in messages:
         if isinstance(msg.content, str):
             text = msg.content.strip()
-        else:
-            text = " ".join(
-                str(block.get("text", ""))
-                for block in msg.content
-                if isinstance(block, dict)
-            ).strip()
-        if text:
-            normalized.append({"role": msg.role, "content": text})
+            if text:
+                normalized.append({"role": msg.role, "content": text})
+            continue
+
+        blocks: list[dict[str, Any]] = []
+        has_image = False
+        text_parts: list[str] = []
+        for raw_block in msg.content:
+            if not isinstance(raw_block, dict):
+                continue
+            block_type = str(raw_block.get("type") or "").strip().lower()
+            if block_type == "image_url":
+                raw_image_url = raw_block.get("image_url")
+                image_obj: dict[str, Any] | None = None
+                if isinstance(raw_image_url, dict):
+                    url_val = str(raw_image_url.get("url") or "").strip()
+                    if url_val:
+                        image_obj = {"url": url_val}
+                        detail = raw_image_url.get("detail")
+                        if isinstance(detail, str) and detail.strip():
+                            image_obj["detail"] = detail.strip()
+                elif isinstance(raw_image_url, str) and raw_image_url.strip():
+                    image_obj = {"url": raw_image_url.strip()}
+                if image_obj is not None:
+                    has_image = True
+                    blocks.append({"type": "image_url", "image_url": image_obj})
+            else:
+                raw_text = raw_block.get("text")
+                text_val = str(raw_text).strip() if raw_text is not None else ""
+                if text_val:
+                    text_parts.append(text_val)
+                    blocks.append({"type": block_type or "text", "text": text_val})
+
+        if has_image:
+            normalized.append({"role": msg.role, "content": blocks})
+        elif text_parts:
+            normalized.append({"role": msg.role, "content": " ".join(text_parts)})
+
     return normalized or [{"role": "user", "content": "Hello"}]
 
 
 def _extract_prompt_from_messages(messages: list[ChatMessage]) -> str:
     """Flatten OpenAI chat messages into a single prompt string for fallback tokenizers."""
-    parts: list[str] = [
-        f"[{item['role']}] {item['content']}"
-        for item in _extract_chat_messages_dicts(messages)
-    ]
+    parts: list[str] = []
+    for item in _extract_chat_messages_dicts(messages):
+        content = item.get("content")
+        if isinstance(content, list):
+            flat_items: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "image_url":
+                    flat_items.append("[image]")
+                elif "text" in block:
+                    text_val = str(block.get("text") or "").strip()
+                    if text_val:
+                        flat_items.append(text_val)
+            parts.append(f"[{item['role']}] {' '.join(flat_items)}".strip())
+        else:
+            parts.append(f"[{item['role']}] {content}")
     return "\n".join(parts) if parts else "Hello"
 
 
@@ -304,6 +351,7 @@ class LocalNodeRuntime:
         self.node_id: str | None = None
         self.model_id: str | None = None
         self.model_path: str | None = None
+        self.mmproj_path: str | None = None
         self.network_mode: NetworkMode | None = None
         self.room_id: str | None = None
         self.room_key_hash: str | None = None
@@ -830,7 +878,7 @@ class LocalNodeRuntime:
     async def _stream_native_async(
         self,
         prompt: str,
-        messages: list[dict[str, str]] | None,
+        messages: list[dict[str, Any]] | None,
         max_tokens: int,
         temperature: float,
         stop_event: threading.Event | None = None,
@@ -1027,7 +1075,7 @@ class LocalNodeRuntime:
         prompt: str,
         max_tokens: int,
         compress_activations: bool = True,
-        messages: list[dict[str, str]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
         stop_event: threading.Event | None = None,
     ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
@@ -1583,6 +1631,7 @@ class LocalNodeRuntime:
             node_id=self.node_id,
             model_id=self.model_id,
             model_path=self.model_path,
+            mmproj_path=self.mmproj_path,
             network_mode=self.network_mode,
             room_id=self.room_id,
             is_private=self.is_private,
@@ -2007,6 +2056,7 @@ async def stream_model_download(
     ram_gb: int | None = None,
     source_type: ModelSourceType = ModelSourceType.CATALOG,
     filename: str | None = None,
+    mmproj_filename: str | None = None,
     room_id: str | None = None,
     room_key: str | None = None,
     network_mode: NetworkMode = NetworkMode.INTERNET,
@@ -2078,6 +2128,7 @@ async def stream_model_download(
                 shard_layer_end=resolved_end,
                 source_type=source_type.value,
                 filename=filename,
+                mmproj_filename=mmproj_filename,
             )
         except Exception as exc:
             progress_queue.put_nowait(
@@ -2107,6 +2158,7 @@ async def stream_model_download(
                         "downloaded_bytes": evt.downloaded_bytes,
                         "total_bytes": evt.total_bytes,
                         "local_path": evt.local_path,
+                        "mmproj_path": evt.mmproj_path,
                         "message": evt.message,
                     }
                 )
@@ -2181,6 +2233,7 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
         runtime.node_id = None
         runtime.model_id = None
         runtime.model_path = None
+        runtime.mmproj_path = None
         runtime.network_mode = None
         runtime.room_id = None
         runtime.room_key_hash = None
@@ -2490,6 +2543,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                 shard_layer_end=target_end,
                 source_type=request.source_type.value,
                 filename=request.filename,
+                mmproj_filename=request.mmproj_filename,
             )
         except PermissionError as perm_exc:
             raise HTTPException(
@@ -2556,10 +2610,19 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             request,
             estimated_ram_mb=final_est_ram,
         )
+        local_mmproj_path = runtime.model_downloader.get_resolved_mmproj_path(
+            request.model_id
+        )
+        active_mmproj_path: str | None = (
+            str(local_mmproj_path)
+            if (final_start == 0 and local_mmproj_path is not None)
+            else None
+        )
         runtime.model_runner = await asyncio.to_thread(
             ShardModelRunner,
             model_id=request.model_id,
             model_path=str(local_model_path),
+            mmproj_path=active_mmproj_path,
             shard_layer_start=final_start,
             shard_layer_end=final_end,
             total_layers=final_total_layers,
@@ -2616,6 +2679,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.node_id = request.node_id
         runtime.model_id = request.model_id
         runtime.model_path = str(local_model_path)
+        runtime.mmproj_path = active_mmproj_path
         runtime.network_mode = request.network_mode
         runtime.room_id = request.room_id
         runtime.room_key_hash = room_key_hash
@@ -2806,7 +2870,7 @@ async def openai_chat_completions(
     runtime.validate_pipeline_preflight()
 
     prompt_text: str = _extract_prompt_from_messages(request.messages)
-    chat_messages: list[dict[str, str]] = _extract_chat_messages_dicts(request.messages)
+    chat_messages: list[dict[str, Any]] = _extract_chat_messages_dicts(request.messages)
     max_tokens: int = request.max_tokens or 256
     temperature: float = request.temperature if request.temperature is not None else 0.7
     completion_id: str = f"chatcmpl-{uuid.uuid4().hex[:24]}"
