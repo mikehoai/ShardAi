@@ -1,8 +1,7 @@
 <div align="center">
   <img src="assets/logo.png" alt="ShardAi Logo" width="140" />
-  <h1>ShardAi Node</h1>
+  <h1>ShardAi</h1>
   <p><strong>Open-Source P2P Distributed LLM Desktop Client &amp; Local OpenAI-Compatible API Gateway</strong></p>
-
   <p>
     <a href="https://shardai.online"><img src="https://img.shields.io/badge/Website-shardai.online-2563eb?style=flat-square" alt="Official Website" /></a>
     <a href="https://github.com/mikehoai/ShardAi/stargazers"><img src="https://img.shields.io/github/stars/mikehoai/ShardAi?style=flat-square&color=2563eb" alt="Stars" /></a>
@@ -10,7 +9,6 @@
     <a href="https://github.com/mikehoai/ShardAi/issues"><img src="https://img.shields.io/github/issues/mikehoai/ShardAi?style=flat-square" alt="Issues" /></a>
     <a href="https://github.com/mikehoai/ShardAi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/mikehoai/ShardAi?style=flat-square" alt="License" /></a>
   </p>
-
   <p>
     <a href="https://www.nvidia.com/en-us/startups/" target="_blank" rel="noopener noreferrer">
       <picture>
@@ -20,7 +18,6 @@
       </picture>
     </a>
   </p>
-  <p><sub>ShardAi is a member of the <a href="https://www.nvidia.com/en-us/startups/">NVIDIA Inception Program</a>.</sub></p>
 </div>
 
 ---
