@@ -14,6 +14,19 @@
   <p>
     🌐 <strong>Official Homepage:</strong> <a href="https://shardai.online">https://shardai.online</a>
   </p>
+
+  <br />
+
+  <p>
+    <a href="https://www.nvidia.com/en-us/startups/" target="_blank" rel="noopener noreferrer">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/nvidia-inception-program-badge-rgb-white-bg.jpg" />
+        <source media="(prefers-color-scheme: light)" srcset="assets/nvidia-inception-program-badge-rgb.png" />
+        <img src="assets/nvidia-inception-program-badge-rgb-white-bg.jpg" alt="NVIDIA Inception Program Member" width="220" />
+      </picture>
+    </a>
+  </p>
+  <p><sub>ShardAi is a member of the <a href="https://www.nvidia.com/en-us/startups/">NVIDIA Inception Program</a>.</sub></p>
 </div>
 
 ---
@@ -377,3 +390,7 @@ Contributions to `shardai-node` are welcome!
 ## 📄 License
 
 Distributed under the MIT License. See `LICENSE` for more information.
+
+---
+
+<sub>NVIDIA®, the NVIDIA logo, and NVIDIA Inception® are trademarks and/or registered trademarks of NVIDIA Corporation in the U.S. and other countries.</sub>
