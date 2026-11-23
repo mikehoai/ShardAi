@@ -59,6 +59,7 @@ const NETWORK_STATUS_META: Record<
 
 type ThemeMode = "light" | "dark";
 type NavSection = "overview" | "node" | "rooms" | "credentials";
+type EngineBootState = "loading" | "ready" | "error";
 
 const MAX_COMPACT_ROOM_NAME_LEN = 18;
 const MODEL_PREFIX_PATTERNS: readonly RegExp[] = [
@@ -235,6 +236,25 @@ export const Dashboard: React.FC = () => {
   });
   const [themeMode, setThemeMode] = useState<ThemeMode>(resolveInitialTheme);
   const [isMaximized, setIsMaximized] = useState<boolean>(false);
+  const [engineBootState, setEngineBootState] = useState<EngineBootState>(() =>
+    isTauriEnvironment() ? "loading" : "ready"
+  );
+  const [engineBootDetail, setEngineBootDetail] = useState<string>(
+    "Initializing local Core Engine..."
+  );
+  const [engineBootError, setEngineBootError] = useState<string | null>(null);
+  const [engineBootAttempt, setEngineBootAttempt] = useState<number>(0);
+  const isEngineBlocked = engineBootState !== "ready";
+  const workspaceContentRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const container = workspaceContentRef.current as
+      | (HTMLDivElement & { inert?: boolean })
+      | null;
+    if (container) {
+      container.inert = isEngineBlocked;
+    }
+  }, [isEngineBlocked]);
 
   useEffect(() => {
     try {
@@ -253,6 +273,9 @@ export const Dashboard: React.FC = () => {
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent): void => {
+      if (isEngineBlocked) {
+        return;
+      }
       if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) {
         return;
       }
@@ -277,7 +300,7 @@ export const Dashboard: React.FC = () => {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [toggleSidebar]);
+  }, [toggleSidebar, isEngineBlocked]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", themeMode);
@@ -291,6 +314,29 @@ export const Dashboard: React.FC = () => {
   const toggleThemeMode = (): void => {
     setThemeMode((prev) => (prev === "dark" ? "light" : "dark"));
   };
+
+  // Keep maximize/restore icon synced on native double-click maximize or OS snap
+  useEffect(() => {
+    if (!isTauriEnvironment()) {
+      return;
+    }
+    const handleWindowResize = (): void => {
+      void invokeTauriCommand<boolean>("window_is_maximized")
+        .then((max) => {
+          if (isMountedRef.current) {
+            setIsMaximized(Boolean(max));
+          }
+        })
+        .catch(() => {
+          // Ignore transient window state query errors
+        });
+    };
+
+    window.addEventListener("resize", handleWindowResize);
+    return () => {
+      window.removeEventListener("resize", handleWindowResize);
+    };
+  }, []);
 
   // Network Rooms Lobby State
   const roomSessionSeedRef = useRef<number>(createRoomSessionSeed());
@@ -590,6 +636,134 @@ export const Dashboard: React.FC = () => {
     },
     [updateSelectedCatalogId, updateModalSelectedCatalogId]
   );
+
+  // Initial Core Engine startup gate in Tauri desktop shell
+  useEffect(() => {
+    if (!isTauriEnvironment()) {
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const probeHealth = async (signal: AbortSignal): Promise<boolean> => {
+      try {
+        const res = await fetch(`${LOCAL_ENGINE_ROOT}/health`, {
+          method: "GET",
+          signal,
+        });
+        return res.ok;
+      } catch (err: unknown) {
+        if (isAbortError(err) || signal.aborted) {
+          throw err;
+        }
+        return false;
+      }
+    };
+
+    const waitAbortable = (ms: number, signal: AbortSignal): Promise<void> =>
+      new Promise((resolve) => {
+        if (signal.aborted) {
+          resolve();
+          return;
+        }
+        const timerId = window.setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, ms);
+        const onAbort = (): void => {
+          window.clearTimeout(timerId);
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+
+    const bootEngine = async (): Promise<void> => {
+      if (cancelled || controller.signal.aborted || !isMountedRef.current) {
+        return;
+      }
+      setEngineBootState("loading");
+      setEngineBootError(null);
+      setEngineBootDetail("Connecting to ShardAi Core Engine...");
+
+      try {
+        const alreadyReady = await probeHealth(controller.signal);
+        if (cancelled || controller.signal.aborted || !isMountedRef.current) {
+          return;
+        }
+
+        if (!alreadyReady) {
+          setEngineBootDetail(
+            "Starting local Core Engine runtime (first launch may take up to 30s)..."
+          );
+          await invokeTauriCommand<string>("start_python_core");
+          if (cancelled || controller.signal.aborted || !isMountedRef.current) {
+            return;
+          }
+
+          let healthy = false;
+          for (let attempt = 0; attempt < 15; attempt += 1) {
+            if (cancelled || controller.signal.aborted) {
+              return;
+            }
+            if (await probeHealth(controller.signal)) {
+              healthy = true;
+              break;
+            }
+            if (attempt < 14) {
+              await waitAbortable(300, controller.signal);
+            }
+          }
+          if (!healthy) {
+            throw new Error("Core Engine started but failed to respond on /health.");
+          }
+        }
+
+        if (cancelled || controller.signal.aborted || !isMountedRef.current) {
+          return;
+        }
+
+        setEngineBootDetail("Syncing network status and model catalog...");
+        const [netResult] = await Promise.allSettled([
+          fetchNetworkStatus({ signal: controller.signal }),
+          fetchAvailableRooms({ signal: controller.signal }),
+          fetchModelCatalog({ signal: controller.signal }),
+        ]);
+
+        if (cancelled || controller.signal.aborted || !isMountedRef.current) {
+          return;
+        }
+
+        if (netResult.status === "fulfilled" && netResult.value) {
+          engineSyncedRef.current = true;
+        }
+        setEngineBootState("ready");
+      } catch (err: unknown) {
+        if (
+          cancelled ||
+          controller.signal.aborted ||
+          isAbortError(err) ||
+          !isMountedRef.current
+        ) {
+          return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        setEngineBootError(message);
+        setEngineBootState("error");
+      }
+    };
+
+    void bootEngine();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [engineBootAttempt, fetchNetworkStatus, fetchAvailableRooms, fetchModelCatalog]);
+
+  const handleRetryEngineBoot = (): void => {
+    setEngineBootAttempt((prev) => prev + 1);
+  };
 
   // Network Status Indicator: fast 2s poll while engine is unpacking, 10s once connected
   useEffect(() => {
@@ -1591,36 +1765,14 @@ export const Dashboard: React.FC = () => {
       {/* =================================================================== */}
       {/* Custom Native OS Window Titlebar                                    */}
       {/* =================================================================== */}
-      <header
-        className="native-titlebar"
-        data-tauri-drag-region
-        onMouseDown={(e) => {
-          if (
-            inTauri &&
-            e.button === 0 &&
-            !(e.target as HTMLElement).closest("button")
-          ) {
-            void invokeTauriCommand("window_start_drag");
-          }
-        }}
-        onDoubleClick={(e) => {
-          if (
-            inTauri &&
-            !(e.target as HTMLElement).closest("button")
-          ) {
-            void invokeTauriCommand<boolean>("window_toggle_maximize").then((max) => {
-              if (isMountedRef.current) {
-                setIsMaximized(Boolean(max));
-              }
-            });
-          }
-        }}
-      >
-        <div className="native-titlebar-left" data-tauri-drag-region>
+      <header className="native-titlebar" data-tauri-drag-region="deep">
+        <div className="native-titlebar-left">
           <button
             type="button"
             data-testid="sidebar-toggle-btn"
+            data-tauri-drag-region="false"
             className="sidebar-toggle-btn"
+            disabled={isEngineBlocked}
             onClick={toggleSidebar}
             aria-expanded={!isSidebarHidden}
             aria-controls="primary-navigation-sidebar"
@@ -1659,14 +1811,16 @@ export const Dashboard: React.FC = () => {
             alt="ShardAi Logo"
             data-testid="shardai-logo"
             className="native-titlebar-logo"
+            draggable={false}
           />
-          <span className="native-titlebar-title" data-tauri-drag-region>
-            ShardAi Gateway
-          </span>
+          <span className="native-titlebar-title">ShardAi Gateway</span>
           <span className="native-titlebar-version">v0.1.0</span>
         </div>
 
-        <div className={`native-titlebar-right${inTauri ? " has-window-controls" : ""}`}>
+        <div
+          className={`native-titlebar-right${inTauri ? " has-window-controls" : ""}`}
+          data-tauri-drag-region="false"
+        >
           <div className="titlebar-status-group">
             <span
               role="status"
@@ -1845,14 +1999,19 @@ export const Dashboard: React.FC = () => {
       {/* Desktop Split Body: Left Sidebar + Main Workspace                   */}
       {/* =================================================================== */}
       <div className="native-body">
-        <aside
-          id="primary-navigation-sidebar"
-          data-testid="native-sidebar"
-          className={`native-sidebar${isSidebarHidden ? " collapsed" : ""}`}
-          aria-label="Primary Navigation"
-          aria-hidden={isSidebarHidden}
-          hidden={isSidebarHidden}
+        <div
+          ref={workspaceContentRef}
+          className={`native-body-content${isEngineBlocked ? " is-blocked" : ""}`}
+          aria-hidden={isEngineBlocked}
         >
+          <aside
+            id="primary-navigation-sidebar"
+            data-testid="native-sidebar"
+            className={`native-sidebar${isSidebarHidden ? " collapsed" : ""}`}
+            aria-label="Primary Navigation"
+            aria-hidden={isSidebarHidden}
+            hidden={isSidebarHidden}
+          >
           <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             <nav>
               <div className="sidebar-section-label">Workspace</div>
@@ -3110,6 +3269,77 @@ export const Dashboard: React.FC = () => {
             )}
           </div>
         </main>
+        </div>
+
+        {isEngineBlocked && (
+          <div
+            data-testid="core-engine-loading-overlay"
+            data-boot-state={engineBootState}
+            className="engine-boot-overlay"
+            role={engineBootState === "error" ? "alertdialog" : "status"}
+            aria-modal="true"
+            aria-busy={engineBootState === "loading"}
+            aria-live="polite"
+            aria-label={
+              engineBootState === "error"
+                ? "Core Engine Failed to Start"
+                : "Starting Core Engine"
+            }
+          >
+            <div className="engine-boot-card">
+              <div className="engine-boot-brand">
+                <img
+                  src="/logo.png"
+                  alt="ShardAi Logo"
+                  className="engine-boot-logo"
+                  draggable={false}
+                />
+              </div>
+
+              {engineBootState === "loading" ? (
+                <>
+                  <div className="engine-boot-spinner" aria-hidden="true" />
+                  <h2 className="engine-boot-title">Starting Core Engine</h2>
+                  <p className="engine-boot-detail">{engineBootDetail}</p>
+                  <p className="engine-boot-hint">
+                    Please wait while ShardAi initializes the local AI &amp; P2P runtime...
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="engine-boot-error-icon" aria-hidden="true">
+                    <svg
+                      width="24"
+                      height="24"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="12" cy="12" r="10" />
+                      <line x1="12" y1="8" x2="12" y2="12" />
+                      <line x1="12" y1="16" x2="12.01" y2="16" />
+                    </svg>
+                  </div>
+                  <h2 className="engine-boot-title">Core Engine Failed to Start</h2>
+                  <p className="engine-boot-error" role="alert">
+                    {engineBootError ?? "Unable to start local Core Engine."}
+                  </p>
+                  <button
+                    type="button"
+                    data-testid="retry-engine-boot-btn"
+                    className="native-btn native-btn-primary"
+                    onClick={handleRetryEngineBoot}
+                  >
+                    Retry Startup
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {isSharing && sessionToken && (
@@ -3136,7 +3366,11 @@ export const Dashboard: React.FC = () => {
             whiteSpace: "nowrap",
           }}
         >
-          {statusMessage}
+          {engineBootState === "loading"
+            ? "Starting Core Engine..."
+            : engineBootState === "error"
+              ? "Core Engine failed to start"
+              : statusMessage}
         </span>
         <span
           data-testid="footer-copyright"

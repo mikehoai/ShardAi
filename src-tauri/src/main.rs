@@ -684,6 +684,11 @@ fn window_start_drag(window: tauri::Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn window_is_maximized(window: tauri::Window) -> Result<bool, String> {
+    window.is_maximized().map_err(|e| e.to_string())
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -748,6 +753,7 @@ fn main() {
             get_available_ram_gb,
             window_minimize,
             window_toggle_maximize,
+            window_is_maximized,
             window_close,
             window_start_drag
         ])
@@ -801,6 +807,28 @@ mod tests {
         assert!(
             perms.iter().any(|item| item.as_str() == Some("dialog:default")),
             "capabilities/default.json must include dialog:default"
+        );
+    }
+
+    #[test]
+    fn default_capabilities_include_window_drag_and_maximize_permissions() {
+        let caps_json = include_str!("../capabilities/default.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(caps_json).expect("capabilities/default.json must be valid JSON");
+        let perms = parsed["permissions"]
+            .as_array()
+            .expect("permissions must be a JSON array");
+        assert!(
+            perms
+                .iter()
+                .any(|item| item.as_str() == Some("core:window:allow-start-dragging")),
+            "capabilities/default.json must include core:window:allow-start-dragging"
+        );
+        assert!(
+            perms
+                .iter()
+                .any(|item| item.as_str() == Some("core:window:allow-internal-toggle-maximize")),
+            "capabilities/default.json must include core:window:allow-internal-toggle-maximize"
         );
     }
 
