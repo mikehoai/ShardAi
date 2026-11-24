@@ -2,8 +2,7 @@
 
 Supports true distributed PyTorch pipeline parallelism across transformer layers
 (`shard_layer_start` .. `shard_layer_end`) loaded selectively from Hugging Face
-`.safetensors` shards, as well as a lightweight deterministic simulation fallback
-for offline unit tests without physical model weights.
+`.safetensors` shards, as well as native `llama_cpp` execution for `.gguf` models.
 
 Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
 - 100% Python type hints.
@@ -33,29 +32,6 @@ DEFAULT_HIDDEN_DIM: int = 4096
 DEFAULT_TOTAL_LAYERS: int = 32
 MAX_KV_CACHE_ENTRIES: int = 8
 KV_CACHE_TTL_SECONDS: float = 120.0
-
-# Vocabulary sample bank used ONLY when running offline simulation without real weights
-_SYNTHETIC_VOCAB: tuple[str, ...] = (
-    "ShardAi",
-    " distributed",
-    " P2P",
-    " pipeline",
-    " inference",
-    " streams",
-    " hidden",
-    " state",
-    " tensors",
-    " across",
-    " peer",
-    " nodes",
-    " with",
-    " binary",
-    " struct",
-    " serialization",
-    " and",
-    " adaptive",
-    " compression.",
-)
 
 
 @dataclass
@@ -134,6 +110,20 @@ def select_llama_chat_handler(model_id: str, mmproj_path: str) -> Any | None:
     return None
 
 
+def messages_contain_image(messages: list[dict[str, Any]] | None) -> bool:
+    """Return True if any OpenAI chat message contains an `image_url` content block."""
+    if not messages:
+        return False
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and str(block.get("type") or "").strip().lower() == "image_url":
+                return True
+    return False
+
+
 class ShardModelRunner:
     """Executes forward passes across the transformer layers assigned to this node."""
 
@@ -171,6 +161,7 @@ class ShardModelRunner:
         # not fit in `max_ram_mb` are paged on demand from disk instead of triggering OOM.
         self.use_mmap: bool = use_mmap
         self._native_handle: Any | None = native_handle
+        self._has_vision_chat_handler: bool = False
         self._native_lock: threading.Lock = threading.Lock()
         self._stop_events_lock: threading.Lock = threading.Lock()
         self._active_stop_events: set[threading.Event] = set()
@@ -212,6 +203,13 @@ class ShardModelRunner:
     def has_native_llama(self) -> bool:
         """Return True when llama_cpp.Llama native engine is loaded."""
         return self._native_handle is not None
+
+    @property
+    def has_vision_support(self) -> bool:
+        """Return True when a multimodal vision chat handler is active (or mocked without model_path)."""
+        if self._native_handle is not None and self.model_path is None:
+            return True
+        return self._has_vision_chat_handler
 
     @property
     def is_head_node(self) -> bool:
@@ -283,8 +281,9 @@ class ShardModelRunner:
         """Load ONLY the assigned transformer layers from `.safetensors` using a meta skeleton."""
         safetensor_files = _resolve_safetensors_files(model_dir)
         if not safetensor_files:
-            logger.info("No .safetensors files in %s; keeping simulation mode.", model_dir)
-            return
+            raise RuntimeError(
+                f"No .safetensors weight files found in '{model_dir}'. Please reload the model."
+            )
 
         config_path = model_dir / "config.json"
         if config_path.is_file():
@@ -441,13 +440,16 @@ class ShardModelRunner:
                 else ("HEAD" if self.is_head_node else ("TAIL" if self.is_tail_node else "MIDDLE")),
             )
         except Exception as exc:
-            logger.info(
-                "Using lightweight float32 shard runner for %s (layers %d..%d): %s",
+            logger.error(
+                "Failed to load PyTorch model shard for %s (layers %d..%d): %s",
                 model_dir,
                 self.shard_layer_start,
                 self.shard_layer_end,
                 exc,
             )
+            raise RuntimeError(
+                f"Failed to load PyTorch model shard from '{model_dir}': {exc}. Please reload the model."
+            ) from exc
 
     def _init_llama_cpp(self, gguf_path: str, n_layers: int) -> None:
         """Initialize `llama_cpp.Llama` when an explicit real `.gguf` file is provided."""
@@ -475,6 +477,7 @@ class ShardModelRunner:
                 if chat_handler is not None:
                     llama_kwargs["chat_handler"] = chat_handler
 
+            self._has_vision_chat_handler = "chat_handler" in llama_kwargs
             self._native_handle = Llama(**llama_kwargs)
             logger.info(
                 "Initialized llama_cpp with %s (n_layers=%d, use_mmap=%s, vision=%s)",
@@ -484,12 +487,15 @@ class ShardModelRunner:
                 "chat_handler" in llama_kwargs,
             )
         except Exception as exc:
-            logger.info(
-                "Using lightweight float32 shard runner for %s (n_layers=%d): %s",
+            logger.error(
+                "Failed to initialize llama_cpp for %s (n_layers=%d): %s",
                 gguf_path,
                 n_layers,
                 exc,
             )
+            raise RuntimeError(
+                f"Failed to load GGUF model '{Path(gguf_path).name}' via llama_cpp: {exc}. Please reload the model."
+            ) from exc
 
     def _is_native_cancelled(
         self,
@@ -529,12 +535,24 @@ class ShardModelRunner:
 
                 use_chat: bool = bool(messages)
                 if use_chat:
-                    stream = native_handle.create_chat_completion(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=True,
-                    )
+                    if messages_contain_image(messages) and not self.has_vision_support:
+                        raise ValueError(
+                            f"Model '{self.model_id}' does not support image or vision attachments "
+                            "(no vision projector loaded). Please switch to a Vision/Multimodal "
+                            "model or remove the image attachment."
+                        )
+                    try:
+                        stream = native_handle.create_chat_completion(
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            stream=True,
+                        )
+                    except TypeError as exc:
+                        raise ValueError(
+                            f"Model '{self.model_id}' does not support this attachment format "
+                            f"(model error: {exc}). Please switch to a Vision/Multimodal model or send text only."
+                        ) from exc
                 else:
                     stream = native_handle.create_completion(
                         prompt=prompt,
@@ -885,16 +903,9 @@ class ShardModelRunner:
 
                 return token_id, token_text, is_eos
 
-        if len(hidden_state_bytes) < 4:
-            return 2, "", True
-
-        first_float: float = struct.unpack_from("<f", hidden_state_bytes, 0)[0]
-        vocab_idx: int = (step_index + int(abs(first_float) * 10)) % len(_SYNTHETIC_VOCAB)
-        ordered_idx: int = step_index % len(_SYNTHETIC_VOCAB)
-        token_text = _SYNTHETIC_VOCAB[ordered_idx]
-        token_id = 1000 + vocab_idx
-        is_eos = (step_index + 1) >= max_tokens or (step_index + 1) >= len(_SYNTHETIC_VOCAB)
-        return token_id, token_text, is_eos
+        raise RuntimeError(
+            "Model weights are not loaded for inference. Please reload the model and try again."
+        )
 
     def release(self) -> None:
         """Explicitly release any native model handles and KV-caches to prevent RAM leaks."""

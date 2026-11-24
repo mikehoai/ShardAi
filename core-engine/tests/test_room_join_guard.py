@@ -21,6 +21,7 @@ from shard_engine.tracker_client import (
     SignalingTrackerClient,
     extract_tracker_error_detail,
 )
+from tests._mock_runner import patch_start_node_runner
 
 client = TestClient(app)
 
@@ -313,6 +314,7 @@ def test_start_node_preserves_offline_solo_fallback_on_tracker_timeout(
         "ensure_model_downloaded",
         AsyncMock(return_value=fake_model),
     )
+    patch_start_node_runner(monkeypatch)
 
     res = client.post(
         "/start-node",

@@ -2,6 +2,8 @@ import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import mammoth from "mammoth";
+import * as pdfjsLib from "pdfjs-dist";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   Dashboard,
@@ -27,6 +29,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
+}));
+
+vi.mock("pdfjs-dist", () => ({
+  GlobalWorkerOptions: { workerSrc: "" },
+  getDocument: vi.fn(),
 }));
 
 describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
@@ -3770,15 +3777,15 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     );
 
     const textarea = screen.getByTestId("chat-input");
-    const closeBtn = screen.getByTestId("chat-close-btn");
+    const attachBtn = screen.getByTestId("chat-attach-btn");
     expect(document.activeElement).toBe(textarea);
 
     const initialAddCount = countKeydownCalls(addSpy);
     const initialRemoveCount = countKeydownCalls(removeSpy);
 
-    // User moves focus to the Close button
-    closeBtn.focus();
-    expect(document.activeElement).toBe(closeBtn);
+    // User moves focus to the Attach button
+    attachBtn.focus();
+    expect(document.activeElement).toBe(attachBtn);
 
     // Parent re-renders with new inline onClose callbacks and updated coveragePercent
     rerender(
@@ -3792,7 +3799,7 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
         onClose={secondOnClose}
       />
     );
-    expect(document.activeElement).toBe(closeBtn);
+    expect(document.activeElement).toBe(attachBtn);
 
     rerender(
       <ChatWindow
@@ -3805,7 +3812,7 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
         onClose={thirdOnClose}
       />
     );
-    expect(document.activeElement).toBe(closeBtn);
+    expect(document.activeElement).toBe(attachBtn);
 
     // Keydown listener was never torn down or re-attached across re-renders
     expect(countKeydownCalls(addSpy)).toBe(initialAddCount);
@@ -3899,10 +3906,10 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     expect(screen.getByTestId("ai-chat-window")).toBeTruthy();
     expect(document.activeElement).toBe(screen.getByTestId("chat-input"));
 
-    // User moves focus to the Close button
-    const closeBtn = screen.getByTestId("chat-close-btn");
-    closeBtn.focus();
-    expect(document.activeElement).toBe(closeBtn);
+    // User moves focus to the Attach button
+    const attachBtn = screen.getByTestId("chat-attach-btn");
+    attachBtn.focus();
+    expect(document.activeElement).toBe(attachBtn);
 
     const pollsBeforeTicks = statusPollCount;
 
@@ -3918,8 +3925,8 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       expect(statusPollCount).toBeGreaterThanOrEqual(pollsBeforeTicks + 2);
     });
 
-    // Focus must remain on Close button and never be stolen back to textarea
-    expect(document.activeElement).toBe(closeBtn);
+    // Focus must remain on Attach button and never be stolen back to textarea
+    expect(document.activeElement).toBe(attachBtn);
     expect(document.activeElement).not.toBe(screen.getByTestId("chat-input"));
 
     // Escape closes the modal cleanly via memoized handleCloseChat
@@ -4015,5 +4022,727 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       expect(selectEl.options[2].value).toBe("wan-2.1");
       expect(selectEl.options[3].value).toBe("qwen-vl");
     });
+  });
+
+  it("configures data-tauri-drag-region='deep' without duplicate mousedown/doubleClick invoke handlers", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const mockedInvoke = vi.mocked(invoke);
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_available_ram_gb") return 12;
+      if (cmd === "window_is_maximized") return true;
+      return "";
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+
+    const { container } = render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("core-engine-loading-overlay")).toBeNull();
+    });
+
+    const header = container.querySelector("header.native-titlebar") as HTMLElement | null;
+    expect(header).toBeTruthy();
+    expect(header?.getAttribute("data-tauri-drag-region")).toBe("deep");
+
+    const toggleBtn = screen.getByTestId("sidebar-toggle-btn");
+    expect(toggleBtn.getAttribute("data-tauri-drag-region")).toBe("false");
+
+    const titlebarRight = container.querySelector(".native-titlebar-right");
+    expect(titlebarRight?.getAttribute("data-tauri-drag-region")).toBe("false");
+
+    const logo = screen.getByTestId("shardai-logo") as HTMLImageElement;
+    expect(logo.getAttribute("draggable")).toBe("false");
+
+    mockedInvoke.mockClear();
+    fireEvent.mouseDown(header as HTMLElement, { button: 0 });
+    fireEvent.doubleClick(header as HTMLElement);
+
+    expect(mockedInvoke).not.toHaveBeenCalledWith("window_start_drag", undefined);
+    expect(mockedInvoke).not.toHaveBeenCalledWith("window_toggle_maximize", undefined);
+
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized", undefined);
+    });
+  });
+
+  it("blocks UI with Core Engine loading overlay in Tauri mode until ready and supports retry on startup failure", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const mockedInvoke = vi.mocked(invoke);
+
+    let engineHealthy = false;
+    let resolveStartCore: ((val: string) => void) | null = null;
+
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_available_ram_gb") return 12;
+      if (cmd === "start_python_core") {
+        return await new Promise<string>((resolve) => {
+          resolveStartCore = resolve;
+        });
+      }
+      return "";
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/health")) {
+        if (!engineHealthy) {
+          throw new TypeError("Failed to fetch");
+        }
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(JSON.stringify({ source: "default", count: 0, models: [] }), {
+          status: 200,
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    const firstRender = render(<Dashboard />);
+
+    // While /health fails and start_python_core is pending, overlay blocks interaction
+    await waitFor(() => {
+      const overlay = screen.getByTestId("core-engine-loading-overlay");
+      expect(overlay.getAttribute("data-boot-state")).toBe("loading");
+      expect(overlay.getAttribute("aria-busy")).toBe("true");
+    });
+
+    const toggleBtn = screen.getByTestId("sidebar-toggle-btn") as HTMLButtonElement;
+    const sidebar = screen.getByTestId("native-sidebar");
+    const workspaceBody = firstRender.container.querySelector(
+      ".native-body-content"
+    ) as HTMLDivElement & { inert?: boolean };
+
+    expect(toggleBtn.disabled).toBe(true);
+    expect(workspaceBody.classList.contains("is-blocked")).toBe(true);
+    expect(workspaceBody.inert).toBe(true);
+    expect(screen.getByTestId("status-message").textContent).toBe("Starting Core Engine...");
+
+    // Ctrl+B must not toggle sidebar while Core Engine is booting
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("true");
+    expect(sidebar.hidden).toBe(false);
+
+    // Complete Core Engine startup and allow /health to succeed
+    engineHealthy = true;
+    await act(async () => {
+      resolveStartCore?.("Python core is ready on http://127.0.0.1:8000.");
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("core-engine-loading-overlay")).toBeNull();
+    });
+
+    expect(toggleBtn.disabled).toBe(false);
+    expect(workspaceBody.classList.contains("is-blocked")).toBe(false);
+    expect(workspaceBody.inert).toBe(false);
+
+    // Ctrl+B works once Core Engine is ready
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+    expect(sidebar.hidden).toBe(true);
+
+    firstRender.unmount();
+
+    // Verify failure state & Retry Startup recovery
+    engineHealthy = false;
+    let bootAttempt = 0;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_available_ram_gb") return 12;
+      if (cmd === "start_python_core") {
+        bootAttempt += 1;
+        if (bootAttempt === 1) {
+          throw new Error("Sidecar process exited prematurely.");
+        }
+        engineHealthy = true;
+        return "Python core is ready on http://127.0.0.1:8000.";
+      }
+      return "";
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      const overlay = screen.getByTestId("core-engine-loading-overlay");
+      expect(overlay.getAttribute("data-boot-state")).toBe("error");
+      expect(screen.getByTestId("retry-engine-boot-btn")).toBeTruthy();
+      expect(overlay.textContent).toContain("Sidecar process exited prematurely.");
+    });
+    expect(screen.getByTestId("status-message").textContent).toBe("Core Engine failed to start");
+
+    fireEvent.click(screen.getByTestId("retry-engine-boot-btn"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("core-engine-loading-overlay")).toBeNull();
+    });
+    expect(bootAttempt).toBe(2);
+  });
+
+  it("renders '👁️ Vision / Video' badge for vision models in ModelSelector and Room Lobby and forwards mmproj_filename", async () => {
+    const visionCatalog: CatalogModelItem[] = [
+      {
+        id: "llama-text",
+        name: "Llama 3.1 8B",
+        repo_id: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        estimated_ram_gb: 5.1,
+        enabled: true,
+        modality: "text",
+      },
+      {
+        id: "qwen2.5-vl-7b",
+        name: "Qwen2.5-VL 7B",
+        repo_id: "Qwen/Qwen2.5-VL-7B-Instruct-GGUF",
+        filename: "qwen2.5-vl-7b-instruct-q4_k_m.gguf",
+        mmproj_filename: "mmproj-qwen2.5-vl-7b-f16.gguf",
+        estimated_ram_gb: 7.5,
+        enabled: true,
+        modality: "vision",
+      },
+    ];
+
+    const visionRooms: RoomLobbyItem[] = [
+      {
+        room_id: "text-room",
+        model: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        modality: "text",
+        nodes_online: 2,
+        total_shared_ram_gb: 10,
+        is_private: false,
+        network_scope: "internet",
+      },
+      {
+        room_id: "vision-room",
+        model: "Qwen/Qwen2.5-VL-7B-Instruct-GGUF",
+        modality: "vision",
+        nodes_online: 2,
+        total_shared_ram_gb: 12,
+        is_private: false,
+        network_scope: "internet",
+      },
+    ];
+
+    const seenUrls: string[] = [];
+    const capturedStartPayloads: StartNodeRequest[] = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      seenUrls.push(url);
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: visionCatalog.length,
+            models: visionCatalog,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify(visionRooms), { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "public", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/download-stream")) {
+        const sse = `data: ${JSON.stringify({
+          model_id: "Qwen/Qwen2.5-VL-7B-Instruct-GGUF",
+          status: "completed",
+          progress: 100,
+          downloaded_bytes: 100,
+          total_bytes: 100,
+          local_path: "/models/qwen2.5-vl-7b-instruct-q4_k_m.gguf",
+          message: "Done",
+        })}\n\ndata: [DONE]\n\n`;
+        return new Response(encoder.encode(sse), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.includes("/start-node")) {
+        const parsedStart = JSON.parse(String(init?.body ?? "{}")) as StartNodeRequest;
+        capturedStartPayloads.push(parsedStart);
+        return new Response(
+          JSON.stringify({
+            state: "RUNNING",
+            node_id: "vision-node-01",
+            model_id: parsedStart.model_id,
+            room_id: parsedStart.room_id,
+            backend: "llama_cpp",
+            n_layers: 16,
+            total_layers: 32,
+            allocated_ram_mb: 4096,
+            allocated_vram_mb: 0,
+            p2p_listen_port: 49152,
+            connected_peers_count: 1,
+            peers: [],
+            session_token: "sk-shard-vision-ui",
+            api_base_url: "http://127.0.0.1:8000/v1",
+            coverage_percent: 100,
+            is_swarm_ready: true,
+            message: "Active",
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("room-model-vision-room")).toBeTruthy();
+    });
+
+    // Room Lobby shows Vision / Video badge only on vision room
+    expect(screen.getByTestId("room-vision-badge-vision-room").textContent).toBe(
+      "👁️ Vision / Video"
+    );
+    expect(screen.queryByTestId("room-vision-badge-text-room")).toBeNull();
+
+    // Text catalog item is initially selected -> no vision badge yet, but option text labels vision option
+    const selectEl = screen.getByTestId("catalog-model-select") as HTMLSelectElement;
+    expect(selectEl.options[0].textContent).not.toContain("👁️ Vision / Video");
+    expect(selectEl.options[1].textContent).toContain("👁️ Vision / Video");
+    expect(screen.queryByTestId("vision-modality-badge")).toBeNull();
+
+    // Selecting the Vision catalog model displays the badge and forwards mmproj_filename
+    fireEvent.change(selectEl, { target: { value: "qwen2.5-vl-7b" } });
+    expect(screen.getByTestId("vision-modality-badge").textContent).toBe("👁️ Vision / Video");
+
+    fireEvent.click(screen.getByTestId("toggle-sharing-btn"));
+
+    await waitFor(() => {
+      expect(capturedStartPayloads.length).toBe(1);
+    });
+    expect(capturedStartPayloads[0]?.mmproj_filename).toBe("mmproj-qwen2.5-vl-7b-f16.gguf");
+    expect(
+      seenUrls.some(
+        (u) =>
+          u.includes("/models/download-stream") &&
+          u.includes("mmproj_filename=mmproj-qwen2.5-vl-7b-f16.gguf")
+      )
+    ).toBe(true);
+  });
+
+  it("supports ChatWindow full-window default layout and Maximize/Restore toggle with Tauri window sync", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const mockedInvoke = vi.mocked(invoke);
+    mockedInvoke.mockResolvedValue(true);
+
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-max-test"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={onClose}
+      />
+    );
+
+    const backdrop = screen.getByTestId("ai-chat-backdrop");
+    const dialog = screen.getByTestId("ai-chat-window");
+    const header = dialog.querySelector(".chat-modal-header") as HTMLElement;
+
+    expect(screen.queryByTestId("chat-maximize-btn")).toBeNull();
+    expect(screen.queryByTestId("chat-close-btn")).toBeNull();
+    expect(dialog.getAttribute("data-maximized")).toBe("false");
+    expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(false);
+    expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(false);
+
+    // Double-click header -> marks dialog & backdrop maximized and calls Tauri window_set_maximized(true)
+    fireEvent.doubleClick(header);
+    expect(dialog.getAttribute("data-maximized")).toBe("true");
+    expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(true);
+    expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(true);
+    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: true });
+
+    // Double-click header again -> restores default size and calls window_set_maximized(false)
+    fireEvent.doubleClick(header);
+    expect(dialog.getAttribute("data-maximized")).toBe("false");
+    expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(false);
+    expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(false);
+    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+
+    // Double-click header to maximize again, then closing ChatWindow restores unmaximized OS state
+    fireEvent.doubleClick(header);
+    expect(dialog.getAttribute("data-maximized")).toBe("true");
+
+    mockedInvoke.mockClear();
+    rerender(
+      <ChatWindow
+        isOpen={false}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-max-test"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={onClose}
+      />
+    );
+    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+  });
+
+  it("supports drag-and-drop of document, image, and video files in ChatWindow when ready and sends multimodal payload", async () => {
+    const sentRequests: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/chat/completions")) {
+        sentRequests.push(
+          JSON.parse(String(init?.body ?? "{}")) as {
+            messages: Array<{ role: string; content: unknown }>;
+          }
+        );
+        const sse = `data: ${JSON.stringify({
+          choices: [{ delta: { content: "Analyzed attachments." } }],
+        })}\n\ndata: [DONE]\n\n`;
+        return new Response(encoder.encode(sse), {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    const docFile = new File(["Document summary text"], "notes.txt", { type: "text/plain" });
+    const imgFile = new File([new Uint8Array([137, 80, 78, 71])], "frame.png", {
+      type: "image/png",
+    });
+    const vidFile = new File([new Uint8Array([0, 0, 0, 24])], "demo.mp4", {
+      type: "video/mp4",
+    });
+
+    // 1. When not ready, drag & drop is blocked/ignored
+    const { rerender } = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={false}
+        coveragePercent={50}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-dnd-test"
+        modelId="Qwen/Qwen2.5-VL-7B-Instruct-GGUF"
+        onClose={vi.fn()}
+      />
+    );
+
+    const standbyDialog = screen.getByTestId("ai-chat-window");
+    expect((screen.getByTestId("chat-attach-btn") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.dragEnter(standbyDialog, { dataTransfer: { files: [imgFile] } });
+    expect(screen.queryByTestId("chat-drop-overlay")).toBeNull();
+    fireEvent.drop(standbyDialog, { dataTransfer: { files: [imgFile] } });
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+
+    // 2. When ready, dragEnter shows drop overlay and drop attaches doc, image, and video
+    rerender(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-dnd-test"
+        modelId="Qwen/Qwen2.5-VL-7B-Instruct-GGUF"
+        onClose={vi.fn()}
+      />
+    );
+
+    const readyDialog = screen.getByTestId("ai-chat-window");
+    expect((screen.getByTestId("chat-attach-btn") as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.dragEnter(readyDialog, { dataTransfer: { files: [docFile, imgFile, vidFile] } });
+    expect(screen.getByTestId("chat-drop-overlay")).toBeTruthy();
+
+    fireEvent.drop(readyDialog, { dataTransfer: { files: [docFile, imgFile, vidFile] } });
+    expect(screen.queryByTestId("chat-drop-overlay")).toBeNull();
+
+    await waitFor(() => {
+      const bar = screen.getByTestId("chat-attachments-bar");
+      expect(bar.textContent).toContain("notes.txt");
+      expect(bar.textContent).toContain("frame.png");
+      expect(bar.textContent).toContain("demo.mp4");
+    });
+
+    // Remove the document attachment and keep image + video
+    fireEvent.click(screen.getByTestId("chat-remove-attachment-0"));
+    expect(screen.getByTestId("chat-attachments-bar").textContent).not.toContain("notes.txt");
+
+    // Re-attach document via file input to cover all three types in payload
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [docFile] },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-attachments-bar").textContent).toContain("notes.txt");
+    });
+
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Review these files" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(sentRequests.length).toBe(1);
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Analyzed attachments."
+      );
+    });
+
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+    expect(screen.getByTestId("chat-message-attachments")).toBeTruthy();
+
+    const sentContent = sentRequests[0].messages[0].content as Array<{
+      type: string;
+      text?: string;
+      image_url?: { url: string };
+    }>;
+    expect(Array.isArray(sentContent)).toBe(true);
+    expect(sentContent[0].type).toBe("text");
+    expect(sentContent[0].text).toContain("Review these files");
+    expect(sentContent[0].text).toContain("[Attached document: notes.txt]");
+    expect(sentContent[0].text).toContain("Document summary text");
+    expect(sentContent[0].text).toContain("[Attached video: demo.mp4");
+    expect(sentContent[1].type).toBe("image_url");
+    expect(sentContent[1].image_url?.url.startsWith("data:image/png;base64,")).toBe(true);
+  });
+
+  it("drops rejected image message from ChatWindow history so subsequent text or document prompts succeed", async () => {
+    const sentRequests: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/chat/completions")) {
+        const parsed = JSON.parse(String(init?.body ?? "{}")) as {
+          messages: Array<{ role: string; content: unknown }>;
+        };
+        sentRequests.push(parsed);
+        if (sentRequests.length === 1) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message:
+                  "Model 'Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF' does not support image or vision attachments.",
+                code: "model_vision_not_supported",
+              },
+            }),
+            { status: 400, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response(
+          new ReadableStream({
+            start(ctrl) {
+              ctrl.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ choices: [{ delta: { content: "Text reply ok" } }] })}\n\n`
+                )
+              );
+              ctrl.enqueue(encoder.encode("data: [DONE]\n\n"));
+              ctrl.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    const imgFile = new File([new Uint8Array([137, 80, 78, 71])], "photo.png", {
+      type: "image/png",
+    });
+
+    render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-vision-err-test"
+        modelId="Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"
+        onClose={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [imgFile] },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-attachments-bar").textContent).toContain("photo.png");
+    });
+
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Read this image" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-error-banner").textContent).toContain(
+        "does not support image or vision attachments"
+      );
+    });
+    expect(screen.queryByTestId("chat-message-user")).toBeNull();
+
+    // Subsequent text/document prompt should NOT re-send the failed image message
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Hello in plain text" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(sentRequests.length).toBe(2);
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Text reply ok"
+      );
+    });
+    expect(sentRequests[1].messages).toEqual([
+      { role: "user", content: "Hello in plain text" },
+    ]);
+  });
+
+  it("extracts text from .docx and .pdf documents and shows explicit errors for .doc and scanned PDFs", async () => {
+    const sentRequests: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+    const encoder = new TextEncoder();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/chat/completions")) {
+        const parsed = JSON.parse(String(init?.body ?? "{}")) as {
+          messages: Array<{ role: string; content: unknown }>;
+        };
+        sentRequests.push(parsed);
+        return new Response(
+          new ReadableStream({
+            start(ctrl) {
+              ctrl.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ choices: [{ delta: { content: "Read document ok" } }] })}\n\n`
+                )
+              );
+              ctrl.enqueue(encoder.encode("data: [DONE]\n\n"));
+              ctrl.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    vi.spyOn(mammoth, "extractRawText").mockResolvedValue({
+      value: "Quarterly roadmap from DOCX",
+      messages: [],
+    });
+
+    const mockedGetDocument = vi.mocked(pdfjsLib.getDocument);
+    mockedGetDocument.mockReturnValueOnce({
+      promise: Promise.resolve({
+        numPages: 1,
+        getPage: async () => ({
+          getTextContent: async () => ({ items: [] }),
+        }),
+        cleanup: async () => {},
+      }),
+      destroy: async () => {},
+    } as unknown as ReturnType<typeof pdfjsLib.getDocument>);
+
+    render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-doc-extract-test"
+        modelId="Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF"
+        onClose={vi.fn()}
+      />
+    );
+
+    // 1. Legacy .doc file shows explicit error and is NOT attached
+    const legacyDoc = new File(["binary doc"], "legacy.doc", {
+      type: "application/msword",
+    });
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [legacyDoc] },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-error-banner").textContent).toContain(
+        "Cannot read legacy binary .doc file"
+      );
+    });
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+
+    // 2. Scanned/image-only .pdf shows explicit error and is NOT attached
+    const scannedPdf = new File(["%PDF-1.4"], "scanned.pdf", {
+      type: "application/pdf",
+    });
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [scannedPdf] },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-error-banner").textContent).toContain(
+        "No readable text could be extracted"
+      );
+    });
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+
+    // 3. Valid .docx extracts text and sends content to model
+    const docxFile = new File(["PK\x03\x04"], "report.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [docxFile] },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-attachments-bar").textContent).toContain("report.docx");
+    });
+
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Summarize report" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(sentRequests.length).toBe(1);
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Read document ok"
+      );
+    });
+    const sentContent = String(sentRequests[0].messages[0].content);
+    expect(sentContent).toContain("[Attached document: report.docx]");
+    expect(sentContent).toContain("Quarterly roadmap from DOCX");
   });
 });

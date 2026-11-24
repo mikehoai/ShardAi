@@ -478,8 +478,12 @@ def test_pyproject_scripts_and_install_scripts_exist() -> None:
     assert install_ps1.is_file()
     assert install_sh.is_file()
 
-    # build scripts reference shardai executable
+    # build scripts reference shardai executable and bundle llama_cpp
     build_ps1 = (repo_root / "scripts" / "build_core.ps1").read_text(encoding="utf-8")
     build_sh = (repo_root / "scripts" / "build_core.sh").read_text(encoding="utf-8")
     assert "shardai" in build_ps1
     assert "shardai" in build_sh
+    assert "--collect-all" in build_ps1
+    assert "llama_cpp" in build_ps1
+    assert "--collect-all" in build_sh
+    assert "llama_cpp" in build_sh

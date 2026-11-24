@@ -11,4 +11,5 @@ safetensors>=0.4.5
 accelerate>=0.34.0
 lz4>=4.3.3
 zeroconf>=0.132.0
+llama-cpp-python>=0.3.0
 pyinstaller>=6.10.0

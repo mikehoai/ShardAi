@@ -32,6 +32,7 @@ from shard_engine.schemas import (
     StartNodeRequest,
 )
 from shard_engine.tracker_client import SignalingTrackerClient, hash_room_key
+from tests._mock_runner import patch_start_node_runner
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +104,7 @@ def _stub_fast_local_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pat
         "stop_advertising",
         AsyncMock(return_value=None),
     )
+    patch_start_node_runner(monkeypatch)
     return fake_model
 
 

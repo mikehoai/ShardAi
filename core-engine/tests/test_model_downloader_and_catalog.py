@@ -34,6 +34,7 @@ from models.downloader import (
 )
 from shard_engine.schemas import CatalogModelItem, CatalogModelTask, NodeState
 from shard_engine.tracker_client import SignalingTrackerClient
+from tests._mock_runner import patch_start_node_runner
 
 client = TestClient(app)
 
@@ -171,6 +172,7 @@ def test_start_node_step1_resolves_cached_catalog_gguf_fingerprint_and_header_la
     """`POST /start-node` Step 1 locates cached catalog GGUF with `filename=None` for fingerprint and layer count."""
     monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
     monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+    patch_start_node_runner(monkeypatch)
 
     downloader = _make_downloader(tmp_path)
     gguf_path = downloader.models_dir / "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf"
@@ -621,6 +623,7 @@ async def test_start_node_fingerprint_computation_does_not_block_event_loop(
     """Step 1 and Step 4 fingerprint disk reads run off the event loop without stalling `/health` or `/status`."""
     monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
     monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+    patch_start_node_runner(monkeypatch)
 
     downloader = _make_downloader(tmp_path)
     gguf_path = downloader.models_dir / "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf"
@@ -794,6 +797,7 @@ async def test_start_node_fingerprint_step1_error_fallback_and_step4_error_clean
     """Step 1 worker failure falls back to `initial_fingerprint=None`; Step 4 failure releases resources."""
     monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
     monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+    patch_start_node_runner(monkeypatch)
 
     downloader = _make_downloader(tmp_path)
     gguf_path = downloader.models_dir / "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf"

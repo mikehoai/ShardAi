@@ -19,6 +19,7 @@ from models.downloader import GGUF_MAGIC, ModelDownloader
 from models.shard_runner import ShardModelRunner
 from p2p.serializer import deserialize_activation_tensor, serialize_activation_tensor
 from shard_engine.schemas import NodeState, PeerNodeInfo, PeerRole
+from tests._mock_runner import make_mock_runner
 
 client = TestClient(app)
 
@@ -250,7 +251,7 @@ async def test_p2p_activation_rejects_unauthorized_origin_before_outgoing_tcp(
     tail.shard_layer_start = 16
     tail.shard_layer_end = 31
     tail.total_layers = 32
-    tail.model_runner = ShardModelRunner(
+    tail.model_runner = make_mock_runner(
         shard_layer_start=16,
         shard_layer_end=31,
         total_layers=32,

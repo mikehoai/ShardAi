@@ -18,6 +18,7 @@ from main import LocalNodeRuntime, app, runtime, start_node
 from models.shard_runner import ShardModelRunner
 from shard_engine.schemas import NetworkMode, NetworkStatus, NodeState, StartNodeRequest
 from shard_engine.tracker_client import SignalingTrackerClient
+from tests._mock_runner import patch_start_node_runner
 
 client = TestClient(app)
 
@@ -149,6 +150,7 @@ async def test_online_node_falls_back_to_offline_solo_and_lan_only_on_outage_and
         return list(lan_beacons_to_return)
 
     monkeypatch.setattr(main_module, "_scan_all_lan_beacons", _fake_scan_lan)
+    patch_start_node_runner(monkeypatch)
     runtime.tracker_client = _make_mock_tracker(_handler)
 
     start_resp = await start_node(
@@ -335,3 +337,113 @@ async def test_native_llama_stream_abort_cancels_worker_and_releases_compute_loc
     second_item = await asyncio.wait_for(anext(follow_up_gen), timeout=2.0)
     assert second_item[3].startswith("tok-")
     await follow_up_gen.aclose()
+
+
+def test_corrupt_gguf_raises_reload_model_error(tmp_path: Path) -> None:
+    """Loading a corrupt >1 MB .gguf must raise RuntimeError instead of falling back."""
+    corrupt_gguf = tmp_path / "corrupt-model.gguf"
+    corrupt_gguf.write_bytes(b"GGUF" + b"\x00" * 1_100_000)
+
+    with pytest.raises(RuntimeError, match="reload the model"):
+        ShardModelRunner(
+            model_id="test/corrupt-gguf",
+            model_path=str(corrupt_gguf),
+            shard_layer_start=0,
+            shard_layer_end=15,
+            total_layers=16,
+            n_layers=16,
+        )
+
+
+def test_decode_without_loaded_weights_raises_reload_model_error() -> None:
+    """decode_final_layer_to_token must never emit synthetic fallback tokens."""
+    runner = ShardModelRunner(
+        shard_layer_start=0,
+        shard_layer_end=15,
+        total_layers=16,
+    )
+    assert runner.is_real_model is False
+
+    with pytest.raises(RuntimeError, match="reload the model"):
+        runner.decode_final_layer_to_token(b"\x00" * 16, step_index=0, max_tokens=4)
+
+
+def test_inference_endpoints_return_503_when_model_not_loaded() -> None:
+    """/v1/chat/completions and /generate must return HTTP 503 asking to reload the model."""
+    token = "sk-shard-unloaded-model-token"
+    runtime.state = NodeState.RUNNING
+    runtime.node_id = "unloaded-node"
+    runtime.model_id = "test/unloaded-model"
+    runtime.room_id = "public"
+    runtime.session_token = token
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 31
+    runtime.total_layers = 32
+    runtime.n_layers = 32
+    runtime.is_swarm_ready = True
+    runtime.coverage_percent = 100.0
+    runtime.peers = []
+    runtime.model_runner = ShardModelRunner(
+        model_id="test/unloaded-model",
+        shard_layer_start=0,
+        shard_layer_end=31,
+        total_layers=32,
+        n_layers=32,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    chat_res = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={
+            "model": "test/unloaded-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        },
+    )
+    assert chat_res.status_code == 503
+    assert "reload the model" in chat_res.json()["detail"].lower()
+
+    gen_res = client.post(
+        "/generate",
+        headers=headers,
+        json={"prompt": "Hello", "max_tokens": 4},
+    )
+    assert gen_res.status_code == 503
+    assert "reload the model" in gen_res.json()["detail"].lower()
+
+
+def test_start_node_corrupt_gguf_returns_500_and_sets_error_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """/start-node must return HTTP 500 with reload-model prompt and transition to ERROR on load failure."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "true")
+    corrupt_gguf = tmp_path / "broken-weights.gguf"
+    corrupt_gguf.write_bytes(b"GGUF" + b"\x00" * 1_100_000)
+
+    monkeypatch.setattr(
+        runtime.model_downloader,
+        "ensure_model_downloaded",
+        AsyncMock(return_value=corrupt_gguf),
+    )
+
+    res = client.post(
+        "/start-node",
+        json={
+            "node_id": "corrupt-start-node",
+            "model_id": "test/corrupt-gguf",
+            "network_mode": "lan",
+            "room_id": "public",
+            "ram_gb": 4,
+            "shared_ram_gb": 4,
+            "max_ram_mb": 4096,
+            "p2p_listen_port": 49599,
+            "shard_layer_start": 0,
+            "shard_layer_end": 15,
+            "total_layers": 16,
+        },
+    )
+    assert res.status_code == 500
+    assert "reload the model" in res.json()["detail"].lower()
+    assert runtime.state == NodeState.ERROR

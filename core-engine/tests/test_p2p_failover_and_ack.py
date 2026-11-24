@@ -20,6 +20,7 @@ import pytest
 import main as main_module
 from main import LocalNodeRuntime
 from models.shard_runner import ShardModelRunner
+from tests._mock_runner import make_mock_runner
 from p2p.serializer import (
     MAGIC_HEADER,
     ActivationFrame,
@@ -291,7 +292,7 @@ async def test_head_node_fails_over_immediately_on_middle_node_forwarding_failur
     broken_middle.shard_layer_start = 16
     broken_middle.shard_layer_end = 23
     broken_middle.total_layers = 32
-    broken_middle.model_runner = ShardModelRunner(
+    broken_middle.model_runner = make_mock_runner(
         shard_layer_start=16, shard_layer_end=23, total_layers=32
     )
     broken_middle.peers = [
@@ -312,7 +313,7 @@ async def test_head_node_fails_over_immediately_on_middle_node_forwarding_failur
     backup_tail.shard_layer_start = 16
     backup_tail.shard_layer_end = 31
     backup_tail.total_layers = 32
-    backup_tail.model_runner = ShardModelRunner(
+    backup_tail.model_runner = make_mock_runner(
         shard_layer_start=16, shard_layer_end=31, total_layers=32
     )
     backup_tail_port = await backup_tail.start_p2p_listener(port=0)
@@ -324,7 +325,7 @@ async def test_head_node_fails_over_immediately_on_middle_node_forwarding_failur
     head_node.shard_layer_end = 15
     head_node.total_layers = 32
     head_node.failover_token_timeout_seconds = 5.0
-    head_node.model_runner = ShardModelRunner(
+    head_node.model_runner = make_mock_runner(
         shard_layer_start=0, shard_layer_end=15, total_layers=32
     )
     head_node.peers = [
@@ -393,7 +394,7 @@ async def test_late_token_from_timed_out_primary_does_not_desynchronize_after_ba
     head_node.shard_layer_end = 15
     head_node.total_layers = 32
     head_node.failover_token_timeout_seconds = 0.20
-    head_node.model_runner = ShardModelRunner(
+    head_node.model_runner = make_mock_runner(
         shard_layer_start=0, shard_layer_end=15, total_layers=32
     )
     head_port = await head_node.start_p2p_listener(port=0)
@@ -691,7 +692,7 @@ async def test_pipeline_failover_evicts_dead_primary_and_promotes_backup_without
     head_node.shard_layer_end = 15
     head_node.total_layers = 32
     head_node.failover_token_timeout_seconds = 0.25
-    head_node.model_runner = ShardModelRunner(
+    head_node.model_runner = make_mock_runner(
         shard_layer_start=0, shard_layer_end=15, total_layers=32
     )
     await head_node.start_p2p_listener(port=0)
@@ -1051,7 +1052,7 @@ async def test_all_candidates_failed_preserves_peers_without_destructive_evictio
     runtime.shard_layer_start = 0
     runtime.shard_layer_end = 15
     runtime.total_layers = 32
-    runtime.model_runner = ShardModelRunner(
+    runtime.model_runner = make_mock_runner(
         shard_layer_start=0, shard_layer_end=15, total_layers=32
     )
 

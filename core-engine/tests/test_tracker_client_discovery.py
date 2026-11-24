@@ -28,6 +28,7 @@ from shard_engine.tracker_client import (
     TrackerUnreachableError,
     hash_room_key,
 )
+from tests._mock_runner import patch_start_node_runner
 
 client = TestClient(app)
 
@@ -661,6 +662,7 @@ def test_start_and_stop_node_end_to_end_private_slash_model_discovery_and_leave(
         "ensure_model_downloaded",
         AsyncMock(return_value=fake_model),
     )
+    patch_start_node_runner(monkeypatch)
 
     start_res = client.post(
         "/start-node",

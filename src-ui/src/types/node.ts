@@ -145,14 +145,32 @@ export interface NodeStatusResponse {
 
 export type ChatRole = "system" | "user" | "assistant";
 
+export type OpenAIChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: "auto" | "low" | "high" } };
+
 export interface OpenAIChatMessagePayload {
   role: ChatRole;
-  content: string;
+  content: string | OpenAIChatContentPart[];
+}
+
+export type ChatAttachmentKind = "image" | "video" | "document";
+
+export interface ChatAttachmentItem {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  kind: ChatAttachmentKind;
+  dataUrl?: string;
+  textContent?: string;
+  previewUrl?: string;
 }
 
 export interface ChatMessageItem {
   id: string;
   role: Exclude<ChatRole, "system">;
   content: string;
+  attachments?: ChatAttachmentItem[];
   createdAt: number;
 }

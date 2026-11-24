@@ -50,7 +50,7 @@ from models.downloader import (
     sanitize_catalog_entries,
     sanitize_catalog_entry,
 )
-from models.shard_runner import ShardModelRunner
+from models.shard_runner import ShardModelRunner, messages_contain_image
 from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
 from p2p.serializer import (
@@ -848,6 +848,14 @@ class LocalNodeRuntime:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Node must be RUNNING before invoking pipeline inference.",
+            )
+        if not self.model_runner.is_real_model:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Model weights are not loaded or failed to initialize. "
+                    "Please reload the model and try again."
+                ),
             )
         if not self.model_runner.is_head_node:
             raise HTTPException(
@@ -2618,18 +2626,34 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             if (final_start == 0 and local_mmproj_path is not None)
             else None
         )
-        runtime.model_runner = await asyncio.to_thread(
-            ShardModelRunner,
-            model_id=request.model_id,
-            model_path=str(local_model_path),
-            mmproj_path=active_mmproj_path,
-            shard_layer_start=final_start,
-            shard_layer_end=final_end,
-            total_layers=final_total_layers,
-            n_layers=final_n_layers,
-            max_ram_mb=request.max_ram_mb,
-            use_mmap=use_mmap,
-        )
+        try:
+            runtime.model_runner = await asyncio.to_thread(
+                ShardModelRunner,
+                model_id=request.model_id,
+                model_path=str(local_model_path),
+                mmproj_path=active_mmproj_path,
+                shard_layer_start=final_start,
+                shard_layer_end=final_end,
+                total_layers=final_total_layers,
+                n_layers=final_n_layers,
+                max_ram_mb=request.max_ram_mb,
+                use_mmap=use_mmap,
+            )
+        except Exception as load_exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to load model '{request.model_id}': {load_exc}",
+            ) from load_exc
+
+        if not is_offline_mode() and not runtime.model_runner.is_real_model:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Model '{request.model_id}' weights failed to load "
+                    "(incomplete or unsupported file). Please reload the model."
+                ),
+            )
+
         effective_backend = (
             ComputeBackend.PYTORCH
             if runtime.model_runner.is_real_model
@@ -2877,6 +2901,27 @@ async def openai_chat_completions(
     created_ts: int = int(time.time())
     served_model: str = request.model or runtime.model_id or "shardai-p2p-model"
 
+    if (
+        messages_contain_image(chat_messages)
+        and runtime.model_runner is not None
+        and not runtime.model_runner.has_vision_support
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": (
+                        f"Model '{served_model}' does not support image or vision attachments "
+                        "(no vision projector loaded). Please switch to a Vision/Multimodal "
+                        "model (e.g. Qwen2.5-VL, Gemma 3 Vision, MiniCPM-V) or remove the image attachment."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "messages",
+                    "code": "model_vision_not_supported",
+                }
+            },
+        )
+
     if request.stream:
         stream_stop_event: threading.Event = threading.Event()
 
@@ -2953,6 +2998,21 @@ async def openai_chat_completions(
                 yield f"data: {error_chunk}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+            except ValueError as exc:
+                logger.warning("OpenAI SSE stream rejected multimodal/invalid input: %s", exc)
+                error_chunk = json.dumps(
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": "model_vision_not_supported",
+                        }
+                    }
+                )
+                yield f"data: {error_chunk}\n\n"
+                yield "data: [DONE]\n\n"
+                return
             except Exception as exc:
                 logger.error("OpenAI SSE stream failed mid-generation: %s", exc)
                 error_chunk = json.dumps(
@@ -3014,6 +3074,19 @@ async def openai_chat_completions(
         ) as token_stream:
             async for _req_id, _step, _tok_id, token_text, _is_eos in token_stream:
                 collected_tokens.append(token_text)
+    except ValueError as exc:
+        logger.warning("Non-streaming chat completion rejected multimodal/invalid input: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "param": "messages",
+                    "code": "model_vision_not_supported",
+                }
+            },
+        )
     except RuntimeError as exc:
         logger.error("Non-streaming chat completion failed: %s", exc)
         return JSONResponse(

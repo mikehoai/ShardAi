@@ -33,6 +33,7 @@ from p2p.serializer import (
     serialize_activation_tensor,
 )
 from shard_engine.schemas import NodeState, PeerNodeInfo, PeerRole
+from tests._mock_runner import make_mock_runner
 
 client = TestClient(app)
 
@@ -88,7 +89,7 @@ def _configure_running_node(
     runtime.is_swarm_ready = is_swarm_ready
     runtime.coverage_percent = coverage_percent
     runtime.peers = list(peers or [])
-    runtime.model_runner = ShardModelRunner(
+    runtime.model_runner = make_mock_runner(
         model_id="meta-llama/Llama-3.1-8B-Instruct",
         shard_layer_start=shard_start,
         shard_layer_end=shard_end,
@@ -572,7 +573,7 @@ async def test_three_node_head_middle_tail_propagates_temperature_to_tail_decode
     head.shard_layer_start = 0
     head.shard_layer_end = 9
     head.total_layers = 32
-    head.model_runner = ShardModelRunner(
+    head.model_runner = make_mock_runner(
         shard_layer_start=0, shard_layer_end=9, total_layers=32, n_layers=10
     )
 
@@ -580,7 +581,7 @@ async def test_three_node_head_middle_tail_propagates_temperature_to_tail_decode
     middle.shard_layer_start = 10
     middle.shard_layer_end = 19
     middle.total_layers = 32
-    middle.model_runner = ShardModelRunner(
+    middle.model_runner = make_mock_runner(
         shard_layer_start=10, shard_layer_end=19, total_layers=32, n_layers=10
     )
 
@@ -588,7 +589,7 @@ async def test_three_node_head_middle_tail_propagates_temperature_to_tail_decode
     tail.shard_layer_start = 20
     tail.shard_layer_end = 31
     tail.total_layers = 32
-    tail.model_runner = ShardModelRunner(
+    tail.model_runner = make_mock_runner(
         shard_layer_start=20, shard_layer_end=31, total_layers=32, n_layers=12
     )
 

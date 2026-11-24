@@ -656,6 +656,7 @@ fn get_available_ram_gb() -> Result<f64, String> {
 
 #[tauri::command]
 fn window_minimize(window: tauri::Window) -> Result<(), String> {
+    let _ = window.set_skip_taskbar(false);
     window.minimize().map_err(|e| e.to_string())
 }
 
@@ -687,6 +688,17 @@ fn window_start_drag(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 fn window_is_maximized(window: tauri::Window) -> Result<bool, String> {
     window.is_maximized().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_set_maximized(window: tauri::Window, maximized: bool) -> Result<bool, String> {
+    if maximized {
+        window.maximize().map_err(|e| e.to_string())?;
+        Ok(true)
+    } else {
+        window.unmaximize().map_err(|e| e.to_string())?;
+        Ok(false)
+    }
 }
 
 fn main() {
@@ -745,6 +757,14 @@ fn main() {
             }
             tray_builder.build(app)?;
 
+            // Ensure the main window stays visible on the Windows Taskbar with the app icon
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_skip_taskbar(false);
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    let _ = win.set_icon(icon);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -754,6 +774,7 @@ fn main() {
             window_minimize,
             window_toggle_maximize,
             window_is_maximized,
+            window_set_maximized,
             window_close,
             window_start_drag
         ])
@@ -830,6 +851,23 @@ mod tests {
                 .any(|item| item.as_str() == Some("core:window:allow-internal-toggle-maximize")),
             "capabilities/default.json must include core:window:allow-internal-toggle-maximize"
         );
+    }
+
+    #[test]
+    fn tauri_conf_enables_taskbar_and_html5_drag_drop() {
+        let conf_json = include_str!("../tauri.conf.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(conf_json).expect("tauri.conf.json must be valid JSON");
+        let main_win = &parsed["app"]["windows"][0];
+        assert_eq!(main_win["skipTaskbar"], serde_json::Value::Bool(false));
+        assert_eq!(main_win["minimizable"], serde_json::Value::Bool(true));
+        assert_eq!(main_win["dragDropEnabled"], serde_json::Value::Bool(false));
+
+        let csp = parsed["app"]["security"]["csp"]
+            .as_str()
+            .expect("app.security.csp must be a string");
+        assert!(csp.contains("img-src"), "CSP must include img-src for dropped images");
+        assert!(csp.contains("media-src"), "CSP must include media-src for dropped videos");
     }
 
     #[test]

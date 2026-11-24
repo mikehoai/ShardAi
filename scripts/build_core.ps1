@@ -81,6 +81,8 @@ $PyInstallerArgs = @(
     "--hidden-import", "zeroconf",
     "--hidden-import", "zeroconf._utils.ipaddress",
     "--hidden-import", "zeroconf._handlers.answers",
+    "--hidden-import", "llama_cpp",
+    "--collect-all", "llama_cpp",
     "--collect-submodules", "zeroconf",
     "--collect-submodules", "shard_engine",
     "--collect-submodules", "models",
@@ -106,10 +108,16 @@ if (-not (Test-Path $BuiltBinary)) {
 $SidecarTarget = Join-Path $BinariesDir "core-engine-$TargetTriple.exe"
 $CliTargetTriple = Join-Path $CliDistDir "shardai-$TargetTriple.exe"
 $CliTargetShort = Join-Path $CliDistDir "shardai.exe"
+$TauriReleaseDir = Join-Path $RepoRoot "src-tauri\target\release"
 
 Copy-Item -Force -Path $BuiltBinary -Destination $SidecarTarget
 Copy-Item -Force -Path $BuiltBinary -Destination $CliTargetTriple
 Copy-Item -Force -Path $BuiltBinary -Destination $CliTargetShort
+if (Test-Path $TauriReleaseDir) {
+    $ReleaseSidecar = Join-Path $TauriReleaseDir "core-engine.exe"
+    Copy-Item -Force -Path $BuiltBinary -Destination $ReleaseSidecar
+    Write-Host "==> Tauri Release Sidecar updated: $ReleaseSidecar"
+}
 
 Write-Host "==> Tauri Sidecar binary ready   : $SidecarTarget"
 Write-Host "==> Standalone CLI binary ready  : $CliTargetShort"

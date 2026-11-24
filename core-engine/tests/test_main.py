@@ -27,6 +27,7 @@ from p2p.transport import receive_activations, send_activations
 from shard_engine.memory_manager import calculate_max_layers
 from shard_engine.schemas import NodeState, StartNodeRequest
 from shard_engine.tracker_client import SignalingTrackerClient, hash_room_key
+from tests._mock_runner import patch_start_node_runner
 
 client = TestClient(app)
 
@@ -168,7 +169,10 @@ def test_system_memory_endpoint_returns_safe_bounds() -> None:
     assert body["max_shareable_ram_gb"] >= 2
 
 
-def test_openai_gateway_lifecycle_auth_and_streaming() -> None:
+def test_openai_gateway_lifecycle_auth_and_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_start_node_runner(monkeypatch)
     # 1. Calling /v1/models while STOPPED must fail with 503
     stopped_res = client.get("/v1/models")
     assert stopped_res.status_code == 503
@@ -256,7 +260,10 @@ def test_openai_gateway_lifecycle_auth_and_streaming() -> None:
     assert client.get("/v1/models", headers=auth_headers).status_code == 503
 
 
-def test_start_generate_sse_and_stop_node_with_private_room() -> None:
+def test_start_generate_sse_and_stop_node_with_private_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_start_node_runner(monkeypatch)
     start_payload: dict[str, object] = {
         "node_id": "test-node-alpha",
         "model_id": "meta-llama/Llama-3.1-8B-Instruct",
