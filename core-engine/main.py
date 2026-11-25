@@ -395,7 +395,7 @@ class LocalNodeRuntime:
         self.native_cancel_wait_timeout_seconds: float = (
             NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS
         )
-        self._compute_lock: asyncio.Lock = asyncio.Lock()
+        self._compute_lock: asyncio.Lock | None = None
         self._compute_lock_loop: asyncio.AbstractEventLoop | None = None
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
@@ -411,7 +411,7 @@ class LocalNodeRuntime:
     def get_compute_lock(self) -> asyncio.Lock:
         """Return the compute serialization lock bound to the active event loop."""
         running_loop = asyncio.get_running_loop()
-        if self._compute_lock_loop is not running_loop:
+        if self._compute_lock is None or self._compute_lock_loop is not running_loop:
             self._compute_lock = asyncio.Lock()
             self._compute_lock_loop = running_loop
         return self._compute_lock
@@ -668,7 +668,7 @@ class LocalNodeRuntime:
                 f"Rejected activation frame from unauthorized origin {frame.origin_ip}:{frame.origin_port}."
             )
 
-        async with self._compute_lock:
+        async with self.get_compute_lock():
             output_tensor_bytes, output_shape = await asyncio.to_thread(
                 self.model_runner.forward_pass,
                 frame.raw_tensor_bytes,
@@ -684,7 +684,7 @@ class LocalNodeRuntime:
         )
 
         if is_final_layer or (not self.model_runner.is_real_model and next_peer is None):
-            async with self._compute_lock:
+            async with self.get_compute_lock():
                 token_id, token_text, is_eos = await asyncio.to_thread(
                     self.model_runner.decode_final_layer_to_token,
                     output_tensor_bytes,
@@ -891,7 +891,7 @@ class LocalNodeRuntime:
         temperature: float,
         stop_event: threading.Event | None = None,
     ) -> AsyncIterator[tuple[int, str, bool]]:
-        """Stream native llama_cpp tokens asynchronously, serialized by `_compute_lock` with cancellation."""
+        """Stream native llama_cpp tokens asynchronously, serialized by `get_compute_lock()` with cancellation."""
         cancel_event: threading.Event = (
             stop_event if stop_event is not None else threading.Event()
         )
@@ -1136,7 +1136,7 @@ class LocalNodeRuntime:
                     if (step_idx == 0 or not self.model_runner.is_real_model)
                     else [token_ids[-1]]
                 )
-                async with self._compute_lock:
+                async with self.get_compute_lock():
                     hidden_bytes, tensor_shape = await asyncio.to_thread(
                         self.model_runner.forward_pass,
                         step_input_ids,
@@ -1242,7 +1242,7 @@ class LocalNodeRuntime:
                     token_text = decoded_frame.token_text
                     is_eos = decoded_frame.is_eos
                 else:
-                    async with self._compute_lock:
+                    async with self.get_compute_lock():
                         token_id, token_text, is_eos = await asyncio.to_thread(
                             self.model_runner.decode_final_layer_to_token,
                             hidden_bytes,
