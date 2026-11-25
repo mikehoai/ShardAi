@@ -668,6 +668,16 @@ class LocalNodeRuntime:
                 f"Rejected activation frame from unauthorized origin {frame.origin_ip}:{frame.origin_port}."
             )
 
+        if (
+            self.model_runner.has_native_llama
+            and not self.model_runner.supports_pipeline_sharding
+        ):
+            raise RuntimeError(
+                "Multi-node hidden-state pipeline sharding is not supported for GGUF "
+                "(llama_cpp) models. Distributed layer sharding requires Safetensors/PyTorch "
+                "weights or single-node GGUF execution."
+            )
+
         async with self._compute_lock:
             output_tensor_bytes, output_shape = await asyncio.to_thread(
                 self.model_runner.forward_pass,
@@ -838,10 +848,33 @@ class LocalNodeRuntime:
                 continue
             return candidate_frame
 
+    def _raise_if_unsupported_gguf_sharding(
+        self, next_peer: PeerNodeInfo | None
+    ) -> None:
+        """Reject multi-node hidden-state pipeline sharding when running a GGUF llama_cpp model."""
+        if self.model_runner is None:
+            return
+        if (
+            self.model_runner.has_native_llama
+            and not self.model_runner.supports_pipeline_sharding
+            and (
+                next_peer is not None
+                or self.shard_layer_end < (self.total_layers - 1)
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Multi-node hidden-state pipeline sharding is not supported for GGUF "
+                    "(llama_cpp) models. Distributed layer sharding requires Safetensors/PyTorch "
+                    "weights or single-node GGUF execution."
+                ),
+            )
+
     def validate_pipeline_preflight(self) -> None:
         """Validate node readiness, Head Node role, and downstream peer availability before streaming.
 
-        Must be called prior to returning a `StreamingResponse` so HTTP 400 / 503 errors
+        Must be called prior to returning a `StreamingResponse` so HTTP 400 / 422 / 503 errors
         are returned with proper HTTP status codes instead of raising after HTTP 200 OK.
         """
         if self.state != NodeState.RUNNING or self.model_runner is None:
@@ -869,6 +902,7 @@ class LocalNodeRuntime:
         next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
             self.shard_layer_end
         )
+        self._raise_if_unsupported_gguf_sharding(next_peer_initial)
         if (
             self.shard_layer_end < (self.total_layers - 1)
             and next_peer_initial is None
@@ -1099,6 +1133,7 @@ class LocalNodeRuntime:
         next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
             self.shard_layer_end
         )
+        self._raise_if_unsupported_gguf_sharding(next_peer_initial)
         if self.model_runner.has_native_llama and next_peer_initial is None:
             try:
                 async with aclosing(
