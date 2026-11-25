@@ -18,7 +18,11 @@ import re
 import socket
 from typing import TYPE_CHECKING, Any
 
-from p2p.mdns_discovery import LanRoomBeacon, _list_local_ipv4_addresses
+from p2p.mdns_discovery import (
+    LanRoomBeacon,
+    _list_local_ipv4_addresses,
+    normalize_beacon_modality,
+)
 
 if TYPE_CHECKING:
     from zeroconf import ServiceStateChange, Zeroconf
@@ -54,7 +58,7 @@ def _sanitize_instance_name(node_id: str) -> str:
 
 
 def _beacon_to_txt(beacon: LanRoomBeacon) -> dict[str, str]:
-    return {
+    txt = {
         "v": "1",
         "node_id": beacon.node_id,
         "room_id": beacon.room_id,
@@ -67,6 +71,10 @@ def _beacon_to_txt(beacon: LanRoomBeacon) -> dict[str, str]:
         "total_layers": str(beacon.total_layers),
         "role": beacon.role,
     }
+    normalized_modality = normalize_beacon_modality(beacon.modality)
+    if normalized_modality is not None:
+        txt["modality"] = normalized_modality
+    return txt
 
 
 def _decode_txt(properties: dict[bytes, bytes | None]) -> dict[str, str]:
@@ -175,6 +183,7 @@ class ZeroconfLanDiscovery:
             "shard_layer_end": _safe_int(txt.get("shard_layer_end"), 0),
             "total_layers": _safe_int(txt.get("total_layers"), 32),
             "role": txt.get("role") or "primary",
+            "modality": normalize_beacon_modality(txt.get("modality") or txt.get("mod")),
             "ip_address": addresses[0] if addresses else "127.0.0.1",
             "source": "zeroconf",
         }

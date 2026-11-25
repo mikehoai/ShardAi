@@ -17,7 +17,13 @@ from urllib.parse import quote
 
 import httpx
 
-from shard_engine.schemas import PeerNodeInfo, PeerRole, RoomLobbyItem, StartNodeRequest
+from shard_engine.schemas import (
+    PeerNodeInfo,
+    PeerRole,
+    RoomLobbyItem,
+    StartNodeRequest,
+    normalize_model_modality,
+)
 
 logger = logging.getLogger("shardai.tracker")
 
@@ -303,6 +309,7 @@ class SignalingTrackerClient:
         max_layers_can_hold: int | None = None,
         model_fingerprint: str | None = None,
         room_key_hash: str | None = None,
+        modality: str | None = None,
     ) -> AnnounceAssignment:
         """Announce node capacity to `POST /announce` and receive Cloud layer assignment & role."""
         resolved_total_layers: int = total_model_layers or config.total_layers
@@ -320,6 +327,7 @@ class SignalingTrackerClient:
             else None
         )
 
+        normalized_modality = normalize_model_modality(modality)
         payload: dict[str, Any] = {
             "node_id": config.node_id,
             "model": config.model_id,
@@ -342,6 +350,7 @@ class SignalingTrackerClient:
             "max_vram_mb": config.max_vram_mb,
             "source_type": config.source_type.value,
             **({"model_fingerprint": model_fingerprint} if model_fingerprint else {}),
+            **({"modality": normalized_modality} if normalized_modality else {}),
         }
         response_data: dict[str, Any] = await self._request_with_retry(
             method="POST",
@@ -418,12 +427,14 @@ class SignalingTrackerClient:
         config: StartNodeRequest,
         total_model_layers: int | None = None,
         max_layers_can_hold: int | None = None,
+        modality: str | None = None,
     ) -> list[PeerNodeInfo]:
         """Announce this node via HTTP POST /announce and return active peers."""
         assignment = await self.register_node_with_assignment(
             config=config,
             total_model_layers=total_model_layers,
             max_layers_can_hold=max_layers_can_hold,
+            modality=modality,
         )
         return assignment.peers
 
@@ -459,17 +470,7 @@ class SignalingTrackerClient:
                 if room.get("redundancy_factor") is not None
                 else 1
             )
-            raw_modality = room.get("modality")
-            normalized_modality = (
-                raw_modality.strip().lower()
-                if isinstance(raw_modality, str)
-                else ""
-            )
-            modality = (
-                normalized_modality
-                if normalized_modality in {"text", "vision", "audio", "multimodal"}
-                else None
-            )
+            modality = normalize_model_modality(room.get("modality"))
             parsed.append(
                 RoomLobbyItem(
                     room_id=str(room.get("room_id") or "public"),

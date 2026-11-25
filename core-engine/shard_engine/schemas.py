@@ -69,6 +69,17 @@ class ModelSourceType(StrEnum):
 
 CatalogModelTask = Literal["text", "image", "video", "multimodal"]
 CatalogModelModality = Literal["text", "vision", "audio", "multimodal"]
+VALID_MODEL_MODALITIES: frozenset[str] = frozenset({"text", "vision", "audio", "multimodal"})
+
+
+def normalize_model_modality(value: Any) -> CatalogModelModality | None:
+    """Normalize an external modality value to a supported `CatalogModelModality` or `None`."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in VALID_MODEL_MODALITIES:
+        return cleaned  # type: ignore[return-value]
+    return None
 
 
 def validate_room_id(value: Any) -> str:

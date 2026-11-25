@@ -71,6 +71,7 @@ from shard_engine.memory_manager import (
 )
 from shard_engine.schemas import (
     CatalogModelItem,
+    CatalogModelModality,
     ChatMessage,
     CheckRoomJoinRequest,
     CheckRoomJoinResponse,
@@ -91,6 +92,7 @@ from shard_engine.schemas import (
     RoomLobbyItem,
     StartNodeRequest,
     SystemMemoryResponse,
+    normalize_model_modality,
     resolve_local_ipc_token,
     validate_room_id,
 )
@@ -353,6 +355,7 @@ class LocalNodeRuntime:
         self.model_id: str | None = None
         self.model_path: str | None = None
         self.mmproj_path: str | None = None
+        self.modality: CatalogModelModality | None = None
         self.network_mode: NetworkMode | None = None
         self.room_id: str | None = None
         self.room_key_hash: str | None = None
@@ -1439,6 +1442,7 @@ class LocalNodeRuntime:
                 max_layers_can_hold=max_layers,
                 model_fingerprint=self.model_fingerprint,
                 room_key_hash=self.room_key_hash,
+                modality=self.modality,
             )
             if self.state != NodeState.RUNNING:
                 return False, None
@@ -1875,6 +1879,51 @@ async def get_network_status() -> NetworkStatusResponse:
     )
 
 
+def _resolve_node_modality(
+    model_id: str,
+    mmproj_path: str | None = None,
+    mmproj_filename: str | None = None,
+) -> CatalogModelModality:
+    """Resolve effective node modality ('vision' when mmproj is active or catalog matches, else 'text')."""
+    if (isinstance(mmproj_path, str) and mmproj_path.strip()) or (
+        isinstance(mmproj_filename, str) and mmproj_filename.strip()
+    ):
+        return "vision"
+    if runtime.model_downloader.get_resolved_mmproj_path(model_id) is not None:
+        return "vision"
+    catalog_entry = runtime.model_downloader.lookup_catalog_entry(model_id)
+    if catalog_entry is not None:
+        entry_modality = normalize_model_modality(catalog_entry.get("modality"))
+        if entry_modality is not None:
+            return entry_modality
+        if catalog_entry.get("mmproj_filename"):
+            return "vision"
+    return "text"
+
+
+def _resolve_lan_group_modality(
+    beacons: list[dict[str, Any]],
+    model: str,
+) -> CatalogModelModality | None:
+    """Resolve effective room modality from discovered LAN beacons or catalog fallback."""
+    candidates: list[CatalogModelModality] = []
+    for beacon in beacons:
+        mod = normalize_model_modality(beacon.get("modality"))
+        if mod is not None:
+            candidates.append(mod)
+    for preferred in ("multimodal", "vision", "audio", "text"):
+        if preferred in candidates:
+            return preferred  # type: ignore[return-value]
+    catalog_entry = runtime.model_downloader.lookup_catalog_entry(model)
+    if catalog_entry is not None:
+        entry_modality = normalize_model_modality(catalog_entry.get("modality"))
+        if entry_modality is not None:
+            return entry_modality
+        if catalog_entry.get("mmproj_filename"):
+            return "vision"
+    return None
+
+
 @app.get("/available-rooms", response_model=list[RoomLobbyItem])
 async def get_available_rooms() -> list[RoomLobbyItem]:
     """Fetch active rooms from Cloudflare Tracker (GET /rooms) merged with LAN mDNS scan."""
@@ -1920,11 +1969,14 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
         min_rep = min(layer_replication.values()) if covered_layers == total_layers else 1
         redundancy = max(1, min_rep)
 
+        lan_modality = _resolve_lan_group_modality(beacons, model)
+
         if r_id in merged:
             existing = merged[r_id]
             merged[r_id] = RoomLobbyItem(
                 room_id=r_id,
                 model=existing.model,
+                modality=existing.modality or lan_modality,
                 nodes_online=existing.nodes_online + len(beacons),
                 total_shared_ram_gb=round(existing.total_shared_ram_gb + total_ram, 2),
                 is_private=existing.is_private or is_private,
@@ -1936,6 +1988,7 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
             merged[r_id] = RoomLobbyItem(
                 room_id=r_id,
                 model=model,
+                modality=lan_modality,
                 nodes_online=len(beacons),
                 total_shared_ram_gb=total_ram,
                 is_private=is_private,
@@ -2268,6 +2321,7 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
         runtime.model_id = None
         runtime.model_path = None
         runtime.mmproj_path = None
+        runtime.modality = None
         runtime.network_mode = None
         runtime.room_id = None
         runtime.room_key_hash = None
@@ -2440,6 +2494,10 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         discovered_peers: list[PeerNodeInfo] = []
         cloud_online: bool = False
         last_announce_monotonic: float = 0.0
+        initial_modality: CatalogModelModality = _resolve_node_modality(
+            request.model_id,
+            mmproj_filename=request.mmproj_filename,
+        )
         if _is_tracker_enabled() and request.network_mode == NetworkMode.INTERNET:
             try:
                 assignment: AnnounceAssignment = (
@@ -2448,6 +2506,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                         total_model_layers=total_model_layers,
                         max_layers_can_hold=max_layers_can_hold,
                         model_fingerprint=initial_fingerprint,
+                        modality=initial_modality,
                     )
                 )
                 cloud_online = True
@@ -2587,13 +2646,27 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         model_fingerprint: str = await asyncio.to_thread(
             compute_model_fingerprint, local_model_path
         )
-        if cloud_online and model_fingerprint != initial_fingerprint:
+        downloaded_mmproj_path = runtime.model_downloader.get_resolved_mmproj_path(
+            request.model_id
+        )
+        post_download_modality: CatalogModelModality = _resolve_node_modality(
+            request.model_id,
+            mmproj_path=(
+                str(downloaded_mmproj_path) if downloaded_mmproj_path is not None else None
+            ),
+            mmproj_filename=request.mmproj_filename,
+        )
+        if cloud_online and (
+            model_fingerprint != initial_fingerprint
+            or post_download_modality != initial_modality
+        ):
             try:
                 await runtime.tracker_client.register_node_with_assignment(
                     request,
                     total_model_layers=total_model_layers,
                     max_layers_can_hold=max_layers_can_hold,
                     model_fingerprint=model_fingerprint,
+                    modality=post_download_modality,
                 )
                 last_announce_monotonic = time.monotonic()
             except Exception as fp_exc:
@@ -2688,6 +2761,15 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
 
         room_key_hash: str | None = announced_room_key_hash
         is_private_room: bool = room_key_hash is not None
+        node_modality: CatalogModelModality = _resolve_node_modality(
+            request.model_id,
+            mmproj_path=(
+                active_mmproj_path
+                or runtime.model_runner.mmproj_path
+                or (str(local_mmproj_path) if local_mmproj_path is not None else None)
+            ),
+            mmproj_filename=request.mmproj_filename,
+        )
 
         # 7. Advertise on LAN (UDP beacon always; zeroconf DNS-SD broadcast in OFFLINE_MODE or
         #    explicit LAN mode) & merge LAN-discovered peers (preserving primary/backup roles).
@@ -2703,6 +2785,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             shard_layer_end=final_end,
             total_layers=final_total_layers,
             role=assigned_role.value,
+            modality=node_modality,
         )
         await lan_mdns_service.start_advertising(lan_beacon)
         if network_status != NetworkStatus.ONLINE or request.network_mode == NetworkMode.LAN:
@@ -2730,6 +2813,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.model_id = request.model_id
         runtime.model_path = str(local_model_path)
         runtime.mmproj_path = active_mmproj_path
+        runtime.modality = node_modality
         runtime.network_mode = request.network_mode
         runtime.room_id = request.room_id
         runtime.room_key_hash = room_key_hash
