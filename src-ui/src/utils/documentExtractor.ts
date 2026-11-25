@@ -71,7 +71,7 @@ async function extractDocxText(file: File): Promise<string> {
   return cleaned;
 }
 
-async function extractPdfText(file: File): Promise<string> {
+async function extractPdfText(file: File, maxChars: number): Promise<string> {
   ensurePdfWorker();
   const arrayBuffer = await readFileAsArrayBuffer(file);
   const loadingTask = pdfjsLib.getDocument({
@@ -81,20 +81,32 @@ async function extractPdfText(file: File): Promise<string> {
     const pdfDoc = await loadingTask.promise;
     try {
       const pageTexts: string[] = [];
-      for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
+      let totalChars = 0;
+      for (let pageNum = 1; pageNum <= pdfDoc.numPages && totalChars < maxChars; pageNum += 1) {
         const page = await pdfDoc.getPage(pageNum);
-        const textContent = await page.getTextContent();
-        const parts: string[] = [];
-        for (const item of textContent.items) {
-          if (typeof item === "object" && item !== null && "str" in item && typeof item.str === "string") {
-            if (item.str) {
-              parts.push(item.str);
+        try {
+          const textContent = await page.getTextContent();
+          const parts: string[] = [];
+          for (const item of textContent.items) {
+            if (typeof item === "object" && item !== null && "str" in item && typeof item.str === "string") {
+              if (item.str) {
+                parts.push(item.str);
+              }
             }
           }
-        }
-        const joined = parts.join(" ").trim();
-        if (joined) {
-          pageTexts.push(joined);
+          const joined = parts.join(" ").trim();
+          if (joined) {
+            if (pageTexts.length > 0) {
+              totalChars += 2;
+            }
+            pageTexts.push(joined);
+            totalChars += joined.length;
+          }
+        } finally {
+          const pageWithCleanup = page as { cleanup?: () => unknown };
+          if (typeof pageWithCleanup.cleanup === "function") {
+            await pageWithCleanup.cleanup();
+          }
         }
       }
       const cleaned = pageTexts.join("\n\n").trim();
@@ -132,7 +144,7 @@ export async function extractDocumentText(
   ) {
     extracted = await extractDocxText(file);
   } else if (ext === ".pdf" || mime === "application/pdf") {
-    extracted = await extractPdfText(file);
+    extracted = await extractPdfText(file, maxChars);
   } else {
     extracted = (await readPlainText(file)).trim();
     if (!extracted) {

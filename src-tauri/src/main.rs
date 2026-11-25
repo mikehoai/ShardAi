@@ -701,6 +701,16 @@ fn window_set_maximized(window: tauri::Window, maximized: bool) -> Result<bool, 
     }
 }
 
+/// Marks shutdown state and terminates the sidecar when the main window closes or is destroyed.
+fn handle_window_event(state: &PythonCoreState, event: &WindowEvent) {
+    if matches!(
+        event,
+        WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+    ) {
+        let _ = shutdown_python_core(state);
+    }
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -779,13 +789,8 @@ fn main() {
             window_start_drag
         ])
         .on_window_event(|window, event| {
-            if matches!(
-                event,
-                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
-            ) {
-                let state = window.app_handle().state::<PythonCoreState>();
-                let _ = terminate_child_process(&state);
-            }
+            let state = window.app_handle().state::<PythonCoreState>();
+            handle_window_event(&state, event);
         })
         .build(tauri::generate_context!())
         .expect("error while building ShardAi Tauri application");
@@ -1325,5 +1330,44 @@ Pages inactive:                               0.
         let zero_gb = parse_vm_stat_available_ram_gb(zero_pages)
             .expect("expected Ok(0.0) when free and inactive pages are explicitly 0");
         assert!(zero_gb.is_finite() && zero_gb.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_handle_window_event_shuts_down_on_close_or_destroy() {
+        let state = PythonCoreState::default();
+        let child = spawn_dummy_long_running_child();
+        let pid = child.id();
+        {
+            let mut guard = state.child.lock().expect("lock child mutex");
+            *guard = Some(child);
+        }
+
+        // Non-close window events must leave the sidecar running and shutting_down unset
+        handle_window_event(&state, &WindowEvent::Focused(false));
+        assert!(
+            !state.is_shutting_down(),
+            "focus change must not mark application as shutting down"
+        );
+        assert!(
+            is_process_alive(pid),
+            "focus change must not terminate python core child"
+        );
+
+        // Destroyed (and CloseRequested) must mark shutting_down and reap the child process
+        handle_window_event(&state, &WindowEvent::Destroyed);
+        assert!(
+            state.is_shutting_down(),
+            "window destroy must mark application as shutting down"
+        );
+        assert!(
+            !is_process_alive(pid),
+            "window destroy must kill and reap python core child PID {pid}"
+        );
+
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains("handle_window_event(&state, event);"),
+            "on_window_event must delegate to handle_window_event"
+        );
     }
 }
