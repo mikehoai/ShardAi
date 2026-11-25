@@ -147,28 +147,87 @@ def _compress_buffer(
     return compressed, CompressionCodec.ZLIB
 
 
+def _decompress_lz4_bounded(payload_bytes: bytes, max_allowed_bytes: int) -> bytes:
+    """Stream-decompress an LZ4 frame while capping output to `max_allowed_bytes`."""
+    if not HAS_LZ4 or lz4_frame is None:
+        raise RuntimeError("Received LZ4-compressed frame but 'lz4' package is not installed.")
+
+    try:
+        frame_info: dict[str, Any] = lz4_frame.get_frame_info(payload_bytes)
+    except RuntimeError as exc:
+        raise ValueError(f"Malformed LZ4 frame header: {exc}") from exc
+
+    if frame_info.get("skippable"):
+        raise ValueError("Rejected skippable LZ4 frame in activation tensor payload.")
+
+    declared_content_size: int = int(frame_info.get("content_size", 0))
+    if declared_content_size > max_allowed_bytes:
+        raise ValueError(
+            "Decompressed LZ4 payload exceeded safety limit: "
+            f"frame header declares {declared_content_size} bytes > {max_allowed_bytes} bytes."
+        )
+
+    decomp = lz4_frame.LZ4FrameDecompressor()
+    try:
+        raw_out: bytes = decomp.decompress(payload_bytes, max_length=max_allowed_bytes)
+    except RuntimeError as exc:
+        raise ValueError(f"Corrupted or invalid LZ4 payload: {exc}") from exc
+
+    if not decomp.needs_input:
+        raise ValueError(
+            f"Decompressed LZ4 payload exceeded safety limit ({max_allowed_bytes} bytes)."
+        )
+    if not decomp.eof:
+        raise ValueError("Incomplete LZ4 frame: missing end-of-frame marker.")
+    if decomp.unused_data:
+        raise ValueError("Unexpected trailing data after LZ4 frame.")
+
+    return raw_out
+
+
+def _decompress_zlib_bounded(payload_bytes: bytes, max_allowed_bytes: int) -> bytes:
+    """Decompress a zlib stream while capping output to `max_allowed_bytes`."""
+    decomp = zlib.decompressobj()
+    # zlib.decompressobj.decompress treats max_length=0 as unbounded, so clamp to >= 1.
+    zlib_max_length: int = max(1, max_allowed_bytes)
+    try:
+        raw_out: bytes = decomp.decompress(payload_bytes, max_length=zlib_max_length)
+    except zlib.error as exc:
+        raise ValueError(f"Corrupted or invalid zlib payload: {exc}") from exc
+
+    if decomp.unconsumed_tail:
+        raise ValueError(
+            f"Decompressed zlib payload exceeded safety limit ({max_allowed_bytes} bytes)."
+        )
+    if not decomp.eof:
+        raise ValueError("Incomplete zlib stream: missing end-of-stream marker.")
+    if decomp.unused_data:
+        raise ValueError("Unexpected trailing data after zlib stream.")
+    if len(raw_out) > max_allowed_bytes:
+        raise ValueError(
+            f"Decompressed zlib payload exceeded safety limit ({max_allowed_bytes} bytes)."
+        )
+    return raw_out
+
+
 def _decompress_buffer(
     payload_bytes: bytes,
     codec: CompressionCodec,
     expected_uncompressed_size: int,
 ) -> bytes:
     """Decompress a binary tensor buffer with strict bounds verification."""
-    if expected_uncompressed_size > MAX_UNCOMPRESSED_TENSOR_BYTES:
+    if expected_uncompressed_size < 0 or expected_uncompressed_size > MAX_UNCOMPRESSED_TENSOR_BYTES:
         raise ValueError(
             f"Rejected P2P tensor exceeding safety cap: {expected_uncompressed_size} bytes"
         )
+    max_allowed_bytes: int = min(expected_uncompressed_size, MAX_UNCOMPRESSED_TENSOR_BYTES)
 
     if codec == CompressionCodec.NONE:
         raw_out = payload_bytes
     elif codec == CompressionCodec.LZ4:
-        if not HAS_LZ4 or lz4_frame is None:
-            raise RuntimeError("Received LZ4-compressed frame but 'lz4' package is not installed.")
-        raw_out = lz4_frame.decompress(payload_bytes)
+        raw_out = _decompress_lz4_bounded(payload_bytes, max_allowed_bytes)
     elif codec == CompressionCodec.ZLIB:
-        decomp = zlib.decompressobj()
-        raw_out = decomp.decompress(payload_bytes, max_length=MAX_UNCOMPRESSED_TENSOR_BYTES)
-        if decomp.unconsumed_tail:
-            raise ValueError("Decompressed zlib payload exceeded safety limit.")
+        raw_out = _decompress_zlib_bounded(payload_bytes, max_allowed_bytes)
     else:
         raise ValueError(f"Unsupported compression codec: {codec}")
 
