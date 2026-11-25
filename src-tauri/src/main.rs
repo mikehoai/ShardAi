@@ -866,6 +866,17 @@ mod tests {
         let csp = parsed["app"]["security"]["csp"]
             .as_str()
             .expect("app.security.csp must be a string");
+        assert!(csp.contains("default-src 'self'"), "CSP must keep default-src 'self'");
+        assert!(csp.contains("script-src 'self'"), "CSP must include strict script-src 'self'");
+        assert!(
+            csp.contains("style-src 'self' 'unsafe-inline'"),
+            "CSP must allow React inline styles via style-src 'self' 'unsafe-inline'"
+        );
+        assert!(
+            !csp.contains("script-src 'self' 'unsafe-inline'"),
+            "CSP must not allow unsafe-inline scripts"
+        );
+        assert!(!csp.contains("'unsafe-eval'"), "CSP must never enable unsafe-eval");
         assert!(csp.contains("img-src"), "CSP must include img-src for dropped images");
         assert!(csp.contains("media-src"), "CSP must include media-src for dropped videos");
     }

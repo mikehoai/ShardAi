@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { streamChatCompletion } from "../services/engineApi";
 import { extractDocumentText, MAX_DOC_TEXT_CHARS } from "../utils/documentExtractor";
@@ -274,13 +274,64 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragCounterRef = useRef<number>(0);
-  const maximizedByChatRef = useRef<boolean>(false);
+  const preChatOsMaximizedRef = useRef<boolean | null>(null);
+  const pendingOsMaxQueryRef = useRef<Promise<boolean> | null>(null);
+  const osWindowMutatedByChatRef = useRef<boolean>(false);
+  const desiredChatMaximizedRef = useRef<boolean>(false);
   const prevModelSessionRef = useRef<{ modelId: string; sessionToken: string }>({
     modelId,
     sessionToken,
   });
 
-  // Track mount lifecycle (StrictMode-safe) and abort any in-flight stream on unmount
+  const ensureBaselineOsMaximized = useCallback((): Promise<boolean> => {
+    if (preChatOsMaximizedRef.current !== null) {
+      return Promise.resolve(preChatOsMaximizedRef.current);
+    }
+    if (pendingOsMaxQueryRef.current !== null) {
+      return pendingOsMaxQueryRef.current;
+    }
+    if (!isTauriEnvironment()) {
+      preChatOsMaximizedRef.current = false;
+      return Promise.resolve(false);
+    }
+    const query = invoke<boolean>("window_is_maximized")
+      .then((val) => {
+        const normalized = Boolean(val);
+        if (preChatOsMaximizedRef.current === null) {
+          preChatOsMaximizedRef.current = normalized;
+        }
+        return normalized;
+      })
+      .catch(() => {
+        if (preChatOsMaximizedRef.current === null) {
+          preChatOsMaximizedRef.current = false;
+        }
+        return false;
+      })
+      .finally(() => {
+        if (pendingOsMaxQueryRef.current === query) {
+          pendingOsMaxQueryRef.current = null;
+        }
+      });
+    pendingOsMaxQueryRef.current = query;
+    return query;
+  }, []);
+
+  const restoreOsWindowMaximizeState = useCallback((): void => {
+    desiredChatMaximizedRef.current = false;
+    const didMutate = osWindowMutatedByChatRef.current;
+    const baseline = preChatOsMaximizedRef.current;
+    osWindowMutatedByChatRef.current = false;
+    preChatOsMaximizedRef.current = null;
+    pendingOsMaxQueryRef.current = null;
+    if (didMutate && isTauriEnvironment()) {
+      void invoke<boolean>("window_set_maximized", {
+        maximized: Boolean(baseline),
+      }).catch(() => undefined);
+    }
+  }, []);
+
+  // Track mount lifecycle (StrictMode-safe), abort streams, and restore OS maximize state on unmount
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
@@ -289,8 +340,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
+      restoreOsWindowMaximizeState();
     };
-  }, []);
+  }, [restoreOsWindowMaximizeState]);
 
   // Keep latest onClose callback without re-triggering open-focus or keydown effects
   useEffect(() => {
@@ -317,27 +369,25 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     setInputValue("");
   }, [modelId, sessionToken]);
 
-  // Abort any in-flight stream and restore window maximize state when closing
+  // Capture baseline OS maximize state on open; abort stream & restore OS state when closing
   useEffect(() => {
-    if (!isOpen) {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
+    if (isOpen) {
+      desiredChatMaximizedRef.current = false;
+      if (isTauriEnvironment()) {
+        void ensureBaselineOsMaximized();
       }
-      setIsStreaming(false);
-      setIsDragOver(false);
-      dragCounterRef.current = 0;
-      setIsMaximized(false);
-      if (maximizedByChatRef.current) {
-        maximizedByChatRef.current = false;
-        if (isTauriEnvironment()) {
-          void invoke<boolean>("window_set_maximized", { maximized: false }).catch(
-            () => undefined
-          );
-        }
-      }
+      return;
     }
-  }, [isOpen]);
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsStreaming(false);
+    setIsDragOver(false);
+    dragCounterRef.current = 0;
+    setIsMaximized(false);
+    restoreOsWindowMaximizeState();
+  }, [isOpen, ensureBaselineOsMaximized, restoreOsWindowMaximizeState]);
 
   // Focus composer textarea only when ChatWindow opens
   useEffect(() => {
@@ -378,12 +428,27 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const handleToggleMaximize = (): void => {
     const nextMax = !isMaximized;
     setIsMaximized(nextMax);
-    if (isTauriEnvironment()) {
-      maximizedByChatRef.current = nextMax;
-      void invoke<boolean>("window_set_maximized", { maximized: nextMax }).catch(
-        () => undefined
-      );
+    desiredChatMaximizedRef.current = nextMax;
+    if (!isTauriEnvironment()) {
+      return;
     }
+    if (preChatOsMaximizedRef.current !== null) {
+      if (!preChatOsMaximizedRef.current) {
+        osWindowMutatedByChatRef.current = nextMax;
+        void invoke<boolean>("window_set_maximized", { maximized: nextMax }).catch(
+          () => undefined
+        );
+      }
+      return;
+    }
+    void ensureBaselineOsMaximized().then((wasMax) => {
+      if (!wasMax && isMountedRef.current && desiredChatMaximizedRef.current === nextMax) {
+        osWindowMutatedByChatRef.current = nextMax;
+        void invoke<boolean>("window_set_maximized", { maximized: nextMax }).catch(
+          () => undefined
+        );
+      }
+    });
   };
 
   const processIncomingFiles = async (fileList: FileList | File[]): Promise<void> => {
@@ -720,6 +785,66 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               disabled={messages.length === 0 && attachments.length === 0 && !isStreaming}
             >
               Clear
+            </button>
+            <button
+              type="button"
+              data-testid="chat-maximize-btn"
+              className="native-btn chat-window-ctrl-btn"
+              aria-label={isMaximized ? "Restore chat window" : "Maximize chat window"}
+              aria-pressed={isMaximized}
+              title={isMaximized ? "Restore (or double-click header)" : "Maximize (or double-click header)"}
+              onClick={handleToggleMaximize}
+            >
+              {isMaximized ? (
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  aria-hidden="true"
+                >
+                  <rect x="2" y="3.5" width="6.5" height="6.5" rx="0.5" />
+                  <path d="M4 3.5V2h6v6H8.5" />
+                </svg>
+              ) : (
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  aria-hidden="true"
+                >
+                  <rect x="2" y="2" width="8" height="8" rx="0.5" />
+                </svg>
+              )}
+              <span>{isMaximized ? "Restore" : "Maximize"}</span>
+            </button>
+            <button
+              type="button"
+              data-testid="chat-close-btn"
+              className="native-btn chat-window-ctrl-btn chat-window-close-btn"
+              aria-label="Close chat window"
+              title="Close (Esc)"
+              onClick={onClose}
+            >
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 12 12"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.35"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <line x1="2.5" y1="2.5" x2="9.5" y2="9.5" />
+                <line x1="9.5" y1="2.5" x2="2.5" y2="9.5" />
+              </svg>
+              <span>Close</span>
             </button>
           </div>
         </div>

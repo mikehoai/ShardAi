@@ -501,8 +501,9 @@ export const Dashboard: React.FC = () => {
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
   const [downloadStatusMsg, setDownloadStatusMsg] = useState<string>("");
 
-  // Clipboard copy feedback
+  // Clipboard copy feedback & synchronous start re-entrancy lock
   const [copiedField, setCopiedField] = useState<string | null>(null);
+  const startInFlightRef = useRef<boolean>(false);
 
   const fetchAvailableRooms = useCallback(
     async (options?: { reseed?: boolean; signal?: AbortSignal }): Promise<void> => {
@@ -1358,6 +1359,10 @@ export const Dashboard: React.FC = () => {
       return;
     }
 
+    if (startInFlightRef.current) {
+      return;
+    }
+    startInFlightRef.current = true;
     setIsBusy(true);
     setErrorMessage(null);
     setDownloadProgress(null);
@@ -1561,6 +1566,7 @@ export const Dashboard: React.FC = () => {
         setStatusMessage("Failed to start P2P AI Gateway.");
       }
     } finally {
+      startInFlightRef.current = false;
       if (isMountedRef.current) {
         setIsBusy(false);
       }
@@ -1614,7 +1620,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const handleJoinLobbyRoom = (room: RoomLobbyItem): void => {
-    if (isSharing || isBusy) return;
+    if (isSharing || isBusy || startInFlightRef.current) return;
     if (room.is_private) {
       setPendingPrivateRoom(room);
       setPrivateKeyInput("");
@@ -1641,6 +1647,9 @@ export const Dashboard: React.FC = () => {
 
   const handleConfirmPrivateJoin = (event: React.FormEvent): void => {
     event.preventDefault();
+    if (isSharing || isBusy || startInFlightRef.current) {
+      return;
+    }
     if (!pendingPrivateRoom || !privateKeyInput.trim()) {
       return;
     }
@@ -1668,6 +1677,9 @@ export const Dashboard: React.FC = () => {
 
   const handleCreateOrJoinUnlisted = (event: React.FormEvent): void => {
     event.preventDefault();
+    if (isSharing || isBusy || startInFlightRef.current) {
+      return;
+    }
     const cleanRoom = modalRoomId.trim() || "private-room";
     const cleanKey = modalRoomKey.trim();
     const resolvedModel = resolveModelSelection({
@@ -1725,6 +1737,9 @@ export const Dashboard: React.FC = () => {
   };
 
   const handleJoinByInviteString = (): void => {
+    if (isSharing || isBusy || startInFlightRef.current) {
+      return;
+    }
     const raw = invitePasteInput.trim();
     if (!raw) return;
     const [parsedRoom, parsedKey] = raw.split("|").map((part) => part.trim());
@@ -2811,6 +2826,7 @@ export const Dashboard: React.FC = () => {
                           type="submit"
                           data-testid="confirm-private-join-btn"
                           className="native-btn native-btn-primary"
+                          disabled={isSharing || isBusy}
                         >
                           Unlock &amp; Join
                         </button>
@@ -2974,6 +2990,7 @@ export const Dashboard: React.FC = () => {
                         data-testid="modal-create-join-btn"
                         className="native-btn native-btn-primary"
                         style={{ width: "100%", padding: "8px 14px" }}
+                        disabled={isSharing || isBusy}
                       >
                         Create &amp; Start Sharing
                       </button>
@@ -3010,6 +3027,7 @@ export const Dashboard: React.FC = () => {
                           data-testid="join-by-invite-btn"
                           className="native-btn"
                           onClick={handleJoinByInviteString}
+                          disabled={isSharing || isBusy}
                         >
                           Join Unlisted
                         </button>

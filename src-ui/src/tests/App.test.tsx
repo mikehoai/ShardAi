@@ -4360,7 +4360,13 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
   it("supports ChatWindow full-window default layout and Maximize/Restore toggle with Tauri window sync", async () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     const mockedInvoke = vi.mocked(invoke);
-    mockedInvoke.mockResolvedValue(true);
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "window_is_maximized") return false;
+      if (cmd === "window_set_maximized") {
+        return Boolean((args as { maximized?: boolean } | undefined)?.maximized);
+      }
+      return true;
+    });
 
     const onClose = vi.fn();
     const { rerender } = render(
@@ -4378,26 +4384,40 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     const backdrop = screen.getByTestId("ai-chat-backdrop");
     const dialog = screen.getByTestId("ai-chat-window");
     const header = dialog.querySelector(".chat-modal-header") as HTMLElement;
+    const maximizeBtn = screen.getByTestId("chat-maximize-btn");
+    const closeBtn = screen.getByTestId("chat-close-btn");
 
-    expect(screen.queryByTestId("chat-maximize-btn")).toBeNull();
-    expect(screen.queryByTestId("chat-close-btn")).toBeNull();
+    expect(maximizeBtn.textContent).toContain("Maximize");
+    expect(maximizeBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(closeBtn.textContent).toContain("Close");
     expect(dialog.getAttribute("data-maximized")).toBe("false");
     expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(false);
     expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(false);
 
-    // Double-click header -> marks dialog & backdrop maximized and calls Tauri window_set_maximized(true)
-    fireEvent.doubleClick(header);
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized");
+    });
+
+    // Click Maximize button -> marks dialog & backdrop maximized and calls Tauri window_set_maximized(true)
+    fireEvent.click(maximizeBtn);
     expect(dialog.getAttribute("data-maximized")).toBe("true");
+    expect(maximizeBtn.textContent).toContain("Restore");
+    expect(maximizeBtn.getAttribute("aria-pressed")).toBe("true");
     expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(true);
     expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(true);
     expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: true });
 
-    // Double-click header again -> restores default size and calls window_set_maximized(false)
-    fireEvent.doubleClick(header);
+    // Click Restore button -> restores default size and calls window_set_maximized(false)
+    fireEvent.click(maximizeBtn);
     expect(dialog.getAttribute("data-maximized")).toBe("false");
+    expect(maximizeBtn.textContent).toContain("Maximize");
     expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(false);
     expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(false);
     expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+
+    // Click Close button invokes onClose cleanly
+    fireEvent.click(closeBtn);
+    expect(onClose).toHaveBeenCalledTimes(1);
 
     // Double-click header to maximize again, then closing ChatWindow restores unmaximized OS state
     fireEvent.doubleClick(header);
@@ -4744,5 +4764,170 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     const sentContent = String(sentRequests[0].messages[0].content);
     expect(sentContent).toContain("[Attached document: report.docx]");
     expect(sentContent).toContain("Quarterly roadmap from DOCX");
+  });
+
+  it("restores OS window on direct ChatWindow unmount when maximized and preserves pre-maximized OS window", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const mockedInvoke = vi.mocked(invoke);
+    let osIsMaximized = false;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "window_is_maximized") return osIsMaximized;
+      if (cmd === "window_set_maximized") {
+        return Boolean((args as { maximized?: boolean } | undefined)?.maximized);
+      }
+      return true;
+    });
+
+    // Part A: OS window starts unmaximized -> maximize ChatWindow -> unmount directly restores OS window
+    const onCloseA = vi.fn();
+    const viewA = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-unmount-a"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={onCloseA}
+      />
+    );
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized");
+    });
+
+    fireEvent.click(screen.getByTestId("chat-maximize-btn"));
+    expect(screen.getByTestId("ai-chat-window").getAttribute("data-maximized")).toBe("true");
+    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: true });
+
+    mockedInvoke.mockClear();
+    viewA.unmount();
+    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+
+    // Part B: OS window starts ALREADY maximized -> ChatWindow maximize/restore/unmount never clobbers it
+    osIsMaximized = true;
+    mockedInvoke.mockClear();
+    const onCloseB = vi.fn();
+    const viewB = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-shard-unmount-b"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={onCloseB}
+      />
+    );
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized");
+    });
+
+    const maxBtnB = screen.getByTestId("chat-maximize-btn");
+    fireEvent.click(maxBtnB);
+    fireEvent.click(maxBtnB);
+    fireEvent.click(maxBtnB);
+    viewB.unmount();
+
+    expect(mockedInvoke).not.toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+  });
+
+  it("guards private room, create room, and invite-string modal handlers against duplicate concurrent startSharing calls", async () => {
+    const mockRooms: RoomLobbyItem[] = [
+      {
+        room_id: "locked-lab",
+        model: "meta-llama/Llama-3.1-8B-Instruct",
+        nodes_online: 1,
+        total_shared_ram_gb: 8,
+        is_private: true,
+        network_scope: "internet",
+      },
+    ];
+
+    let downloadCallCount = 0;
+    const pendingDownloads: Array<() => void> = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/available-rooms")) {
+        return new Response(JSON.stringify(mockRooms), { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(JSON.stringify({ source: "default", count: 0, models: [] }), {
+          status: 200,
+        });
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({ total_ram_gb: 16, available_ram_gb: 12, max_shareable_ram_gb: 11 }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/models/download-stream")) {
+        downloadCallCount += 1;
+        await new Promise<void>((resolve) => {
+          pendingDownloads.push(resolve);
+        });
+        return new Response("data: {\"status\":\"ready\"}\n\n", {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    // 1. Rapid double submit on Private Room Key Modal triggers only 1 start flow
+    const view1 = render(<Dashboard />);
+    await waitFor(() => {
+      expect(screen.getByTestId("join-room-locked-lab")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByTestId("join-room-locked-lab"));
+    fireEvent.change(screen.getByTestId("private-room-key-input"), {
+      target: { value: "secret-123" },
+    });
+    const privateForm = screen.getByTestId("confirm-private-join-btn").closest("form") as HTMLFormElement;
+    fireEvent.submit(privateForm);
+    fireEvent.submit(privateForm);
+    await waitFor(() => {
+      expect(downloadCallCount).toBe(1);
+    });
+    pendingDownloads.shift()?.();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    view1.unmount();
+
+    // 2. Rapid double submit on Create New Room Modal triggers only 1 start flow
+    downloadCallCount = 0;
+    const view2 = render(<Dashboard />);
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    const createBtn = screen.getByTestId("modal-create-join-btn");
+    const createForm = createBtn.closest("form") as HTMLFormElement;
+    fireEvent.submit(createForm);
+    fireEvent.submit(createForm);
+    await waitFor(() => {
+      expect(downloadCallCount).toBe(1);
+    });
+    pendingDownloads.shift()?.();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    view2.unmount();
+
+    // 3. Rapid double Enter on Invite String input triggers only 1 start flow
+    downloadCallCount = 0;
+    const view3 = render(<Dashboard />);
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    const inviteInput = screen.getByTestId("paste-invite-input");
+    fireEvent.change(inviteInput, { target: { value: "studio-room | pass-99" } });
+    fireEvent.keyDown(inviteInput, { key: "Enter" });
+    fireEvent.keyDown(inviteInput, { key: "Enter" });
+    await waitFor(() => {
+      expect(downloadCallCount).toBe(1);
+    });
+    pendingDownloads.shift()?.();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    view3.unmount();
   });
 });
