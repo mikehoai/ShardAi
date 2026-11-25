@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import struct
 import sys
 import types
 from typing import Any
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 import pytest
 
@@ -25,8 +27,8 @@ from models.downloader import (
     sanitize_catalog_entry,
     select_best_mmproj_filename,
 )
-from models.shard_runner import ShardModelRunner
-from shard_engine.schemas import ChatMessage, NodeState
+from models.shard_runner import ShardModelRunner, select_llama_chat_handler
+from shard_engine.schemas import ChatMessage, NodeState, PeerNodeInfo, PeerRole
 
 client = TestClient(app)
 
@@ -508,3 +510,269 @@ def test_chat_template_list_concatenation_typeerror_surfaces_model_error() -> No
     assert body["error"]["code"] == "model_vision_not_supported"
     assert "does not support this attachment format" in body["error"]["message"]
     assert 'can only concatenate str (not "list") to str' in body["error"]["message"]
+
+
+def test_select_llama_chat_handler_maps_gemma3_mtmd_and_modern_vision_families(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`select_llama_chat_handler()` maps Gemma 3 / MTMD and modern VLM projectors accurately."""
+    mmproj_file = tmp_path / "mmproj-google_gemma-3-12b-it-f16.gguf"
+    mmproj_file.write_bytes(b"GGUF" + b"\x00" * 64)
+
+    def _make_handler_cls(name: str, *, fail_init: bool = False) -> type[Any]:
+        class _Handler:
+            handler_name = name
+
+            def __init__(self, *, clip_model_path: str, verbose: bool = True) -> None:
+                if fail_init:
+                    raise RuntimeError(f"{name} init failed")
+                self.clip_model_path = clip_model_path
+                self.verbose = verbose
+
+        _Handler.__name__ = name
+        return _Handler
+
+    fake_chat_format = types.ModuleType("llama_cpp.llama_chat_format")
+    handler_names = (
+        "MTMDChatHandler",
+        "Gemma4ChatHandler",
+        "Qwen25VLChatHandler",
+        "Llama3VisionAlphaChatHandler",
+        "MiniCPMv26ChatHandler",
+        "MoondreamChatHandler",
+        "NanoLlavaChatHandler",
+        "ObsidianChatHandler",
+        "Llava16ChatHandler",
+        "Llava15ChatHandler",
+    )
+    for cls_name in handler_names:
+        setattr(fake_chat_format, cls_name, _make_handler_cls(cls_name))
+
+    fake_llama_cpp = types.ModuleType("llama_cpp")
+    fake_llama_cpp.llama_chat_format = fake_chat_format  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
+    monkeypatch.setitem(sys.modules, "llama_cpp.llama_chat_format", fake_chat_format)
+
+    cases: list[tuple[str, str, str]] = [
+        (
+            "bartowski/google_gemma-3-12b-it-GGUF",
+            "mmproj-google_gemma-3-12b-it-f16.gguf",
+            "MTMDChatHandler",
+        ),
+        (
+            "ggml-org/gemma-4-12b-vision-GGUF",
+            "mmproj-gemma-4-f16.gguf",
+            "Gemma4ChatHandler",
+        ),
+        (
+            "meta-llama/Llama-3.2-11B-Vision-Instruct-GGUF",
+            "mmproj-llama-3.2-vision-f16.gguf",
+            "Llama3VisionAlphaChatHandler",
+        ),
+        (
+            "vikhyatk/moondream2-GGUF",
+            "moondream2-mmproj-f16.gguf",
+            "MoondreamChatHandler",
+        ),
+        (
+            "qnguyen3/nanoLLaVA-1.5-GGUF",
+            "mmproj-nanollava-f16.gguf",
+            "NanoLlavaChatHandler",
+        ),
+        (
+            "NousResearch/Obsidian-3B-V0.5-GGUF",
+            "mmproj-obsidian-f16.gguf",
+            "ObsidianChatHandler",
+        ),
+        (
+            "liuhaotian/llava-v1.6-mistral-7b-GGUF",
+            "mmproj-llava-1.6-f16.gguf",
+            "Llava16ChatHandler",
+        ),
+        (
+            "mys/ggml_llava-v1.5-7b",
+            "mmproj-model-f16.gguf",
+            "Llava15ChatHandler",
+        ),
+        (
+            "org/unclassified-vision-model-GGUF",
+            "mmproj-custom-f16.gguf",
+            "MTMDChatHandler",
+        ),
+    ]
+
+    for model_id, proj_name, expected_cls_name in cases:
+        proj_path = tmp_path / proj_name
+        if not proj_path.exists():
+            proj_path.write_bytes(b"GGUF")
+        selected = select_llama_chat_handler(model_id, str(proj_path))
+        assert selected is not None
+        assert selected.handler_name == expected_cls_name
+        assert selected.clip_model_path == str(proj_path)
+        assert selected.verbose is False
+
+    # Fallback resilience: if MTMDChatHandler initialization fails on Gemma 3,
+    # try remaining candidates cleanly without raising.
+    fake_chat_format.MTMDChatHandler = _make_handler_cls("MTMDChatHandler", fail_init=True)  # type: ignore[attr-defined]
+    fallback_selected = select_llama_chat_handler(
+        "bartowski/google_gemma-3-12b-it-GGUF",
+        str(mmproj_file),
+    )
+    assert fallback_selected is not None
+    assert fallback_selected.handler_name == "Gemma4ChatHandler"
+
+
+def test_sharded_multi_peer_vision_head_node_rejects_image_attachment_with_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Head Node in multi-peer sharded mode rejects image_url before flattening to '[image]'."""
+
+    class _HeadVisionFakeLlama:
+        def create_chat_completion(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            max_tokens: int,
+            temperature: float,
+            stream: bool,
+        ) -> Any:
+            _ = messages, max_tokens, temperature, stream
+            return iter(
+                [
+                    {"choices": [{"delta": {"content": "Sharded text reply."}, "finish_reason": None}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+
+    runner = ShardModelRunner(
+        model_id="bartowski/google_gemma-3-12b-it-GGUF",
+        shard_layer_start=0,
+        shard_layer_end=15,
+        total_layers=32,
+        n_layers=16,
+        native_handle=_HeadVisionFakeLlama(),
+    )
+    assert runner.has_vision_support is True
+    assert runner.has_native_llama is True
+
+    def _fail_if_tokenize_called(_messages: list[dict[str, Any]]) -> list[int]:
+        raise AssertionError("tokenize_chat must never be called for sharded image requests")
+
+    monkeypatch.setattr(runner, "tokenize_chat", _fail_if_tokenize_called)
+
+    runtime.state = NodeState.RUNNING
+    runtime.node_id = "vision-sharded-head"
+    runtime.model_id = "bartowski/google_gemma-3-12b-it-GGUF"
+    runtime.session_token = "sk-shard-sharded-vision"
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.n_layers = 16
+    runtime.is_swarm_ready = True
+    runtime.coverage_percent = 100.0
+    runtime.model_runner = runner
+    runtime.peers = [
+        PeerNodeInfo(
+            peer_id="vision-tail-peer",
+            ip_address="192.168.1.50",
+            port=49153,
+            shard_layer_start=16,
+            shard_layer_end=31,
+            role=PeerRole.PRIMARY,
+        )
+    ]
+
+    image_payload = {
+        "model": "bartowski/google_gemma-3-12b-it-GGUF",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this picture?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        ],
+        "max_tokens": 32,
+    }
+    headers = {"Authorization": "Bearer sk-shard-sharded-vision"}
+
+    for stream_flag in (False, True):
+        res = client.post(
+            "/v1/chat/completions",
+            json={**image_payload, "stream": stream_flag},
+            headers=headers,
+        )
+        assert res.status_code == 400
+        body = res.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["param"] == "messages"
+        assert body["error"]["code"] == "vision_sharded_mode_not_supported"
+        assert "multi-peer sharded pipeline mode" in body["error"]["message"]
+
+
+def test_tokenize_chat_and_pipeline_reject_silent_image_placeholder_flattening() -> None:
+    """Defense-in-depth guards reject image_url in tokenize_chat and sharded pipeline."""
+
+    class _DummyNativeLlama:
+        def create_chat_completion(self, **_kwargs: Any) -> Any:
+            raise AssertionError("Should not execute native chat completion in sharded pipeline guard test")
+
+    runner = ShardModelRunner(
+        model_id="bartowski/google_gemma-3-12b-it-GGUF",
+        shard_layer_start=0,
+        shard_layer_end=15,
+        total_layers=32,
+        n_layers=16,
+        native_handle=_DummyNativeLlama(),
+    )
+    image_messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="single-node native vision execution"):
+        runner.tokenize_chat(image_messages)
+
+    runtime.state = NodeState.RUNNING
+    runtime.node_id = "pipeline-guard-head"
+    runtime.model_id = "bartowski/google_gemma-3-12b-it-GGUF"
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 15
+    runtime.total_layers = 32
+    runtime.n_layers = 16
+    runtime.is_swarm_ready = True
+    runtime.coverage_percent = 100.0
+    runtime.model_runner = runner
+    runtime.peers = [
+        PeerNodeInfo(
+            peer_id="pipeline-guard-tail",
+            ip_address="192.168.1.51",
+            port=49154,
+            shard_layer_start=16,
+            shard_layer_end=31,
+            role=PeerRole.PRIMARY,
+        )
+    ]
+
+    async def _run_pipeline() -> None:
+        async for _ in runtime.stream_p2p_pipeline_tokens(
+            prompt="Describe",
+            max_tokens=8,
+            messages=image_messages,
+        ):
+            pass
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(_run_pipeline())
+
+    assert exc_info.value.status_code == 400
+    assert "single-node native vision execution" in str(exc_info.value.detail)
+    assert runtime.pending_token_queues == {}
+    assert runtime.active_request_steps == {}

@@ -72,6 +72,51 @@ def _extract_eos_token_ids(config: Any, tokenizer: Any) -> set[int]:
     return eos_ids
 
 
+_VISION_CHAT_HANDLER_FAMILIES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("qwen2.5-vl", "qwen2_5_vl", "qwen2.5_vl", "qwen25-vl", "qwen2-vl", "qwen2_vl", "qwen-vl", "qwen_vl"),
+        ("Qwen25VLChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("gemma-4", "gemma4", "gemma_4"),
+        ("Gemma4ChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("gemma-3", "gemma3", "gemma_3", "gemma"),
+        ("MTMDChatHandler", "Gemma4ChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("llama-3.2", "llama3.2", "llama_3_2", "llama-3-vision", "llama3-vision", "mllama"),
+        ("Llama3VisionAlphaChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("minicpm",),
+        ("MiniCPMv26ChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("moondream",),
+        ("MoondreamChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("nanollava", "nano-llava", "nano_llava"),
+        ("NanoLlavaChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("obsidian",),
+        ("ObsidianChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("llava-1.6", "llava-v1.6", "llava16", "llava_1_6"),
+        ("Llava16ChatHandler", "MTMDChatHandler", "Llava15ChatHandler"),
+    ),
+    (
+        ("llava-1.5", "llava-v1.5", "llava15", "llava"),
+        ("Llava15ChatHandler", "MTMDChatHandler"),
+    ),
+)
+_DEFAULT_VISION_CHAT_HANDLERS: tuple[str, ...] = ("MTMDChatHandler", "Llava15ChatHandler")
+
+
 def select_llama_chat_handler(model_id: str, mmproj_path: str) -> Any | None:
     """Select and instantiate the appropriate `llama_cpp` multimodal chat handler for `mmproj_path`."""
     try:
@@ -81,18 +126,11 @@ def select_llama_chat_handler(model_id: str, mmproj_path: str) -> Any | None:
         return None
 
     combined = f"{model_id} {Path(mmproj_path).name}".lower()
-    candidate_names: list[str]
-    if any(
-        token in combined
-        for token in ("qwen2.5-vl", "qwen2_5_vl", "qwen2.5_vl", "qwen25-vl", "qwen2-vl", "qwen2_vl")
-    ):
-        candidate_names = ["Qwen25VLChatHandler", "Llava15ChatHandler"]
-    elif any(token in combined for token in ("llava-1.6", "llava-v1.6", "llava16")):
-        candidate_names = ["Llava16ChatHandler", "Llava15ChatHandler"]
-    elif "minicpm" in combined:
-        candidate_names = ["MiniCPMv26ChatHandler", "Llava15ChatHandler"]
-    else:
-        candidate_names = ["Llava15ChatHandler"]
+    candidate_names: tuple[str, ...] = _DEFAULT_VISION_CHAT_HANDLERS
+    for tokens, candidates in _VISION_CHAT_HANDLER_FAMILIES:
+        if any(token in combined for token in tokens):
+            candidate_names = candidates
+            break
 
     for cls_name in candidate_names:
         handler_cls = getattr(llama_chat_format, cls_name, None)
@@ -647,6 +685,11 @@ class ShardModelRunner:
 
     def tokenize_chat(self, messages: list[dict[str, Any]]) -> list[int]:
         """Apply chat template (when available) and tokenize chat messages into token IDs."""
+        if messages_contain_image(messages):
+            raise ValueError(
+                "Multimodal image attachments require single-node native vision execution "
+                "and cannot be flattened into text-only sharded token IDs."
+            )
         text_messages: list[dict[str, str]] = [
             {
                 "role": str(m.get("role") or "user"),

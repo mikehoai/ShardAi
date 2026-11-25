@@ -1123,6 +1123,14 @@ class LocalNodeRuntime:
             return
 
         try:
+            if messages_contain_image(messages):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Multimodal image attachments require single-node native vision execution "
+                        "and cannot be routed through multi-peer sharded text tokenization."
+                    ),
+                )
             if messages and self.model_runner.is_real_model:
                 token_ids: list[int] = self.model_runner.tokenize_chat(messages)
             else:
@@ -2901,26 +2909,43 @@ async def openai_chat_completions(
     created_ts: int = int(time.time())
     served_model: str = request.model or runtime.model_id or "shardai-p2p-model"
 
-    if (
-        messages_contain_image(chat_messages)
-        and runtime.model_runner is not None
-        and not runtime.model_runner.has_vision_support
-    ):
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "error": {
-                    "message": (
-                        f"Model '{served_model}' does not support image or vision attachments "
-                        "(no vision projector loaded). Please switch to a Vision/Multimodal "
-                        "model (e.g. Qwen2.5-VL, Gemma 3 Vision, MiniCPM-V) or remove the image attachment."
-                    ),
-                    "type": "invalid_request_error",
-                    "param": "messages",
-                    "code": "model_vision_not_supported",
-                }
-            },
-        )
+    if messages_contain_image(chat_messages):
+        if runtime.model_runner is None or not runtime.model_runner.has_vision_support:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {
+                        "message": (
+                            f"Model '{served_model}' does not support image or vision attachments "
+                            "(no vision projector loaded). Please switch to a Vision/Multimodal "
+                            "model (e.g. Qwen2.5-VL, Gemma 3 Vision, MiniCPM-V) or remove the image attachment."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "messages",
+                        "code": "model_vision_not_supported",
+                    }
+                },
+            )
+        if (
+            not runtime.model_runner.has_native_llama
+            or runtime.find_next_hop_peer(runtime.shard_layer_end) is not None
+        ):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {
+                        "message": (
+                            f"Model '{served_model}' cannot process image or vision attachments while "
+                            "running in multi-peer sharded pipeline mode. Multimodal vision inference "
+                            "currently requires single-node (Solo) native GGUF execution so image embeddings "
+                            "are projected directly by the vision encoder without text-only fallback."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "messages",
+                        "code": "vision_sharded_mode_not_supported",
+                    }
+                },
+            )
 
     if request.stream:
         stream_stop_event: threading.Event = threading.Event()
