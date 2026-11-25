@@ -7,10 +7,14 @@ Parses the GGUF v2/v3 binary header key-value section to extract `<arch>.block_c
 import logging
 from pathlib import Path
 import struct
+from typing import BinaryIO
 
 logger = logging.getLogger("shardai.models.gguf_reader")
 
 _GGUF_MAGIC: bytes = b"GGUF"
+_MAX_GGUF_STRING_BYTES = 1_048_576
+_MAX_GGUF_ARRAY_ELEMENTS = 1_000_000
+_MAX_GGUF_SKIP_DEPTH = 8
 
 # GGUF metadata value type IDs (from ggml GGUF spec)
 _GGUF_TYPE_UINT8 = 0
@@ -42,38 +46,70 @@ _SCALAR_SIZES: dict[int, int] = {
 }
 
 
-def _read_gguf_string(f: object) -> str:
-    """Read a length-prefixed UTF-8 string from a binary GGUF file stream."""
-    len_bytes: bytes = f.read(8)  # type: ignore[attr-defined]
+def _read_gguf_string_length(f: BinaryIO) -> int:
+    """Read and validate the 8-byte GGUF string length prefix."""
+    len_bytes: bytes = f.read(8)
     if len(len_bytes) < 8:
         raise EOFError("Unexpected EOF reading GGUF string length")
     (str_len,) = struct.unpack("<Q", len_bytes)
-    if str_len > 1_048_576:
+    if str_len > _MAX_GGUF_STRING_BYTES:
         raise ValueError(f"Suspicious GGUF string length: {str_len}")
-    raw: bytes = f.read(str_len)  # type: ignore[attr-defined]
+    return int(str_len)
+
+
+def _read_gguf_string(f: BinaryIO) -> str:
+    """Read a length-prefixed UTF-8 string from a binary GGUF file stream."""
+    str_len = _read_gguf_string_length(f)
+    raw: bytes = f.read(str_len)
     if len(raw) < str_len:
         raise EOFError("Unexpected EOF reading GGUF string payload")
     return raw.decode("utf-8", errors="replace")
 
 
-def _skip_gguf_value(f: object, value_type: int) -> None:
+def _skip_gguf_string(f: BinaryIO) -> None:
+    """Advance file cursor past a GGUF string without decoding its payload."""
+    str_len = _read_gguf_string_length(f)
+    if str_len > 0:
+        f.seek(str_len, 1)
+
+
+def _skip_gguf_value(
+    f: BinaryIO,
+    value_type: int,
+    depth: int = 0,
+    max_depth: int = _MAX_GGUF_SKIP_DEPTH,
+) -> None:
     """Advance file cursor past an arbitrary GGUF KV metadata value."""
+    if depth > max_depth:
+        raise ValueError(f"GGUF nested value exceeds maximum recursion depth ({max_depth})")
     if value_type in _SCALAR_SIZES:
-        f.seek(_SCALAR_SIZES[value_type], 1)  # type: ignore[attr-defined]
+        f.seek(_SCALAR_SIZES[value_type], 1)
         return
     if value_type == _GGUF_TYPE_STRING:
-        _read_gguf_string(f)
+        _skip_gguf_string(f)
         return
     if value_type == _GGUF_TYPE_ARRAY:
-        hdr: bytes = f.read(12)  # type: ignore[attr-defined]
+        hdr: bytes = f.read(12)
         if len(hdr) < 12:
             raise EOFError("Unexpected EOF reading GGUF array header")
         elem_type, count = struct.unpack("<IQ", hdr)
+        if count > _MAX_GGUF_ARRAY_ELEMENTS:
+            raise ValueError(
+                f"GGUF array element count ({count}) exceeds safety cap ({_MAX_GGUF_ARRAY_ELEMENTS})"
+            )
         if elem_type in _SCALAR_SIZES:
-            f.seek(_SCALAR_SIZES[elem_type] * count, 1)  # type: ignore[attr-defined]
+            f.seek(_SCALAR_SIZES[elem_type] * count, 1)
             return
-        for _ in range(min(count, 200_000)):
-            _skip_gguf_value(f, elem_type)
+        if elem_type == _GGUF_TYPE_STRING:
+            if count > 0 and depth + 1 > max_depth:
+                raise ValueError(
+                    f"GGUF nested value exceeds maximum recursion depth ({max_depth})"
+                )
+            for _ in range(count):
+                _skip_gguf_string(f)
+            return
+        for _ in range(count):
+            _skip_gguf_value(f, elem_type, depth=depth + 1, max_depth=max_depth)
         return
     raise ValueError(f"Unknown GGUF value type: {value_type}")
 
@@ -116,16 +152,18 @@ def read_gguf_total_layers(gguf_path: Path) -> int | None:
                     )
                     size = struct.calcsize(fmt)
                     raw_val = f.read(size)
-                    if len(raw_val) == size:
-                        (block_count,) = struct.unpack(fmt, raw_val)
-                        if 1 <= block_count <= 512:
-                            logger.info(
-                                "Extracted total_model_layers=%d from GGUF metadata (%s=%d)",
-                                block_count,
-                                key,
-                                block_count,
-                            )
-                            return int(block_count)
+                    if len(raw_val) < size:
+                        break
+                    (block_count,) = struct.unpack(fmt, raw_val)
+                    if 1 <= block_count <= 512:
+                        logger.info(
+                            "Extracted total_model_layers=%d from GGUF metadata (%s=%d)",
+                            block_count,
+                            key,
+                            block_count,
+                        )
+                        return int(block_count)
+                    continue
 
                 _skip_gguf_value(f, val_type)
     except Exception as exc:
