@@ -875,7 +875,11 @@ class LocalNodeRuntime:
                 ),
             )
 
-    def validate_pipeline_preflight(self) -> None:
+    def validate_pipeline_preflight(
+        self,
+        *,
+        has_image_attachments: bool = False,
+    ) -> None:
         """Validate node readiness, Head Node role, and downstream peer availability before streaming.
 
         Must be called prior to returning a `StreamingResponse` so HTTP 400 / 422 / 503 errors
@@ -906,7 +910,8 @@ class LocalNodeRuntime:
         next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
             self.shard_layer_end
         )
-        self._raise_if_unsupported_gguf_sharding(next_peer_initial)
+        if not has_image_attachments:
+            self._raise_if_unsupported_gguf_sharding(next_peer_initial)
         if (
             self.shard_layer_end < (self.total_layers - 1)
             and next_peer_initial is None
@@ -1126,18 +1131,20 @@ class LocalNodeRuntime:
         stop_event: threading.Event | None = None,
     ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
         """Execute distributed P2P pipeline inference and yield `(request_id, step, token_id, text, is_eos)`."""
-        self.validate_pipeline_preflight()
+        has_images: bool = messages_contain_image(messages)
+        self.validate_pipeline_preflight(has_image_attachments=has_images)
         assert self.model_runner is not None
+
+        next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
+            self.shard_layer_end
+        )
+        if not has_images:
+            self._raise_if_unsupported_gguf_sharding(next_peer_initial)
 
         request_id: str = str(uuid.uuid4())
         token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue(maxsize=64)
         self.pending_token_queues[request_id] = token_queue
         self.active_request_steps[request_id] = 0
-
-        next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
-            self.shard_layer_end
-        )
-        self._raise_if_unsupported_gguf_sharding(next_peer_initial)
         if self.model_runner.has_native_llama and next_peer_initial is None:
             try:
                 async with aclosing(
@@ -3043,18 +3050,20 @@ async def openai_chat_completions(
     if not runtime.is_swarm_ready:
         return _build_swarm_not_ready_response()
 
-    # Validate Head Node role & downstream peer availability BEFORE committing HTTP 200 SSE
-    runtime.validate_pipeline_preflight()
-
     prompt_text: str = _extract_prompt_from_messages(request.messages)
     chat_messages: list[dict[str, Any]] = _extract_chat_messages_dicts(request.messages)
+    has_images: bool = messages_contain_image(chat_messages)
+
+    # Validate Head Node role & downstream peer availability BEFORE committing HTTP 200 SSE
+    runtime.validate_pipeline_preflight(has_image_attachments=has_images)
+
     max_tokens: int = request.max_tokens or 256
     temperature: float = request.temperature if request.temperature is not None else 0.7
     completion_id: str = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created_ts: int = int(time.time())
     served_model: str = request.model or runtime.model_id or "shardai-p2p-model"
 
-    if messages_contain_image(chat_messages):
+    if has_images:
         if runtime.model_runner is None or not runtime.model_runner.has_vision_support:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,

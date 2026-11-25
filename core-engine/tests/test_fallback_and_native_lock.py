@@ -582,6 +582,7 @@ async def test_compute_lock_serializes_native_stream_with_incoming_activation(
 
     monkeypatch.setattr(runner, "forward_pass", _fake_forward_pass)
     monkeypatch.setattr(runner, "decode_final_layer_to_token", _fake_decode)
+    monkeypatch.setattr(runner, "_is_real_pytorch", True)
     node.model_runner = runner
 
     sent_packets: list[bytes] = []
@@ -714,6 +715,7 @@ async def test_compute_lock_serializes_p2p_pipeline_and_releases_during_network_
     monkeypatch.setattr(runner, "tokenize", lambda _prompt: [1, 2, 3])
     monkeypatch.setattr(runner, "forward_pass", _fake_forward_pass)
     monkeypatch.setattr(runner, "decode_final_layer_to_token", _fake_decode)
+    monkeypatch.setattr(runner, "_is_real_pytorch", True)
     node.model_runner = runner
 
     monkeypatch.setattr(main_module, "send_activations", AsyncMock())
