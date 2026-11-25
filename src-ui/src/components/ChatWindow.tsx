@@ -268,6 +268,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [chatError, setChatError] = useState<string | null>(null);
 
   const isMountedRef = useRef<boolean>(true);
+  const extractionSessionRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const onCloseRef = useRef<() => void>(onClose);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -336,6 +337,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      extractionSessionRef.current += 1;
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
@@ -356,6 +358,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       return;
     }
     prevModelSessionRef.current = { modelId, sessionToken };
+    extractionSessionRef.current += 1;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -378,6 +381,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       }
       return;
     }
+    extractionSessionRef.current += 1;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -460,15 +464,23 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       return;
     }
 
+    const sessionGen = extractionSessionRef.current;
+    const isStaleSession = (): boolean =>
+      !isMountedRef.current || extractionSessionRef.current !== sessionGen;
+
     const nextItems: ChatAttachmentItem[] = [];
+    const errors: string[] = [];
     for (const file of files) {
+      if (isStaleSession()) {
+        return;
+      }
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        setChatError(`File "${file.name}" exceeds the 50 MB attachment limit.`);
+        errors.push(`File "${file.name}" exceeds the 50 MB attachment limit.`);
         continue;
       }
       const kind = classifyAttachmentKind(file);
       if (kind === null) {
-        setChatError(
+        errors.push(
           `Unsupported file type for "${file.name}". Supported: documents, images, and videos.`
         );
         continue;
@@ -477,6 +489,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       try {
         if (kind === "image") {
           const dataUrl = await readFileAsDataUrl(file);
+          if (isStaleSession()) {
+            return;
+          }
           nextItems.push({
             id: createMessageId("att"),
             name: file.name,
@@ -487,6 +502,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           });
         } else if (kind === "video") {
           const keyframeUrl = await extractVideoKeyframe(file);
+          if (isStaleSession()) {
+            return;
+          }
           nextItems.push({
             id: createMessageId("att"),
             name: file.name,
@@ -497,6 +515,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           });
         } else {
           const textContent = await extractDocumentText(file, MAX_DOC_TEXT_CHARS);
+          if (isStaleSession()) {
+            return;
+          }
           nextItems.push({
             id: createMessageId("att"),
             name: file.name,
@@ -507,14 +528,25 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           });
         }
       } catch (err: unknown) {
+        if (isStaleSession()) {
+          return;
+        }
         const detail = err instanceof Error ? err.message : String(err);
-        setChatError(detail);
+        errors.push(detail);
       }
     }
 
-    if (nextItems.length > 0 && isMountedRef.current) {
-      setChatError(null);
+    if (isStaleSession()) {
+      return;
+    }
+
+    if (nextItems.length > 0) {
       setAttachments((prev) => [...prev, ...nextItems]);
+    }
+    if (errors.length > 0) {
+      setChatError(errors.join(" "));
+    } else if (nextItems.length > 0) {
+      setChatError(null);
     }
   };
 
@@ -580,6 +612,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   };
 
   const handleClearChat = (): void => {
+    extractionSessionRef.current += 1;
     handleStopGeneration();
     setMessages([]);
     setAttachments([]);

@@ -1675,13 +1675,9 @@ export const Dashboard: React.FC = () => {
     });
   };
 
-  const handleCreateOrJoinUnlisted = (event: React.FormEvent): void => {
-    event.preventDefault();
-    if (isSharing || isBusy || startInFlightRef.current) {
-      return;
-    }
-    const cleanRoom = modalRoomId.trim() || "private-room";
-    const cleanKey = modalRoomKey.trim();
+  const resolveAndSyncModalModelSelection = (): ReturnType<
+    typeof resolveModelSelection
+  > | null => {
     const resolvedModel = resolveModelSelection({
       modelTab: modalModelTab,
       catalogModels,
@@ -1697,7 +1693,7 @@ export const Dashboard: React.FC = () => {
           ? "Please browse or enter a valid local .gguf file path."
           : "Please select a catalog model or enter a HuggingFace Repo ID / Direct URL."
       );
-      return;
+      return null;
     }
 
     // Sync chosen room model configuration back to main Node & Model Configuration panel
@@ -1717,6 +1713,21 @@ export const Dashboard: React.FC = () => {
     } else {
       setModelInput(resolvedModel.model);
       setCustomFilename(modalCustomFilename.trim());
+    }
+
+    return resolvedModel;
+  };
+
+  const handleCreateOrJoinUnlisted = (event: React.FormEvent): void => {
+    event.preventDefault();
+    if (isSharing || isBusy || startInFlightRef.current) {
+      return;
+    }
+    const cleanRoom = modalRoomId.trim() || "private-room";
+    const cleanKey = modalRoomKey.trim();
+    const resolvedModel = resolveAndSyncModalModelSelection();
+    if (!resolvedModel) {
+      return;
     }
 
     setErrorMessage(null);
@@ -1745,16 +1756,21 @@ export const Dashboard: React.FC = () => {
     const [parsedRoom, parsedKey] = raw.split("|").map((part) => part.trim());
     if (!parsedRoom) return;
 
-    const activeSelection = resolveActiveModelSelection();
+    const resolvedModel = resolveAndSyncModalModelSelection();
+    if (!resolvedModel) {
+      return;
+    }
+
+    setErrorMessage(null);
     setShowRoomModal(false);
     setRoomId(parsedRoom);
     setRoomKey(parsedKey ?? "");
     setIsUnlisted(true);
     void startSharingWithConfig({
-      model: activeSelection.model,
-      sourceType: activeSelection.sourceType,
-      filename: activeSelection.filename,
-      mmprojFilename: activeSelection.mmprojFilename,
+      model: resolvedModel.model,
+      sourceType: resolvedModel.sourceType,
+      filename: resolvedModel.filename,
+      mmprojFilename: resolvedModel.mmprojFilename,
       room: parsedRoom,
       key: parsedKey ?? "",
       unlisted: true,

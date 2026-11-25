@@ -12,6 +12,7 @@ import {
   orderRoomsForSession,
 } from "../components/Dashboard";
 import { ChatWindow } from "../components/ChatWindow";
+import { extractDocumentText } from "../utils/documentExtractor";
 import {
   extractApiErrorDetail,
   normalizeNoticeToEnglish,
@@ -4929,5 +4930,348 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       await Promise.resolve();
     });
     view3.unmount();
+  });
+
+  it("stops scanning PDF pages at maxChars and invokes page.cleanup() in try/finally", async () => {
+    const mockedGetDocument = vi.mocked(pdfjsLib.getDocument);
+    const getPageMock = vi.fn(async (pageNum: number) => ({
+      getTextContent: async () => ({
+        items: [{ str: `Page-${pageNum}-` + "X".repeat(50) }],
+      }),
+      cleanup: vi.fn(),
+    }));
+    const docCleanupMock = vi.fn(async () => {});
+    const destroyMock = vi.fn(async () => {});
+
+    mockedGetDocument.mockReturnValueOnce({
+      promise: Promise.resolve({
+        numPages: 5,
+        getPage: getPageMock,
+        cleanup: docCleanupMock,
+      }),
+      destroy: destroyMock,
+    } as unknown as ReturnType<typeof pdfjsLib.getDocument>);
+
+    const pdfFile = new File(["%PDF-1.4"], "long-book.pdf", {
+      type: "application/pdf",
+    });
+    const extracted = await extractDocumentText(pdfFile, 100);
+
+    expect(getPageMock).toHaveBeenCalledTimes(2);
+    expect(getPageMock).toHaveBeenNthCalledWith(1, 1);
+    expect(getPageMock).toHaveBeenNthCalledWith(2, 2);
+
+    const page1 = await getPageMock.mock.results[0].value;
+    const page2 = await getPageMock.mock.results[1].value;
+    expect(page1.cleanup).toHaveBeenCalledTimes(1);
+    expect(page2.cleanup).toHaveBeenCalledTimes(1);
+    expect(docCleanupMock).toHaveBeenCalledTimes(1);
+    expect(destroyMock).toHaveBeenCalledTimes(1);
+    expect(extracted).toContain("...[truncated to fit model context]");
+
+    // Verify page.cleanup() still runs inside try/finally when getTextContent() fails
+    const failingPageCleanup = vi.fn();
+    const failingDocCleanup = vi.fn(async () => {});
+    const failingDestroy = vi.fn(async () => {});
+    mockedGetDocument.mockReturnValueOnce({
+      promise: Promise.resolve({
+        numPages: 2,
+        getPage: async () => ({
+          getTextContent: async () => {
+            throw new Error("corrupt page stream");
+          },
+          cleanup: failingPageCleanup,
+        }),
+        cleanup: failingDocCleanup,
+      }),
+      destroy: failingDestroy,
+    } as unknown as ReturnType<typeof pdfjsLib.getDocument>);
+
+    await expect(extractDocumentText(pdfFile, 100)).rejects.toThrow("corrupt page stream");
+    expect(failingPageCleanup).toHaveBeenCalledTimes(1);
+    expect(failingDocCleanup).toHaveBeenCalledTimes(1);
+    expect(failingDestroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves batch attachment errors alongside valid files and drops stale extractions on close or session switch", async () => {
+    vi.spyOn(mammoth, "extractRawText").mockResolvedValue({
+      value: "Valid batch document text",
+      messages: [],
+    });
+
+    const { rerender } = render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-batch-1"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={vi.fn()}
+      />
+    );
+
+    // Mixed batch: failing .doc + valid .docx -> valid file attaches AND error banner remains visible
+    const badDoc = new File(["legacy"], "broken.doc", { type: "application/msword" });
+    const goodDocx = new File(["PK\x03\x04"], "notes.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [badDoc, goodDocx] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-attachments-bar").textContent).toContain("notes.docx");
+      expect(screen.getByTestId("chat-error-banner").textContent).toContain(
+        'Cannot read legacy binary .doc file "broken.doc"'
+      );
+    });
+
+    // Clear attachment before testing stale extraction guards
+    fireEvent.click(screen.getByTestId("chat-clear-btn"));
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+    expect(screen.queryByTestId("chat-error-banner")).toBeNull();
+
+    // Case A: Closing ChatWindow invalidates in-flight extraction
+    let resolveSlowClose: ((val: { value: string; messages: [] }) => void) | undefined;
+    const slowCloseSpy = vi.spyOn(mammoth, "extractRawText").mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSlowClose = resolve;
+        })
+    );
+    const slowDocx1 = new File(["PK\x03\x04"], "stale-on-close.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [slowDocx1] },
+    });
+
+    await waitFor(() => {
+      expect(slowCloseSpy).toHaveBeenCalledTimes(1);
+    });
+
+    rerender(
+      <ChatWindow
+        isOpen={false}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-batch-1"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={vi.fn()}
+      />
+    );
+
+    await act(async () => {
+      resolveSlowClose?.({ value: "Should be ignored after close", messages: [] });
+    });
+
+    rerender(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-batch-1"
+        modelId="Qwen/Qwen2.5-7B-Instruct"
+        onClose={vi.fn()}
+      />
+    );
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+
+    // Case B: Switching modelId/sessionToken invalidates in-flight extraction
+    let rejectSlowSwitch: ((reason: Error) => void) | undefined;
+    const slowSwitchSpy = vi.spyOn(mammoth, "extractRawText").mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectSlowSwitch = reject;
+        })
+    );
+    const slowDocx2 = new File(["PK\x03\x04"], "stale-on-switch.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    fireEvent.change(screen.getByTestId("chat-file-input"), {
+      target: { files: [slowDocx2] },
+    });
+
+    await waitFor(() => {
+      expect(slowSwitchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    rerender(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-batch-2"
+        modelId="meta-llama/Llama-3.1-8B-Instruct"
+        onClose={vi.fn()}
+      />
+    );
+
+    await act(async () => {
+      rejectSlowSwitch?.(new Error("Stale extraction failure"));
+    });
+
+    expect(screen.queryByTestId("chat-error-banner")).toBeNull();
+    expect(screen.queryByTestId("chat-attachments-bar")).toBeNull();
+  });
+
+  it("resolves modal model selection and syncs it back for handleJoinByInviteString", async () => {
+    const catalogItems: CatalogModelItem[] = [
+      {
+        id: "llama3",
+        name: "Llama 3.1 8B",
+        repo_id: "meta-llama/Llama-3.1-8B-Instruct",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        estimated_ram_gb: 6,
+        enabled: true,
+      },
+      {
+        id: "qwen7b",
+        name: "Qwen 2.5 7B",
+        repo_id: "Qwen/Qwen2.5-7B-Instruct",
+        filename: "qwen2.5-7b-q4_k_m.gguf",
+        estimated_ram_gb: 5,
+        enabled: true,
+      },
+    ];
+
+    const startPayloads: StartNodeRequest[] = [];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: catalogItems.length,
+            models: catalogItems,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response("[]", { status: 200 });
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/rooms/check-join")) {
+        return new Response(
+          JSON.stringify({ allowed: true, room_id: "modal-invite-room", message: "OK" }),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/download-stream")) {
+        const encoder = new TextEncoder();
+        const doneStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        });
+        return new Response(doneStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/start-node") && init?.body) {
+        const parsed = JSON.parse(String(init.body)) as StartNodeRequest;
+        startPayloads.push(parsed);
+        const statusResp: NodeStatusResponse = {
+          state: "RUNNING",
+          node_id: parsed.node_id,
+          model_id: parsed.model_id,
+          network_mode: parsed.network_mode,
+          room_id: parsed.room_id,
+          is_private: Boolean(parsed.room_key),
+          is_unlisted: Boolean(parsed.is_unlisted),
+          backend: parsed.backend,
+          n_layers: 32,
+          total_layers: 32,
+          allocated_ram_mb: parsed.max_ram_mb,
+          allocated_vram_mb: parsed.max_vram_mb,
+          p2p_listen_port: parsed.p2p_listen_port,
+          connected_peers_count: 1,
+          peers: [],
+          session_token: "sk-modal-invite",
+          api_base_url: "http://127.0.0.1:8000/v1",
+          coverage_percent: 100,
+          is_swarm_ready: true,
+          network_status: "online",
+          message: "Active",
+        };
+        return new Response(JSON.stringify(statusResp), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+
+    render(<Dashboard />);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("catalog-model-select") as HTMLSelectElement).disabled
+      ).toBe(false);
+    });
+
+    // Main panel starts on Catalog tab (llama3); switch model INSIDE modal to Local File
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    fireEvent.click(screen.getByTestId("modal-tab-local"));
+    fireEvent.change(screen.getByTestId("paste-invite-input"), {
+      target: { value: "modal-invite-room | modal-pass" },
+    });
+
+    // Empty modal local path must reject without starting node or closing modal
+    fireEvent.click(screen.getByTestId("join-by-invite-btn"));
+    expect(startPayloads).toHaveLength(0);
+    expect(screen.getByTestId("create-room-modal")).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("valid local .gguf file path");
+
+    // Fill modal local path and join via invite string
+    fireEvent.change(screen.getByTestId("modal-local-file-input"), {
+      target: { value: "C:/models/modal-invite.gguf" },
+    });
+    fireEvent.click(screen.getByTestId("join-by-invite-btn"));
+
+    await waitFor(() => {
+      expect(startPayloads).toHaveLength(1);
+    });
+    expect(startPayloads[0]).toMatchObject({
+      model_id: "C:/models/modal-invite.gguf",
+      source_type: "local_file",
+      filename: null,
+      room_id: "modal-invite-room",
+      room_key: "modal-pass",
+      is_unlisted: true,
+    });
+    // Main panel synced back to Local File tab with the modal's path
+    expect((screen.getByTestId("local-file-input") as HTMLInputElement).value).toBe(
+      "C:/models/modal-invite.gguf"
+    );
   });
 });
