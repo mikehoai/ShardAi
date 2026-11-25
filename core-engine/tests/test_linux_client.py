@@ -11,11 +11,12 @@ from typing import Any
 
 import httpx
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from models.downloader import resolve_default_cache_dir
 from p2p.mdns_discovery import _list_local_ipv4_addresses
-from shard_engine.cli import cli_app
+from shard_engine.cli import _make_http_client, build_engine_base_url, cli_app
 from shard_engine.linux_env import (
     ALL_CLI_SUBCOMMANDS,
     clear_daemon_pid,
@@ -456,3 +457,144 @@ def test_linux_packaging_lf_line_endings_security_and_ci() -> None:
         # Zero Vietnamese diacritics (all non-ASCII letters checked carefully)
         non_ascii = [ch for ch in content if ord(ch) > 127 and ch.isalpha()]
         assert not non_ascii, f"Non-ASCII letters found in {doc_or_code}: {non_ascii[:5]}"
+
+
+def test_build_engine_base_url_rejects_non_loopback_api_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--api-url must reject non-loopback hostnames and non-HTTP(S) schemes before any HTTP request."""
+    assert build_engine_base_url(api_url="http://127.0.0.1:8000/v1") == "http://127.0.0.1:8000"
+    assert build_engine_base_url(api_url="http://localhost:8080/") == "http://localhost:8080"
+    assert build_engine_base_url(api_url="http://[::1]:8000/v1") == "http://[::1]:8000"
+
+    for invalid_url in (
+        "https://evil.example:8000",
+        "http://192.168.1.50:8000",
+        "http://0.0.0.0:8000",
+        "http://127.0.0.1@evil.example:8000",
+        "ftp://127.0.0.1:8000",
+        "http://:8000",
+    ):
+        with pytest.raises(typer.BadParameter):
+            build_engine_base_url(api_url=invalid_url)
+
+    called_urls: list[str] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        called_urls.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr("shard_engine.cli._http_transport_override", httpx.MockTransport(mock_handler))
+    for subcmd in (["status", "--api-url", "https://evil.example:8000"], ["chat", "Hi", "--api-url", "http://192.168.1.50:8000"]):
+        res = runner.invoke(cli_app, subcmd)
+        assert res.exit_code != 0
+        assert not called_urls
+
+
+def test_make_http_client_scopes_local_token_to_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X-ShardAi-Local-Token must only be attached and transmitted for loopback targets."""
+    monkeypatch.setenv("SHARDAI_LOCAL_TOKEN", "ipc-secret-local-token")
+    timeout = httpx.Timeout(timeout=5.0, connect=2.0)
+
+    captured: list[tuple[str, str | None]] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        captured.append((str(request.url), request.headers.get("X-ShardAi-Local-Token")))
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(mock_handler)
+
+    for loopback_url in ("http://127.0.0.1:8000", "http://localhost:8000", "http://[::1]:8000"):
+        with _make_http_client(timeout=timeout, transport=transport, base_url=loopback_url) as client:
+            assert client.headers.get("X-ShardAi-Local-Token") == "ipc-secret-local-token"
+            client.get(f"{loopback_url}/health")
+
+    for non_loopback_url in (None, "https://evil.example:8000", "http://192.168.1.25:8000"):
+        with _make_http_client(timeout=timeout, transport=transport, base_url=non_loopback_url) as client:
+            assert "X-ShardAi-Local-Token" not in client.headers
+            target = non_loopback_url or "https://evil.example:8000"
+            client.get(f"{target}/health")
+
+    # Even a loopback-configured client must strip the local token if directed to a non-loopback URL.
+    with _make_http_client(timeout=timeout, transport=transport, base_url="http://127.0.0.1:8000") as client:
+        client.get("https://evil.example:8000/leak")
+
+    assert captured == [
+        ("http://127.0.0.1:8000/health", "ipc-secret-local-token"),
+        ("http://localhost:8000/health", "ipc-secret-local-token"),
+        ("http://[::1]:8000/health", "ipc-secret-local-token"),
+        ("https://evil.example:8000/health", None),
+        ("https://evil.example:8000/health", None),
+        ("http://192.168.1.25:8000/health", None),
+        ("https://evil.example:8000/leak", None),
+    ]
+
+
+def test_chat_rejects_non_loopback_status_api_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """shardai chat must reject non-loopback api_base_url from /status before sending Bearer tokens."""
+    seen_requests: list[tuple[str, str | None]] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append((str(request.url), request.headers.get("Authorization")))
+        if request.url.path == "/status":
+            return httpx.Response(
+                200,
+                json={
+                    "state": "RUNNING",
+                    "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "api_base_url": "https://attacker.example:8000/v1",
+                    "session_token": "sk-shard-secret-bearer",
+                    "is_swarm_ready": True,
+                    "coverage_percent": 100.0,
+                },
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "should not send"}}]})
+
+    monkeypatch.setattr("shard_engine.cli._http_transport_override", httpx.MockTransport(mock_handler))
+
+    res = runner.invoke(cli_app, ["chat", "Hi", "--no-stream"])
+    assert res.exit_code == 1
+    assert "loopback" in res.output.lower()
+    assert seen_requests == [("http://127.0.0.1:8000/status", None)]
+
+
+def test_chat_accepts_loopback_status_api_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """shardai chat accepts valid loopback api_base_url values from /status."""
+    seen_requests: list[tuple[str, str | None]] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append((str(request.url), request.headers.get("Authorization")))
+        if request.url.path == "/status":
+            return httpx.Response(
+                200,
+                json={
+                    "state": "RUNNING",
+                    "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "api_base_url": "http://localhost:8000/v1",
+                    "session_token": "sk-shard-secret-bearer",
+                    "is_swarm_ready": True,
+                    "coverage_percent": 100.0,
+                },
+            )
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "Local loopback ok"}}]},
+            )
+        return httpx.Response(404)
+
+    monkeypatch.setattr("shard_engine.cli._http_transport_override", httpx.MockTransport(mock_handler))
+
+    res = runner.invoke(cli_app, ["chat", "Hi", "--no-stream", "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["choices"][0]["message"]["content"] == "Local loopback ok"
+    assert seen_requests == [
+        ("http://127.0.0.1:8000/status", None),
+        ("http://localhost:8000/v1/chat/completions", "Bearer sk-shard-secret-bearer"),
+    ]
