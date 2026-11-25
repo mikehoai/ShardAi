@@ -1207,3 +1207,66 @@ async def test_post_announce_task_cancellation_unregisters_zombie_node(
     assert runtime.p2p_server is None
     assert runtime.node_id is None
     assert not runtime.get_lifecycle_lock().locked()
+
+
+@pytest.mark.asyncio
+async def test_build_heartbeat_request_clamps_low_allocated_ram_to_min_two_gb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback heartbeat builder clamps `ram_gb`/`shared_ram_gb` to `StartNodeRequest` bounds."""
+    _enable_tracker(monkeypatch)
+    runtime._active_start_request = None
+    runtime.state = NodeState.RUNNING
+    runtime.network_status = NetworkStatus.ONLINE
+    runtime.node_id = "hb-low-ram-node"
+    runtime.model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    runtime.room_id = "hb-low-ram-room"
+    runtime.p2p_listen_port = 49415
+    runtime.shard_layer_start = 0
+    runtime.shard_layer_end = 31
+    runtime.total_layers = 32
+    runtime._last_heartbeat_at = 0.0
+
+    for allocated_mb in (0, 256, 512, 1024):
+        runtime.memory_manager._allocated_ram_mb = allocated_mb
+        hb_req = runtime._build_heartbeat_request()
+        assert hb_req is not None
+        assert hb_req.ram_gb == 2
+        assert hb_req.shared_ram_gb == 2
+        assert hb_req.max_ram_mb == 2048
+
+    runtime.memory_manager._allocated_ram_mb = 2560
+    hb_mid = runtime._build_heartbeat_request()
+    assert hb_mid is not None
+    assert hb_mid.ram_gb == 3
+    assert hb_mid.shared_ram_gb == 3
+    assert hb_mid.max_ram_mb == 3072
+
+    runtime.memory_manager._allocated_ram_mb = 300_000
+    hb_high = runtime._build_heartbeat_request()
+    assert hb_high is not None
+    assert hb_high.ram_gb == 256
+    assert hb_high.shared_ram_gb == 256
+    assert hb_high.max_ram_mb == 256 * 1024
+
+    runtime.memory_manager._allocated_ram_mb = 512
+    posted_payloads: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/announce":
+            posted_payloads.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "assigned_start_layer": 0,
+                    "assigned_end_layer": 31,
+                    "role": "primary",
+                    "peers": [],
+                },
+            )
+        return httpx.Response(status_code=200, json={"peers": []})
+
+    runtime.tracker_client = _make_mock_tracker(_handler)
+    assert await runtime.maybe_send_tracker_heartbeat(force=True) is True
+    assert len(posted_payloads) == 1
+    assert posted_payloads[0]["ram_gb"] == 2

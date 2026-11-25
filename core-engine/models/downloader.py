@@ -1432,10 +1432,21 @@ class ModelDownloader:
                                     total_bytes = parsed_len
                             except ValueError:
                                 total_bytes = 0
+                        invalid_magic = False
+                        header_prefix = bytearray()
+                        header_verified = False
                         with part_path.open("wb") as handle:
-                            async for chunk in response.aiter_bytes(chunk_size=1_048_576):
+                            async for chunk in response.aiter_bytes():
                                 if not chunk:
                                     continue
+                                if not header_verified:
+                                    needed = len(GGUF_MAGIC) - len(header_prefix)
+                                    header_prefix.extend(chunk[:needed])
+                                    if bytes(header_prefix) != GGUF_MAGIC[: len(header_prefix)]:
+                                        invalid_magic = True
+                                        break
+                                    if len(header_prefix) == len(GGUF_MAGIC):
+                                        header_verified = True
                                 handle.write(chunk)
                                 downloaded += len(chunk)
                                 now = time.monotonic()
@@ -1456,6 +1467,12 @@ class ModelDownloader:
                                             message=f"Downloading {target_path.name} ({pct:.1f}%)...",
                                         )
                                     )
+                        if invalid_magic:
+                            await response.aclose()
+                            raise ValueError(
+                                f"Downloaded file '{target_path.name}' is not a valid GGUF binary "
+                                "(missing 4-byte GGUF magic header)."
+                            )
                         break
             if total_bytes > 0 and downloaded != total_bytes:
                 raise RuntimeError(
