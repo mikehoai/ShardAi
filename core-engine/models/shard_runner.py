@@ -14,7 +14,6 @@ Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
 from array import array
 from collections import OrderedDict
 from collections.abc import Iterator
-import ctypes
 from dataclasses import dataclass, field
 import gc
 import json
@@ -241,6 +240,11 @@ class ShardModelRunner:
     def has_native_llama(self) -> bool:
         """Return True when llama_cpp.Llama native engine is loaded."""
         return self._native_handle is not None
+
+    @property
+    def supports_pipeline_sharding(self) -> bool:
+        """Return True when this runner supports multi-node hidden-state layer sharding."""
+        return self._is_real_pytorch
 
     @property
     def has_vision_support(self) -> bool:
@@ -503,7 +507,6 @@ class ShardModelRunner:
                 "model_path": gguf_path,
                 "n_gpu_layers": n_layers,
                 "n_ctx": 4096 if use_vision_projector else 2048,
-                "embeddings": True,
                 # use_mmap=True -> pages missing weights from SSD (Disk Offload, no OOM);
                 # use_mlock must stay False so the OS is free to evict mapped pages.
                 "use_mmap": self.use_mmap,
@@ -829,6 +832,13 @@ class ShardModelRunner:
                 out_f32 = hidden_states.squeeze(0).to(torch.float32).contiguous()
                 return out_f32.numpy().tobytes(), (int(out_f32.shape[0]), int(out_f32.shape[1]))
 
+        if self._native_handle is not None and not self.supports_pipeline_sharding:
+            raise RuntimeError(
+                "Distributed hidden-state forward_pass is not supported for GGUF "
+                "(llama_cpp) models. Distributed layer sharding requires Safetensors/PyTorch "
+                "weights or single-node GGUF execution."
+            )
+
         # Simulation / Fallback Path (offline unit tests without physical weights)
         if isinstance(input_data, list):
             raw_bytes, tensor_shape = self.embed_tokens_to_raw_tensor(input_data)
@@ -840,20 +850,6 @@ class ShardModelRunner:
                 total_floats = len(raw_bytes) // 4
                 seq_len = max(1, total_floats // self.hidden_dim)
                 tensor_shape = (seq_len, self.hidden_dim)
-
-        if self._native_handle is not None and hasattr(self._native_handle, "_ctx"):
-            ctx_ptr = getattr(self._native_handle._ctx, "ctx", None)
-            if ctx_ptr is not None:
-                try:
-                    import llama_cpp  # type: ignore[import-not-found]
-
-                    embd_ptr = llama_cpp.llama_get_embeddings(ctx_ptr)
-                    if embd_ptr:
-                        num_bytes = tensor_shape[0] * tensor_shape[1] * ctypes.sizeof(ctypes.c_float)
-                        extracted: bytes = ctypes.string_at(embd_ptr, num_bytes)
-                        return extracted, tensor_shape
-                except Exception as exc:
-                    logger.debug("Fallback from native llama_cpp embedding pointer: %s", exc)
 
         buf = bytearray(raw_bytes)
         if len(buf) >= 16:
@@ -945,6 +941,13 @@ class ShardModelRunner:
                     self.release_request_cache(request_id)
 
                 return token_id, token_text, is_eos
+
+        if self._native_handle is not None:
+            raise RuntimeError(
+                "Distributed hidden-state token decoding is not supported for GGUF "
+                "(llama_cpp) models. Distributed layer sharding requires Safetensors/PyTorch "
+                "weights or single-node GGUF execution."
+            )
 
         raise RuntimeError(
             "Model weights are not loaded for inference. Please reload the model and try again."

@@ -42,11 +42,19 @@ class FakeNativeLlama:
         return None
 
 
+class _MockShardModelRunner(ShardModelRunner):
+    """Test-only ShardModelRunner allowing mock P2P hidden-state simulation."""
+
+    @property
+    def supports_pipeline_sharding(self) -> bool:
+        return True
+
+
 def make_mock_runner(**kwargs: Any) -> ShardModelRunner:
     """Create a `ShardModelRunner` backed by `FakeNativeLlama` and a test decoder stub."""
     kwargs.pop("model_path", None)
     kwargs.setdefault("native_handle", FakeNativeLlama())
-    runner = ShardModelRunner(**kwargs)
+    runner = _MockShardModelRunner(**kwargs)
 
     def _test_decode(
         hidden_state_bytes: bytes,
