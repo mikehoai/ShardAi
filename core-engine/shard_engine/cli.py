@@ -183,6 +183,29 @@ def validate_loopback_host(host: str) -> str:
     return cleaned
 
 
+def _validate_loopback_url(url: str, label: str = "URL") -> str:
+    """Validate that an HTTP(S) URL targets a strictly loopback hostname."""
+    cleaned = url.strip().rstrip("/")
+    parsed = urlparse(cleaned)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise typer.BadParameter(
+            f"{label} must begin with http:// or https://; got '{url}'."
+        )
+    validate_loopback_host(parsed.hostname or "")
+    return cleaned
+
+
+def _is_loopback_url(url: str | None) -> bool:
+    """Return True when `url` is an http(s) URL whose hostname is strictly loopback."""
+    if not url or not url.strip():
+        return False
+    try:
+        _validate_loopback_url(url)
+        return True
+    except typer.BadParameter:
+        return False
+
+
 def build_engine_base_url(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
@@ -190,11 +213,7 @@ def build_engine_base_url(
 ) -> str:
     """Resolve the local core-engine HTTP base URL from `--api-url` or `--host`/`--port`."""
     if api_url is not None and api_url.strip():
-        cleaned = api_url.strip().rstrip("/")
-        if not (cleaned.startswith("http://") or cleaned.startswith("https://")):
-            raise typer.BadParameter(
-                f"--api-url must begin with http:// or https://; got '{api_url}'."
-            )
+        cleaned = _validate_loopback_url(api_url, label="--api-url")
         if cleaned.endswith("/v1"):
             cleaned = cleaned[:-3]
         return cleaned.rstrip("/")
@@ -356,17 +375,31 @@ def resolve_model_spec(
     return cleaned, ModelSourceType.HUGGINGFACE, cleaned_filename
 
 
+def _strip_local_token_on_non_loopback_request(request: httpx.Request) -> None:
+    """Ensure `X-ShardAi-Local-Token` is never transmitted to a non-loopback target."""
+    if "X-ShardAi-Local-Token" in request.headers and not _is_loopback_url(str(request.url)):
+        del request.headers["X-ShardAi-Local-Token"]
+
+
 def _make_http_client(
     timeout: httpx.Timeout,
     transport: httpx.BaseTransport | None = None,
+    base_url: str | None = None,
 ) -> httpx.Client:
-    """Create an `httpx.Client` configured with explicit timeout, local token, and optional test transport."""
+    """Create an `httpx.Client` with explicit timeout, loopback-scoped local token, and optional test transport."""
     effective_transport = transport if transport is not None else _http_transport_override
     local_token = resolve_local_ipc_token()
     headers: dict[str, str] | None = (
-        {"X-ShardAi-Local-Token": local_token} if local_token else None
+        {"X-ShardAi-Local-Token": local_token}
+        if local_token and _is_loopback_url(base_url)
+        else None
     )
-    return httpx.Client(timeout=timeout, transport=effective_transport, headers=headers)
+    return httpx.Client(
+        timeout=timeout,
+        transport=effective_transport,
+        headers=headers,
+        event_hooks={"request": [_strip_local_token_on_non_loopback_request]},
+    )
 
 
 def _check_daemon_healthy(
@@ -378,6 +411,7 @@ def _check_daemon_healthy(
         with _make_http_client(
             timeout=httpx.Timeout(timeout=1.5, connect=0.8),
             transport=transport,
+            base_url=base_url,
         ) as client:
             resp = client.get(f"{base_url}/health")
             return resp.status_code == 200
@@ -560,6 +594,7 @@ def _daemon_start_node(
         with _make_http_client(
             timeout=httpx.Timeout(timeout=120.0, connect=4.0),
             transport=transport,
+            base_url=base_url,
         ) as client:
             if check_join_first or request.network_mode == NetworkMode.INTERNET:
                 pre_resp = client.post(
@@ -608,6 +643,7 @@ def _fetch_catalog_entries_best_effort(
             with _make_http_client(
                 timeout=httpx.Timeout(timeout=5.0, connect=2.0),
                 transport=transport,
+                base_url=base_url,
             ) as client:
                 resp = client.get(f"{base_url}/models/catalog")
                 if resp.status_code == 200:
@@ -639,6 +675,7 @@ def _resolve_room_model_for_join(
             with _make_http_client(
                 timeout=httpx.Timeout(timeout=6.0, connect=2.0),
                 transport=transport,
+                base_url=base_url,
             ) as client:
                 resp = client.get(f"{base_url}/available-rooms")
                 if resp.status_code == 200:
@@ -1332,7 +1369,8 @@ def status(
     base_url = build_engine_base_url(host=host, port=port, api_url=api_url)
     try:
         with _make_http_client(
-            timeout=httpx.Timeout(timeout=5.0, connect=2.0)
+            timeout=httpx.Timeout(timeout=5.0, connect=2.0),
+            base_url=base_url,
         ) as client:
             status_resp = client.get(f"{base_url}/status")
             if status_resp.status_code >= 400:
@@ -1430,7 +1468,8 @@ def stop(
     payload: dict[str, object]
     try:
         with _make_http_client(
-            timeout=httpx.Timeout(timeout=10.0, connect=2.0)
+            timeout=httpx.Timeout(timeout=10.0, connect=2.0),
+            base_url=base_url,
         ) as client:
             resp = client.post(f"{base_url}/stop-node")
             if resp.status_code >= 400:
@@ -1517,7 +1556,8 @@ def rooms(
     if _check_daemon_healthy(base_url):
         try:
             with _make_http_client(
-                timeout=httpx.Timeout(timeout=8.0, connect=2.0)
+                timeout=httpx.Timeout(timeout=8.0, connect=2.0),
+                base_url=base_url,
             ) as client:
                 resp = client.get(f"{base_url}/available-rooms")
                 if resp.status_code >= 400:
@@ -1620,7 +1660,8 @@ def models(
     if _check_daemon_healthy(base_url):
         try:
             with _make_http_client(
-                timeout=httpx.Timeout(timeout=8.0, connect=2.0)
+                timeout=httpx.Timeout(timeout=8.0, connect=2.0),
+                base_url=base_url,
             ) as client:
                 resp = client.get(f"{base_url}/models/catalog")
                 if resp.status_code >= 400:
@@ -1780,7 +1821,8 @@ def pull(
         last_event: dict[str, object] = {}
         try:
             with _make_http_client(
-                timeout=httpx.Timeout(timeout=300.0, connect=4.0)
+                timeout=httpx.Timeout(timeout=300.0, connect=4.0),
+                base_url=base_url,
             ) as client:
                 with client.stream(
                     "GET", f"{base_url}/models/download-stream", params=params
@@ -1880,7 +1922,8 @@ def peers(
     base_url = build_engine_base_url(host=host, port=port, api_url=api_url)
     try:
         with _make_http_client(
-            timeout=httpx.Timeout(timeout=5.0, connect=2.0)
+            timeout=httpx.Timeout(timeout=5.0, connect=2.0),
+            base_url=base_url,
         ) as client:
             resp = client.get(f"{base_url}/peers")
             if resp.status_code >= 400:
@@ -2084,7 +2127,8 @@ def chat(
 
     try:
         with _make_http_client(
-            timeout=httpx.Timeout(timeout=120.0, connect=3.0)
+            timeout=httpx.Timeout(timeout=120.0, connect=3.0),
+            base_url=base_url,
         ) as client:
             if effective_token is None or effective_model is None:
                 try:
@@ -2126,7 +2170,12 @@ def chat(
                     )
                 raw_api = status_data.get("api_base_url")
                 if isinstance(raw_api, str) and raw_api.strip():
-                    gateway_v1_url = raw_api.strip().rstrip("/")
+                    try:
+                        gateway_v1_url = _validate_loopback_url(
+                            raw_api, label="/status api_base_url"
+                        )
+                    except typer.BadParameter as exc:
+                        _fail(f"Refusing untrusted /status api_base_url: {exc}")
 
             assert effective_token is not None
             assert effective_model is not None
@@ -2246,7 +2295,8 @@ def network(
     if _check_daemon_healthy(base_url):
         try:
             with _make_http_client(
-                timeout=httpx.Timeout(timeout=6.0, connect=2.0)
+                timeout=httpx.Timeout(timeout=6.0, connect=2.0),
+                base_url=base_url,
             ) as client:
                 net_resp = client.get(f"{base_url}/network-status")
                 if net_resp.status_code >= 400:
