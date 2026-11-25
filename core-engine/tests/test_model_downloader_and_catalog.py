@@ -32,6 +32,7 @@ from models.downloader import (
     is_valid_gguf_file,
     sanitize_catalog_entry,
 )
+from shard_engine.memory_manager import LayerAllocationPlan, calculate_max_layers
 from shard_engine.schemas import CatalogModelItem, CatalogModelTask, NodeState
 from shard_engine.tracker_client import SignalingTrackerClient
 from tests._mock_runner import patch_start_node_runner
@@ -1056,3 +1057,407 @@ def test_catalog_endpoint_and_cache_preserve_task_and_category_end_to_end(
     assert default_body["source"] == "default"
     assert default_body["count"] == len(DEFAULT_CATALOG_MODELS)
     assert all(item["task"] == "text" for item in default_body["models"])
+
+
+@pytest.mark.asyncio
+async def test_async_offload_system_memory_and_catalog_do_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/system/memory` and `/models/catalog` offload sync OS/disk helpers via `asyncio.to_thread`."""
+    downloader = _make_downloader(tmp_path)
+    runtime.model_downloader = downloader
+    loop_thread_id = threading.get_ident()
+
+    # 1. GET /system/memory offloads get_system_memory_info()
+    mem_entered = threading.Event()
+    mem_release = threading.Event()
+    mem_thread_ids: list[int] = []
+
+    def _fake_mem_info() -> tuple[float, float, int]:
+        mem_thread_ids.append(threading.get_ident())
+        mem_entered.set()
+        assert mem_release.wait(timeout=5.0)
+        return 16.0, 10.0, 9
+
+    monkeypatch.setattr(main_module, "get_system_memory_info", _fake_mem_info)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as async_client:
+        mem_task = asyncio.create_task(async_client.get("/system/memory"))
+        try:
+            assert await asyncio.to_thread(mem_entered.wait, 5.0)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            mem_release.set()
+            mem_res = await asyncio.wait_for(mem_task, timeout=5.0)
+            assert mem_res.status_code == 200
+            assert mem_res.json() == {
+                "total_ram_gb": 16.0,
+                "available_ram_gb": 10.0,
+                "max_shareable_ram_gb": 9,
+            }
+            assert mem_thread_ids and mem_thread_ids[0] != loop_thread_id
+        finally:
+            mem_release.set()
+            if not mem_task.done():
+                mem_task.cancel()
+
+        # 2. GET /models/catalog offloads save_catalog_cache() and load_catalog_cache()
+        monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+        monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "true")
+        sample_model = {
+            "id": "offload-test-model",
+            "name": "Offload Test Model",
+            "repo_id": "org/offload-test-gguf",
+            "filename": "offload.gguf",
+            "estimated_ram_gb": 4.0,
+            "enabled": True,
+        }
+
+        def _cloud_handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=200, json={"models": [sample_model]})
+
+        runtime.tracker_client = _make_mock_tracker(_cloud_handler)
+
+        save_entered = threading.Event()
+        save_release = threading.Event()
+        save_thread_ids: list[int] = []
+        orig_save = downloader.save_catalog_cache
+
+        def _spy_save(models: list[dict[str, Any]]) -> None:
+            save_thread_ids.append(threading.get_ident())
+            save_entered.set()
+            assert save_release.wait(timeout=5.0)
+            orig_save(models)
+
+        monkeypatch.setattr(downloader, "save_catalog_cache", _spy_save)
+
+        cat_cloud_task = asyncio.create_task(async_client.get("/models/catalog"))
+        try:
+            assert await asyncio.to_thread(save_entered.wait, 5.0)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            save_release.set()
+            cat_cloud_res = await asyncio.wait_for(cat_cloud_task, timeout=5.0)
+            assert cat_cloud_res.status_code == 200
+            assert cat_cloud_res.json()["source"] == "cloud"
+            assert save_thread_ids and save_thread_ids[0] != loop_thread_id
+        finally:
+            save_release.set()
+            if not cat_cloud_task.done():
+                cat_cloud_task.cancel()
+
+        monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "false")
+        load_entered = threading.Event()
+        load_release = threading.Event()
+        load_thread_ids: list[int] = []
+        orig_load = downloader.load_catalog_cache
+
+        def _spy_load() -> list[dict[str, Any]]:
+            load_thread_ids.append(threading.get_ident())
+            load_entered.set()
+            assert load_release.wait(timeout=5.0)
+            return orig_load()
+
+        monkeypatch.setattr(downloader, "load_catalog_cache", _spy_load)
+
+        cat_cache_task = asyncio.create_task(async_client.get("/models/catalog"))
+        try:
+            assert await asyncio.to_thread(load_entered.wait, 5.0)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            load_release.set()
+            cat_cache_res = await asyncio.wait_for(cat_cache_task, timeout=5.0)
+            assert cat_cache_res.status_code == 200
+            assert cat_cache_res.json()["source"] == "cache"
+            assert load_thread_ids and load_thread_ids[0] != loop_thread_id
+        finally:
+            load_release.set()
+            if not cat_cache_task.done():
+                cat_cache_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_async_offload_download_stream_and_start_node_layer_helpers_do_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/models/download-stream` and `/start-node` offload `calculate_max_layers` and `read_hf_config_summary`."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "true")
+    monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "false")
+    monkeypatch.setenv("SHARDAI_LAN_DISCOVERY_WAIT_SECONDS", "0")
+    monkeypatch.setenv("SHARDAI_ENABLE_ZEROCONF", "false")
+    patch_start_node_runner(monkeypatch)
+
+    downloader = _make_downloader(tmp_path)
+    runtime.model_downloader = downloader
+    loop_thread_id = threading.get_ident()
+
+    # 1. `/models/download-stream` offloads calculate_max_layers()
+    dl_plan_entered = threading.Event()
+    dl_plan_release = threading.Event()
+    dl_plan_thread_ids: list[int] = []
+    recorded_dl_kwargs: list[dict[str, Any]] = []
+
+    def _blocking_dl_calc(**kwargs: Any) -> LayerAllocationPlan:
+        dl_plan_thread_ids.append(threading.get_ident())
+        dl_plan_entered.set()
+        assert dl_plan_release.wait(timeout=5.0)
+        return LayerAllocationPlan(
+            model_id=str(kwargs["model_id"]),
+            total_layers=32,
+            n_layers=12,
+            shard_layer_start=0,
+            shard_layer_end=11,
+            model_size_gb=5.0,
+            per_layer_mb=160.0,
+            estimated_ram_mb=2560,
+        )
+
+    async def _fake_ensure_downloaded(*args: Any, **kwargs: Any) -> Path:
+        recorded_dl_kwargs.append(kwargs)
+        on_event = kwargs.get("on_event")
+        if on_event is not None:
+            on_event(
+                DownloadProgressEvent(
+                    model_id=str(args[0]),
+                    status="completed",
+                    progress_percent=100.0,
+                    downloaded_bytes=1024,
+                    total_bytes=1024,
+                    local_path=str(tmp_path / "dummy.gguf"),
+                    message="done",
+                )
+            )
+        return tmp_path / "dummy.gguf"
+
+    monkeypatch.setattr(main_module, "calculate_max_layers", _blocking_dl_calc)
+    monkeypatch.setattr(downloader, "ensure_model_downloaded", _fake_ensure_downloaded)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as async_client:
+        dl_task = asyncio.create_task(
+            async_client.get(
+                "/models/download-stream",
+                params={
+                    "model_id": "deepseek-r1-distill-llama-8b",
+                    "ram_gb": 4,
+                    "source_type": "catalog",
+                },
+            )
+        )
+        try:
+            assert await asyncio.to_thread(dl_plan_entered.wait, 5.0)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            dl_plan_release.set()
+            dl_res = await asyncio.wait_for(dl_task, timeout=5.0)
+            assert dl_res.status_code == 200
+            assert dl_plan_thread_ids and dl_plan_thread_ids[0] != loop_thread_id
+            assert recorded_dl_kwargs[0]["shard_layer_start"] == 0
+            assert recorded_dl_kwargs[0]["shard_layer_end"] == 11
+        finally:
+            dl_plan_release.set()
+            if not dl_task.done():
+                dl_task.cancel()
+
+        # 2. `/start-node` offloads calculate_max_layers() (x2) and read_hf_config_summary()
+        downloader_hf = _make_downloader(tmp_path / "hf_case")
+        runtime.model_downloader = downloader_hf
+        hf_dir = downloader_hf.models_dir / "local-hf-offload"
+        hf_dir.mkdir(parents=True, exist_ok=True)
+        (hf_dir / "config.json").write_text(
+            json.dumps({"num_hidden_layers": 28, "tie_word_embeddings": False}),
+            encoding="utf-8",
+        )
+        (hf_dir / "model.safetensors").write_bytes(b"SAFETENSORS_TEST_DATA")
+
+        calc_thread_ids: list[int] = []
+        hf_thread_ids: list[int] = []
+        calc_entered = threading.Event()
+        calc_release = threading.Event()
+        hf_entered = threading.Event()
+        hf_release = threading.Event()
+
+        def _blocking_start_calc(**kwargs: Any) -> LayerAllocationPlan:
+            call_num = len(calc_thread_ids)
+            calc_thread_ids.append(threading.get_ident())
+            if call_num == 0:
+                calc_entered.set()
+                assert calc_release.wait(timeout=5.0)
+            return calculate_max_layers(**kwargs)
+
+        def _blocking_hf_summary(model_dir: Path) -> tuple[int, bool]:
+            assert model_dir == hf_dir.resolve()
+            hf_thread_ids.append(threading.get_ident())
+            hf_entered.set()
+            assert hf_release.wait(timeout=5.0)
+            return 28, False
+
+        monkeypatch.setattr(main_module, "calculate_max_layers", _blocking_start_calc)
+        monkeypatch.setattr(main_module, "read_hf_config_summary", _blocking_hf_summary)
+
+        start_task = asyncio.create_task(
+            async_client.post(
+                "/start-node",
+                json={
+                    "node_id": "offload-hf-node",
+                    "model_id": str(hf_dir),
+                    "source_type": "local_file",
+                    "network_mode": "lan",
+                    "room_id": "offload-room",
+                    "ram_gb": 8,
+                    "p2p_listen_port": 49461,
+                },
+            )
+        )
+        try:
+            assert await asyncio.to_thread(calc_entered.wait, 5.0)
+            health_res = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res.status_code == 200
+            calc_release.set()
+
+            assert await asyncio.to_thread(hf_entered.wait, 5.0)
+            health_res_2 = await asyncio.wait_for(async_client.get("/health"), timeout=1.0)
+            assert health_res_2.status_code == 200
+            hf_release.set()
+
+            start_res = await asyncio.wait_for(start_task, timeout=5.0)
+            assert start_res.status_code == 200
+            assert start_res.json()["total_layers"] == 28
+            assert len(calc_thread_ids) == 2
+            assert all(tid != loop_thread_id for tid in calc_thread_ids)
+            assert len(hf_thread_ids) == 1
+            assert hf_thread_ids[0] != loop_thread_id
+        finally:
+            calc_release.set()
+            hf_release.set()
+            if not start_task.done():
+                start_task.cancel()
+            if runtime.state != NodeState.STOPPED:
+                await async_client.post("/stop-node")
+
+
+@pytest.mark.asyncio
+async def test_direct_url_aborts_immediately_on_non_gguf_magic_and_closes_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-GGUF `direct_url` streams abort on chunk 1, close the response, and delete `.part`."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+    url = "https://cdn.example.test/models/early-abort-html.gguf"
+
+    class _TrackingStream(httpx.AsyncByteStream):
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = chunks
+            self.chunks_yielded = 0
+            self.closed = False
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for item in self._chunks:
+                self.chunks_yielded += 1
+                yield item
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _TrackingStream(
+        [
+            b"<!DOCTYPE html><html>502 Bad Gateway</html>",
+            b"chunk-2-must-not-be-read" * 1024,
+            b"chunk-3-must-not-be-read" * 1024,
+        ]
+    )
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=200,
+            headers={"Content-Length": str(50 * 1024 * 1024)},
+            stream=stream,
+        )
+
+    downloader = _make_downloader(tmp_path, transport=httpx.MockTransport(_handler))
+    target_path = downloader.resolve_direct_url_path(url)
+    part_path = target_path.with_suffix(target_path.suffix + ".part")
+    events: list[DownloadProgressEvent] = []
+
+    with pytest.raises(ValueError, match="not a valid GGUF binary"):
+        await downloader.ensure_model_downloaded(
+            url,
+            source_type="direct_url",
+            on_event=events.append,
+        )
+
+    assert stream.chunks_yielded == 1
+    assert stream.closed is True
+    assert not part_path.exists()
+    assert not target_path.exists()
+    assert all(evt.status not in ("downloading", "completed") for evt in events)
+
+
+@pytest.mark.asyncio
+async def test_direct_url_split_magic_across_tiny_chunks_aborts_early_or_accepts_valid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1-2 byte chunks verify progressive GGUF magic prefixes without waiting for EOF."""
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+
+    class _TrackingChunkStream(httpx.AsyncByteStream):
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = chunks
+            self.chunks_yielded = 0
+            self.closed = False
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for item in self._chunks:
+                self.chunks_yielded += 1
+                yield item
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    # 1. Partial prefix b"G" followed by b"X" aborts on chunk 2 before chunk 3
+    bad_stream = _TrackingChunkStream([b"G", b"X", b"UF" + (b"\x00" * 1024)])
+    bad_url = "https://cdn.example.test/models/split-bad.gguf"
+    dl_bad = _make_downloader(
+        tmp_path / "split_bad",
+        transport=httpx.MockTransport(lambda _r: httpx.Response(status_code=200, stream=bad_stream)),
+    )
+    bad_part = dl_bad.resolve_direct_url_path(bad_url).with_suffix(".gguf.part")
+    with pytest.raises(ValueError, match="not a valid GGUF binary"):
+        await dl_bad.ensure_model_downloaded(bad_url, source_type="direct_url")
+    assert bad_stream.chunks_yielded == 2
+    assert bad_stream.closed is True
+    assert not bad_part.exists()
+
+    # 2. Truncated stream (< 4 bytes) still fails and cleans up .part
+    short_stream = _TrackingChunkStream([b"G", b"G"])
+    short_url = "https://cdn.example.test/models/split-short.gguf"
+    dl_short = _make_downloader(
+        tmp_path / "split_short",
+        transport=httpx.MockTransport(lambda _r: httpx.Response(status_code=200, stream=short_stream)),
+    )
+    short_part = dl_short.resolve_direct_url_path(short_url).with_suffix(".gguf.part")
+    with pytest.raises(ValueError, match="not a valid GGUF binary"):
+        await dl_short.ensure_model_downloaded(short_url, source_type="direct_url")
+    assert short_stream.closed is True
+    assert not short_part.exists()
+
+    # 3. Valid split magic [b"GG", b"UF", rest] succeeds cleanly
+    valid_bytes = _build_synthetic_gguf_bytes(block_count=24, total_size=1_100_000)
+    ok_stream = _TrackingChunkStream([valid_bytes[:2], valid_bytes[2:4], valid_bytes[4:]])
+    ok_url = "https://cdn.example.test/models/split-ok.gguf"
+    dl_ok = _make_downloader(
+        tmp_path / "split_ok",
+        transport=httpx.MockTransport(lambda _r: httpx.Response(status_code=200, stream=ok_stream)),
+    )
+    ok_path = await dl_ok.ensure_model_downloaded(ok_url, source_type="direct_url")
+    assert ok_stream.chunks_yielded == 3
+    assert ok_path.is_file()
+    assert has_gguf_magic(ok_path)

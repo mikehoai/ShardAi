@@ -1430,7 +1430,7 @@ class LocalNodeRuntime:
             or self.p2p_listen_port is None
         ):
             return None
-        ram_gb = max(1, (self.memory_manager.allocated_ram_mb + 1023) // 1024)
+        ram_gb = min(256, max(2, (self.memory_manager.allocated_ram_mb + 1023) // 1024))
         return StartNodeRequest(
             node_id=self.node_id,
             model_id=self.model_id,
@@ -1865,7 +1865,7 @@ async def get_node_status(
 @app.get("/system/memory", response_model=SystemMemoryResponse)
 async def get_host_system_memory() -> SystemMemoryResponse:
     """Return host OS total/free RAM and safe max shareable RAM (free RAM - 1 GB)."""
-    total_gb, avail_gb, max_shareable_gb = get_system_memory_info()
+    total_gb, avail_gb, max_shareable_gb = await asyncio.to_thread(get_system_memory_info)
     return SystemMemoryResponse(
         total_ram_gb=total_gb,
         available_ram_gb=avail_gb,
@@ -2124,7 +2124,9 @@ async def get_model_catalog() -> ModelCatalogResponse:
             cloud_models = await runtime.tracker_client.fetch_model_catalog()
             sanitized_cloud = sanitize_catalog_entries(cloud_models)
             if sanitized_cloud:
-                runtime.model_downloader.save_catalog_cache(sanitized_cloud)
+                await asyncio.to_thread(
+                    runtime.model_downloader.save_catalog_cache, sanitized_cloud
+                )
                 raw_models = sanitized_cloud
                 source = "cloud"
                 runtime.last_tracker_reachable = True
@@ -2132,7 +2134,7 @@ async def get_model_catalog() -> ModelCatalogResponse:
             logger.warning("Failed to fetch /config/models from Cloud (%s); using local cache.", exc)
 
     if not raw_models:
-        cached = runtime.model_downloader.load_catalog_cache()
+        cached = await asyncio.to_thread(runtime.model_downloader.load_catalog_cache)
         if cached:
             raw_models = cached
             source = "cache"
@@ -2232,7 +2234,9 @@ async def stream_model_download(
     resolved_start = shard_layer_start
     resolved_end = shard_layer_end
     if resolved_start is None and resolved_end is None and ram_gb is not None:
-        pre_plan = calculate_max_layers(model_id=model_id, ram_gb=max(2, ram_gb))
+        pre_plan = await asyncio.to_thread(
+            calculate_max_layers, model_id=model_id, ram_gb=max(2, ram_gb)
+        )
         resolved_start = pre_plan.shard_layer_start
         resolved_end = pre_plan.shard_layer_end
 
@@ -2490,7 +2494,8 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             except Exception:
                 initial_fingerprint = None
 
-        pre_plan = calculate_max_layers(
+        pre_plan = await asyncio.to_thread(
+            calculate_max_layers,
             model_id=request.model_id,
             ram_gb=effective_ram_gb,
             model_path=probe_path,
@@ -2708,7 +2713,8 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                 logger.debug("Optional model_fingerprint sync skipped: %s", fp_exc)
 
         # 5. Recompute final layer bounds from actual downloaded config.json / GGUF metadata
-        layer_plan = calculate_max_layers(
+        layer_plan = await asyncio.to_thread(
+            calculate_max_layers,
             model_id=request.model_id,
             ram_gb=effective_ram_gb,
             model_path=local_model_path,
@@ -2716,7 +2722,9 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         )
         final_total_layers = layer_plan.total_layers
         if local_model_path.is_dir():
-            cfg_total = read_hf_config_summary(local_model_path)[0]
+            cfg_total = (
+                await asyncio.to_thread(read_hf_config_summary, local_model_path)
+            )[0]
             if cfg_total > 0:
                 final_total_layers = cfg_total
 
