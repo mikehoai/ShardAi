@@ -91,6 +91,7 @@ from shard_engine.schemas import (
     RoomLobbyItem,
     StartNodeRequest,
     SystemMemoryResponse,
+    resolve_local_ipc_token,
     validate_room_id,
 )
 from shard_engine.tracker_client import (
@@ -1631,7 +1632,11 @@ class LocalNodeRuntime:
                 pass
             self._coverage_poll_task = None
 
-    def to_status_response(self, message: str = "") -> NodeStatusResponse:
+    def to_status_response(
+        self,
+        message: str = "",
+        include_session_token: bool = True,
+    ) -> NodeStatusResponse:
         """Build a typed status snapshot for the Tauri UI."""
         is_running: bool = self.state == NodeState.RUNNING
         return NodeStatusResponse(
@@ -1655,7 +1660,9 @@ class LocalNodeRuntime:
             p2p_listen_port=self.p2p_listen_port,
             connected_peers_count=len(self.peers),
             peers=self.peers,
-            session_token=self.session_token if is_running else None,
+            session_token=(
+                self.session_token if (is_running and include_session_token) else None
+            ),
             api_base_url=self.api_base_url if is_running else None,
             coverage_percent=self.coverage_percent if is_running else 0.0,
             is_swarm_ready=self.is_swarm_ready if is_running else False,
@@ -1703,9 +1710,17 @@ async def verify_openai_bearer_token(
 
 
 def _get_configured_local_ipc_token() -> str | None:
-    """Return the configured local IPC token from `SHARDAI_LOCAL_IPC_TOKEN`, if enabled."""
-    token = os.getenv("SHARDAI_LOCAL_IPC_TOKEN", "").strip()
-    return token or None
+    """Return the configured local IPC token from `SHARDAI_LOCAL_IPC_TOKEN` or `SHARDAI_LOCAL_TOKEN`."""
+    return resolve_local_ipc_token()
+
+
+def _is_local_ipc_authorized(provided_header: str | None) -> bool:
+    """Return True when local IPC auth is disabled or the provided header matches the configured token."""
+    expected_token = _get_configured_local_ipc_token()
+    if expected_token is None:
+        return True
+    provided_token = (provided_header or "").strip()
+    return bool(provided_token) and secrets.compare_digest(provided_token, expected_token)
 
 
 async def verify_local_ipc_token(
@@ -1714,11 +1729,7 @@ async def verify_local_ipc_token(
     ),
 ) -> None:
     """Enforce `X-ShardAi-Local-Token` on sensitive control routes when configured."""
-    expected_token = _get_configured_local_ipc_token()
-    if expected_token is None:
-        return
-    provided_token = (x_shardai_local_token or "").strip()
-    if not provided_token or not secrets.compare_digest(provided_token, expected_token):
+    if not _is_local_ipc_authorized(x_shardai_local_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: Missing or invalid X-ShardAi-Local-Token header.",
@@ -1792,9 +1803,16 @@ async def health_check() -> dict[str, str]:
 
 
 @app.get("/status", response_model=NodeStatusResponse)
-async def get_node_status() -> NodeStatusResponse:
-    """Return current node state, RAM/VRAM usage, active session token, and connected peers."""
-    return runtime.to_status_response(message="Node status retrieved successfully.")
+async def get_node_status(
+    x_shardai_local_token: str | None = Header(
+        default=None, alias="X-ShardAi-Local-Token"
+    ),
+) -> NodeStatusResponse:
+    """Return current node state, RAM/VRAM usage, active session token (when IPC-authorized), and peers."""
+    return runtime.to_status_response(
+        message="Node status retrieved successfully.",
+        include_session_token=_is_local_ipc_authorized(x_shardai_local_token),
+    )
 
 
 @app.get("/system/memory", response_model=SystemMemoryResponse)

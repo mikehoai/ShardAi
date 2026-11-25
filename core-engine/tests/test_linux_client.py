@@ -247,6 +247,8 @@ def test_shardai_service_unit_and_security_validation(monkeypatch: pytest.Monkey
     assert "ProtectSystem=strict" in sys_unit
     assert "SHARDAI_OFFLINE_MODE=true" in sys_unit
     assert "SHARDAI_TRACKER_URL=https://network.shardai.online" in sys_unit
+    assert "EnvironmentFile=-/etc/shardai/shardai.env" in sys_unit
+    assert "EnvironmentFile=-%h/.config/shardai/shardai.env" in user_unit
     assert "WantedBy=multi-user.target" in sys_unit
     assert "\r" not in sys_unit
 
@@ -456,3 +458,124 @@ def test_linux_packaging_lf_line_endings_security_and_ci() -> None:
         # Zero Vietnamese diacritics (all non-ASCII letters checked carefully)
         non_ascii = [ch for ch in content if ord(ch) > 127 and ch.isalpha()]
         assert not non_ascii, f"Non-ASCII letters found in {doc_or_code}: {non_ascii[:5]}"
+
+
+def test_cli_authenticates_with_shardai_local_ipc_token_across_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #43: CLI commands honor SHARDAI_LOCAL_IPC_TOKEN and propagate it to background daemons."""
+    monkeypatch.setenv("SHARDAI_HOME_DIR", str(tmp_path / "home"))
+    monkeypatch.setenv("SHARDAI_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("SHARDAI_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.delenv("SHARDAI_LOCAL_TOKEN", raising=False)
+    monkeypatch.setenv("SHARDAI_LOCAL_IPC_TOKEN", "canonical-ipc-secret-999")
+
+    seen_requests: list[tuple[str, str | None]] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("X-ShardAi-Local-Token")
+        seen_requests.append((request.url.path, token))
+        if token != "canonical-ipc-secret-999":
+            return httpx.Response(401, json={"detail": "Unauthorized"})
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/status":
+            return httpx.Response(
+                200,
+                json={
+                    "state": "RUNNING",
+                    "node_id": "cli-ipc-node",
+                    "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "room_id": "public",
+                    "allocated_ram_mb": 4096,
+                    "allocated_vram_mb": 0,
+                    "connected_peers_count": 0,
+                    "peers": [],
+                    "session_token": "sk-shard-cli-revealed-token",
+                    "coverage_percent": 100.0,
+                    "is_swarm_ready": True,
+                },
+            )
+        if request.url.path == "/network-status":
+            return httpx.Response(200, json={"network_status": "offline_solo"})
+        if request.url.path == "/v1/chat/completions":
+            assert request.headers.get("Authorization") == "Bearer sk-shard-cli-revealed-token"
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                },
+            )
+        if request.url.path == "/stop-node":
+            return httpx.Response(
+                200,
+                json={
+                    "state": "STOPPED",
+                    "allocated_ram_mb": 0,
+                    "allocated_vram_mb": 0,
+                    "message": "Node stopped.",
+                },
+            )
+        return httpx.Response(404)
+
+    captured_child_envs: list[dict[str, str]] = []
+
+    class _FakeProc:
+        pid = 51515
+
+        def poll(self) -> int | None:
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            pass
+
+    def fake_popen(*_args: object, **kwargs: object) -> _FakeProc:
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        captured_child_envs.append({str(k): str(v) for k, v in env.items()})
+        return _FakeProc()
+
+    monkeypatch.setattr("shard_engine.cli._http_transport_override", httpx.MockTransport(mock_handler))
+    monkeypatch.setattr("shard_engine.cli.subprocess.Popen", fake_popen)
+
+    # 1. serve --background propagates both env vars into child_env and passes /health with header
+    health_calls = 0
+
+    def bg_mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal health_calls
+        if request.url.path == "/health":
+            health_calls += 1
+            if health_calls == 1:
+                return httpx.Response(503)
+        return mock_handler(request)
+
+    monkeypatch.setattr("shard_engine.cli._http_transport_override", httpx.MockTransport(bg_mock_handler))
+    res_serve = runner.invoke(cli_app, ["serve", "--background", "--port", "8129", "--json"])
+    assert res_serve.exit_code == 0, res_serve.output
+    assert captured_child_envs
+    assert captured_child_envs[0].get("SHARDAI_LOCAL_IPC_TOKEN") == "canonical-ipc-secret-999"
+    assert captured_child_envs[0].get("SHARDAI_LOCAL_TOKEN") == "canonical-ipc-secret-999"
+
+    # 2. shardai status --show-key --json receives full session_token because X-ShardAi-Local-Token is sent
+    monkeypatch.setattr("shard_engine.cli._http_transport_override", httpx.MockTransport(mock_handler))
+    res_status = runner.invoke(cli_app, ["status", "--port", "8129", "--show-key", "--json"])
+    assert res_status.exit_code == 0, res_status.output
+    assert json.loads(res_status.stdout)["session_token"] == "sk-shard-cli-revealed-token"
+
+    # 3. shardai chat auto-discovers session_token from /status and completes chat
+    res_chat = runner.invoke(cli_app, ["chat", "--port", "8129", "--no-stream", "--prompt", "hi", "--json"])
+    assert res_chat.exit_code == 0, res_chat.output
+    assert json.loads(res_chat.stdout)["choices"][0]["message"]["content"] == "ok"
+
+    # 4. shardai stop sends X-ShardAi-Local-Token cleanly
+    res_stop = runner.invoke(cli_app, ["stop", "--port", "8129", "--json"])
+    assert res_stop.exit_code == 0, res_stop.output
+    assert all(tok == "canonical-ipc-secret-999" for _, tok in seen_requests)

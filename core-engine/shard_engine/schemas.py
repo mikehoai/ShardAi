@@ -1,8 +1,22 @@
 """Pydantic schemas with strict typing for Tauri UI IPC, Signaling Server, and OpenAI Gateway."""
 
+from collections.abc import Mapping
 from enum import StrEnum
+import os
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
+
+
+def resolve_local_ipc_token(env: Mapping[str, str] | None = None) -> str | None:
+    """Resolve the local IPC auth token from `SHARDAI_LOCAL_IPC_TOKEN` or legacy alias `SHARDAI_LOCAL_TOKEN`."""
+    source = os.environ if env is None else env
+    for key in ("SHARDAI_LOCAL_IPC_TOKEN", "SHARDAI_LOCAL_TOKEN"):
+        raw = source.get(key, "")
+        if isinstance(raw, str):
+            cleaned = raw.strip()
+            if cleaned:
+                return cleaned
+    return None
 
 
 class NodeState(StrEnum):

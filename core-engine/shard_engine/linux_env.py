@@ -442,6 +442,11 @@ def render_systemd_unit(
         "KillSignal=SIGTERM",
         "TimeoutStopSec=15",
         "Environment=PYTHONUNBUFFERED=1",
+        (
+            "EnvironmentFile=-/etc/shardai/shardai.env"
+            if scope == "system"
+            else "EnvironmentFile=-%h/.config/shardai/shardai.env"
+        ),
     ]
     if tracker_url and tracker_url.strip():
         lines.append(f"Environment=SHARDAI_TRACKER_URL={tracker_url.strip()}")

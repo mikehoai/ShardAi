@@ -18,7 +18,7 @@ import models.downloader as downloader_module
 from models.downloader import GGUF_MAGIC, ModelDownloader
 from models.shard_runner import ShardModelRunner
 from p2p.serializer import deserialize_activation_tensor, serialize_activation_tensor
-from shard_engine.schemas import NodeState, PeerNodeInfo, PeerRole
+from shard_engine.schemas import NodeState, PeerNodeInfo, PeerRole, resolve_local_ipc_token
 from tests._mock_runner import make_mock_runner
 
 client = TestClient(app)
@@ -55,12 +55,15 @@ def isolate_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
     orig_downloader = runtime.model_downloader
     orig_tracker = runtime.tracker_client
     monkeypatch.delenv("SHARDAI_LOCAL_IPC_TOKEN", raising=False)
+    monkeypatch.delenv("SHARDAI_LOCAL_TOKEN", raising=False)
     monkeypatch.delenv("SHARDAI_ALLOWED_MODEL_DIRS", raising=False)
     runtime.session_token = None
     runtime.state = NodeState.STOPPED
     runtime.node_id = None
     runtime.peers = []
     yield
+    monkeypatch.delenv("SHARDAI_LOCAL_IPC_TOKEN", raising=False)
+    monkeypatch.delenv("SHARDAI_LOCAL_TOKEN", raising=False)
     if runtime.state != NodeState.STOPPED:
         client.post("/stop-node")
     runtime.model_downloader = orig_downloader
@@ -372,3 +375,104 @@ def test_local_ipc_token_enforcement_on_mutating_endpoints(
 
     stop_res = client.post("/stop-node", headers=valid_headers)
     assert stop_res.status_code == 200
+
+
+def test_local_ipc_token_alias_and_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SHARDAI_LOCAL_TOKEN acts as an alias, while SHARDAI_LOCAL_IPC_TOKEN takes precedence."""
+    assert resolve_local_ipc_token({}) is None
+    assert resolve_local_ipc_token({"SHARDAI_LOCAL_IPC_TOKEN": "   "}) is None
+    assert resolve_local_ipc_token({"SHARDAI_LOCAL_TOKEN": " alias-tok "}) == "alias-tok"
+    assert (
+        resolve_local_ipc_token(
+            {
+                "SHARDAI_LOCAL_IPC_TOKEN": "  ",
+                "SHARDAI_LOCAL_TOKEN": "alias-tok",
+            }
+        )
+        == "alias-tok"
+    )
+    assert (
+        resolve_local_ipc_token(
+            {
+                "SHARDAI_LOCAL_IPC_TOKEN": "primary-tok",
+                "SHARDAI_LOCAL_TOKEN": "alias-tok",
+            }
+        )
+        == "primary-tok"
+    )
+
+    # Alias SHARDAI_LOCAL_TOKEN enforces auth on mutating endpoints
+    monkeypatch.delenv("SHARDAI_LOCAL_IPC_TOKEN", raising=False)
+    monkeypatch.setenv("SHARDAI_LOCAL_TOKEN", "alias-secret-456")
+
+    assert client.post("/stop-node").status_code == 401
+    assert (
+        client.post(
+            "/stop-node", headers={"X-ShardAi-Local-Token": "alias-secret-456"}
+        ).status_code
+        == 200
+    )
+
+    # When both are set, SHARDAI_LOCAL_IPC_TOKEN takes precedence over SHARDAI_LOCAL_TOKEN
+    monkeypatch.setenv("SHARDAI_LOCAL_IPC_TOKEN", "canonical-secret-789")
+    assert (
+        client.post(
+            "/stop-node", headers={"X-ShardAi-Local-Token": "alias-secret-456"}
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/stop-node", headers={"X-ShardAi-Local-Token": "canonical-secret-789"}
+        ).status_code
+        == 200
+    )
+
+
+def test_status_redacts_session_token_without_valid_ipc_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /status redacts session_token when IPC auth is enabled and header is missing/invalid."""
+    runtime.state = NodeState.RUNNING
+    runtime.node_id = "node-status-redaction"
+    runtime.model_id = "Qwen/Qwen2.5-7B-Instruct"
+    runtime.session_token = "sk-shard-secret-bearer-token"
+
+    # 1. With no local IPC token configured, /status exposes session_token for local desktop/CLI UX
+    unprotected = client.get("/status")
+    assert unprotected.status_code == 200
+    assert unprotected.json()["session_token"] == "sk-shard-secret-bearer-token"
+
+    # 2. With SHARDAI_LOCAL_IPC_TOKEN configured, unauthenticated or wrong-header /status redacts token
+    monkeypatch.setenv("SHARDAI_LOCAL_IPC_TOKEN", "ipc-status-secret")
+
+    no_header = client.get("/status")
+    assert no_header.status_code == 200
+    assert no_header.json()["state"] == "RUNNING"
+    assert no_header.json()["session_token"] is None
+
+    wrong_header = client.get(
+        "/status", headers={"X-ShardAi-Local-Token": "wrong-ipc-secret"}
+    )
+    assert wrong_header.status_code == 200
+    assert wrong_header.json()["session_token"] is None
+
+    valid_header = client.get(
+        "/status", headers={"X-ShardAi-Local-Token": "ipc-status-secret"}
+    )
+    assert valid_header.status_code == 200
+    assert valid_header.json()["session_token"] == "sk-shard-secret-bearer-token"
+
+    # 3. Alias SHARDAI_LOCAL_TOKEN also gates session_token disclosure on /status
+    monkeypatch.delenv("SHARDAI_LOCAL_IPC_TOKEN", raising=False)
+    monkeypatch.setenv("SHARDAI_LOCAL_TOKEN", "ipc-alias-status-secret")
+
+    assert client.get("/status").json()["session_token"] is None
+    assert (
+        client.get(
+            "/status", headers={"X-ShardAi-Local-Token": "ipc-alias-status-secret"}
+        ).json()["session_token"]
+        == "sk-shard-secret-bearer-token"
+    )

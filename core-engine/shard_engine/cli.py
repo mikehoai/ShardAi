@@ -65,6 +65,7 @@ from shard_engine.schemas import (
     NetworkMode,
     RoomLobbyItem,
     StartNodeRequest,
+    resolve_local_ipc_token,
 )
 from shard_engine.tracker_client import SignalingTrackerClient
 
@@ -361,7 +362,7 @@ def _make_http_client(
 ) -> httpx.Client:
     """Create an `httpx.Client` configured with explicit timeout, local token, and optional test transport."""
     effective_transport = transport if transport is not None else _http_transport_override
-    local_token = os.getenv("SHARDAI_LOCAL_TOKEN", "").strip()
+    local_token = resolve_local_ipc_token()
     headers: dict[str, str] | None = (
         {"X-ShardAi-Local-Token": local_token} if local_token else None
     )
@@ -1176,6 +1177,10 @@ def _start_daemon_background(
     child_env = os.environ.copy()
     child_env["SHARDAI_ENGINE_PORT"] = str(port)
     child_env["PYTHONUNBUFFERED"] = "1"
+    resolved_ipc_token = resolve_local_ipc_token(child_env)
+    if resolved_ipc_token is not None:
+        child_env["SHARDAI_LOCAL_IPC_TOKEN"] = resolved_ipc_token
+        child_env["SHARDAI_LOCAL_TOKEN"] = resolved_ipc_token
     if not getattr(sys, "frozen", False):
         core_dir = str(Path(__file__).resolve().parent.parent)
         existing_pp = child_env.get("PYTHONPATH", "").strip()
