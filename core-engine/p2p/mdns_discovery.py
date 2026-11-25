@@ -18,6 +18,15 @@ MDNS_MULTICAST_GROUP: str = "224.0.0.251"
 SHARDAI_MDNS_PORT: int = 5353
 FALLBACK_LAN_PORT: int = 49535
 PROBE_MAGIC: bytes = b"SHARDAI_MDNS_DISCOVER_V1"
+VALID_BEACON_MODALITIES: frozenset[str] = frozenset({"text", "vision", "audio", "multimodal"})
+
+
+def normalize_beacon_modality(value: Any) -> str | None:
+    """Normalize an optional beacon modality value, returning `None` if absent or invalid."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    return cleaned if cleaned in VALID_BEACON_MODALITIES else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +44,7 @@ class LanRoomBeacon:
     shard_layer_end: int = 15
     total_layers: int = 32
     role: str = "primary"
+    modality: str | None = None
 
 
 class _MdnsResponderProtocol(asyncio.DatagramProtocol):
@@ -50,21 +60,23 @@ class _MdnsResponderProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         if data != PROBE_MAGIC or self.beacon.is_unlisted or self.transport is None:
             return
-        reply_payload = json.dumps(
-            {
-                "type": "SHARDAI_MDNS_ROOM_V1",
-                "node_id": self.beacon.node_id,
-                "room_id": self.beacon.room_id,
-                "model": self.beacon.model,
-                "ram_gb": self.beacon.ram_gb,
-                "is_private": self.beacon.is_private,
-                "p2p_port": self.beacon.p2p_port,
-                "shard_layer_start": self.beacon.shard_layer_start,
-                "shard_layer_end": self.beacon.shard_layer_end,
-                "total_layers": self.beacon.total_layers,
-                "role": self.beacon.role,
-            }
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "type": "SHARDAI_MDNS_ROOM_V1",
+            "node_id": self.beacon.node_id,
+            "room_id": self.beacon.room_id,
+            "model": self.beacon.model,
+            "ram_gb": self.beacon.ram_gb,
+            "is_private": self.beacon.is_private,
+            "p2p_port": self.beacon.p2p_port,
+            "shard_layer_start": self.beacon.shard_layer_start,
+            "shard_layer_end": self.beacon.shard_layer_end,
+            "total_layers": self.beacon.total_layers,
+            "role": self.beacon.role,
+        }
+        normalized_modality = normalize_beacon_modality(self.beacon.modality)
+        if normalized_modality is not None:
+            payload["modality"] = normalized_modality
+        reply_payload = json.dumps(payload).encode("utf-8")
         try:
             self.transport.sendto(reply_payload, addr)
         except Exception:
@@ -183,6 +195,7 @@ class LanMdnsService:
                 "shard_layer_end": self._active_beacon.shard_layer_end,
                 "total_layers": self._active_beacon.total_layers,
                 "role": self._active_beacon.role,
+                "modality": normalize_beacon_modality(self._active_beacon.modality),
                 "ip_address": "127.0.0.1",
             }
 
@@ -221,6 +234,8 @@ class LanMdnsService:
                         data = json.loads(packet.decode("utf-8"))
                         if isinstance(data, dict) and data.get("type") == "SHARDAI_MDNS_ROOM_V1":
                             data.setdefault("ip_address", addr[0])
+                            if "modality" in data:
+                                data["modality"] = normalize_beacon_modality(data.get("modality"))
                             found.append(data)
                     except (TimeoutError, socket.timeout, OSError, ValueError):
                         break
