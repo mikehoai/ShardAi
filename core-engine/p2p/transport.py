@@ -159,7 +159,10 @@ async def handle_incoming_p2p_stream(
 
         pkt_type: int = frame_bytes[4]
         if pkt_type == int(PacketType.ACTIVATION_TENSOR):
-            activation_frame = deserialize_activation_tensor(frame_bytes)
+            activation_frame = await asyncio.to_thread(
+                deserialize_activation_tensor,
+                frame_bytes,
+            )
             await on_activation_frame(activation_frame)
         elif pkt_type == int(PacketType.DECODED_TOKEN):
             if on_token_frame is None:
