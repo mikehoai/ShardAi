@@ -2703,21 +2703,6 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             ),
             mmproj_filename=request.mmproj_filename,
         )
-        if cloud_online and (
-            model_fingerprint != initial_fingerprint
-            or post_download_modality != initial_modality
-        ):
-            try:
-                await runtime.tracker_client.register_node_with_assignment(
-                    request,
-                    total_model_layers=total_model_layers,
-                    max_layers_can_hold=max_layers_can_hold,
-                    model_fingerprint=model_fingerprint,
-                    modality=post_download_modality,
-                )
-                last_announce_monotonic = time.monotonic()
-            except Exception as fp_exc:
-                logger.debug("Optional model_fingerprint sync skipped: %s", fp_exc)
 
         # 5. Recompute final layer bounds from actual downloaded config.json / GGUF metadata
         layer_plan = await asyncio.to_thread(
@@ -2735,10 +2720,11 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             if cfg_total > 0:
                 final_total_layers = cfg_total
 
+        max_layers_can_hold = layer_plan.n_layers
         final_start = max(0, min(target_start, final_total_layers - 1))
         ram_capped_end = min(
             final_total_layers - 1,
-            final_start + layer_plan.n_layers - 1,
+            final_start + max_layers_can_hold - 1,
         )
         # Re-check with the REAL on-disk model size: Solo + SSD offload consent -> mmap all layers.
         if (
@@ -2753,14 +2739,59 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         max_allowed_end = final_total_layers - 1 if ssd_offload_active else ram_capped_end
         final_end = max(final_start, min(target_end, max_allowed_end))
         final_n_layers = final_end - final_start + 1
-        final_est_ram = min(
-            request.max_ram_mb,
-            round((0.6 + (final_n_layers * (layer_plan.per_layer_mb / 1024.0))) * 1024.0),
-        )
 
         request.total_layers = final_total_layers
         request.shard_layer_start = final_start
         request.shard_layer_end = final_end
+
+        if cloud_online and (
+            model_fingerprint != initial_fingerprint
+            or post_download_modality != initial_modality
+            or final_total_layers != total_model_layers
+            or final_start != target_start
+            or final_end != target_end
+        ):
+            try:
+                post_assignment: AnnounceAssignment = (
+                    await runtime.tracker_client.register_node_with_assignment(
+                        request,
+                        total_model_layers=final_total_layers,
+                        max_layers_can_hold=max_layers_can_hold,
+                        model_fingerprint=model_fingerprint,
+                        modality=post_download_modality,
+                    )
+                )
+                last_announce_monotonic = time.monotonic()
+                discovered_peers = [
+                    peer for peer in post_assignment.peers if peer.peer_id != request.node_id
+                ]
+                assigned_role = post_assignment.role
+                if not request.exact_shard_range:
+                    final_start = max(
+                        0,
+                        min(post_assignment.assigned_start_layer, final_total_layers - 1),
+                    )
+                    ram_capped_end = min(
+                        final_total_layers - 1,
+                        final_start + max_layers_can_hold - 1,
+                    )
+                    max_allowed_end = (
+                        final_total_layers - 1 if ssd_offload_active else ram_capped_end
+                    )
+                    final_end = max(
+                        final_start,
+                        min(post_assignment.assigned_end_layer, max_allowed_end),
+                    )
+                    final_n_layers = final_end - final_start + 1
+                    request.shard_layer_start = final_start
+                    request.shard_layer_end = final_end
+            except Exception as fp_exc:
+                logger.debug("Optional post-download tracker sync skipped: %s", fp_exc)
+
+        final_est_ram = min(
+            request.max_ram_mb,
+            round((0.6 + (final_n_layers * (layer_plan.per_layer_mb / 1024.0))) * 1024.0),
+        )
 
         # 6. Allocate local RAM/VRAM & load ONLY the assigned layers into llama_cpp / PyTorch
         runtime.memory_manager.allocate_shard(
