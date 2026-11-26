@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { streamChatCompletion } from "../services/engineApi";
 import { extractDocumentText, MAX_DOC_TEXT_CHARS } from "../utils/documentExtractor";
+import MarkdownMessage, { copyTextToClipboard } from "./MarkdownMessage";
 import type {
   ChatAttachmentItem,
   ChatAttachmentKind,
@@ -266,11 +267,16 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [isMaximized, setIsMaximized] = useState<boolean>(false);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingDraft, setEditingDraft] = useState<string>("");
 
   const isMountedRef = useRef<boolean>(true);
   const extractionSessionRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const onCloseRef = useRef<() => void>(onClose);
+  const editingMessageIdRef = useRef<string | null>(null);
+  const copyResetTimerRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -332,24 +338,42 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     }
   }, []);
 
+  const clearCopyResetTimer = useCallback((): void => {
+    if (copyResetTimerRef.current !== null) {
+      window.clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+  }, []);
+
+  const setEditingState = useCallback((id: string | null, draft = ""): void => {
+    editingMessageIdRef.current = id;
+    setEditingMessageId(id);
+    setEditingDraft(draft);
+  }, []);
+
   // Track mount lifecycle (StrictMode-safe), abort streams, and restore OS maximize state on unmount
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
       extractionSessionRef.current += 1;
+      clearCopyResetTimer();
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
       restoreOsWindowMaximizeState();
     };
-  }, [restoreOsWindowMaximizeState]);
+  }, [restoreOsWindowMaximizeState, clearCopyResetTimer]);
 
   // Keep latest onClose callback without re-triggering open-focus or keydown effects
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+
+  useEffect(() => {
+    editingMessageIdRef.current = editingMessageId;
+  }, [editingMessageId]);
 
   // Reset chat history when switching active model or gateway session token
   useEffect(() => {
@@ -363,6 +387,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
+    clearCopyResetTimer();
+    setCopiedMessageId(null);
+    setEditingState(null, "");
     setIsStreaming(false);
     setMessages([]);
     setAttachments([]);
@@ -370,7 +397,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     dragCounterRef.current = 0;
     setChatError(null);
     setInputValue("");
-  }, [modelId, sessionToken]);
+  }, [modelId, sessionToken, clearCopyResetTimer, setEditingState]);
 
   // Capture baseline OS maximize state on open; abort stream & restore OS state when closing
   useEffect(() => {
@@ -386,12 +413,15 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
+    clearCopyResetTimer();
+    setCopiedMessageId(null);
+    setEditingState(null, "");
     setIsStreaming(false);
     setIsDragOver(false);
     dragCounterRef.current = 0;
     setIsMaximized(false);
     restoreOsWindowMaximizeState();
-  }, [isOpen, ensureBaselineOsMaximized, restoreOsWindowMaximizeState]);
+  }, [isOpen, ensureBaselineOsMaximized, restoreOsWindowMaximizeState, clearCopyResetTimer, setEditingState]);
 
   // Focus composer textarea only when ChatWindow opens
   useEffect(() => {
@@ -400,13 +430,17 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     }
   }, [isOpen]);
 
-  // Listen for Escape to close without tearing down/re-attaching on parent re-renders
+  // Listen for Escape to cancel inline edit or close modal without tearing down on parent re-renders
   useEffect(() => {
     if (!isOpen) return;
 
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key === "Escape") {
         event.preventDefault();
+        if (editingMessageIdRef.current !== null) {
+          setEditingState(null, "");
+          return;
+        }
         onCloseRef.current();
       }
     };
@@ -414,7 +448,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isOpen]);
+  }, [isOpen, setEditingState]);
 
   // Auto-scroll message list on updates
   useEffect(() => {
@@ -613,30 +647,35 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   const handleClearChat = (): void => {
     extractionSessionRef.current += 1;
+    clearCopyResetTimer();
+    setCopiedMessageId(null);
+    setEditingState(null, "");
     handleStopGeneration();
     setMessages([]);
     setAttachments([]);
     setChatError(null);
   };
 
-  const handleSendMessage = async (): Promise<void> => {
-    const trimmed = inputValue.trim();
-    const pendingAttachments = [...attachments];
-    if ((!trimmed && pendingAttachments.length === 0) || isStreaming || !isModelReady) {
+  const handleCopyMessage = async (messageId: string, content: string): Promise<void> => {
+    const copied = await copyTextToClipboard(content);
+    if (!isMountedRef.current || !copied) {
       return;
     }
+    clearCopyResetTimer();
+    setCopiedMessageId(messageId);
+    copyResetTimerRef.current = window.setTimeout(() => {
+      if (isMountedRef.current) {
+        setCopiedMessageId(null);
+      }
+      copyResetTimerRef.current = null;
+    }, 1800);
+  };
 
-    setChatError(null);
-    setInputValue("");
-    setAttachments([]);
-
-    const userMsg: ChatMessageItem = {
-      id: createMessageId("user"),
-      role: "user",
-      content: trimmed,
-      ...(pendingAttachments.length > 0 ? { attachments: pendingAttachments } : {}),
-      createdAt: Date.now(),
-    };
+  const streamAssistantReply = async (
+    baseHistory: ChatMessageItem[],
+    userMsg: ChatMessageItem,
+    options?: { preserveUserOnPreTokenError?: boolean }
+  ): Promise<void> => {
     const assistantMsgId = createMessageId("assistant");
     const assistantPlaceholder: ChatMessageItem = {
       id: assistantMsgId,
@@ -646,11 +685,11 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     };
 
     const requestHistory: OpenAIChatMessagePayload[] = [
-      ...messages.map((m) => buildOpenAIMessagePayload(m.role, m.content, m.attachments)),
-      buildOpenAIMessagePayload("user", trimmed, pendingAttachments),
+      ...baseHistory.map((m) => buildOpenAIMessagePayload(m.role, m.content, m.attachments)),
+      buildOpenAIMessagePayload(userMsg.role, userMsg.content, userMsg.attachments),
     ];
 
-    setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
+    setMessages([...baseHistory, userMsg, assistantPlaceholder]);
     setIsStreaming(true);
 
     const controller = new AbortController();
@@ -692,14 +731,18 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             ? err.message
             : "Failed to complete chat request against local gateway.";
         setChatError(message);
-        // Remove empty assistant placeholder and, if no tokens arrived, drop the failed user message
-        // so rejected attachments are not resent on subsequent prompts.
+        // Remove empty assistant placeholder and, for new sends that failed before any token,
+        // drop the failed user message so rejected attachments are not resent on subsequent prompts.
         setMessages((prev) =>
           prev.filter((item) => {
             if (item.id === assistantMsgId && item.content.trim() === "") {
               return false;
             }
-            if (!receivedAnyToken && item.id === userMsg.id) {
+            if (
+              !options?.preserveUserOnPreTokenError &&
+              !receivedAnyToken &&
+              item.id === userMsg.id
+            ) {
               return false;
             }
             return true;
@@ -725,6 +768,60 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         });
       }
     }
+  };
+
+  const handleSendMessage = async (): Promise<void> => {
+    const trimmed = inputValue.trim();
+    const pendingAttachments = [...attachments];
+    if ((!trimmed && pendingAttachments.length === 0) || isStreaming || !isModelReady) {
+      return;
+    }
+
+    setChatError(null);
+    setInputValue("");
+    setAttachments([]);
+    setEditingState(null, "");
+
+    const userMsg: ChatMessageItem = {
+      id: createMessageId("user"),
+      role: "user",
+      content: trimmed,
+      ...(pendingAttachments.length > 0 ? { attachments: pendingAttachments } : {}),
+      createdAt: Date.now(),
+    };
+
+    await streamAssistantReply(messages, userMsg);
+  };
+
+  const handleStartEdit = (msg: ChatMessageItem): void => {
+    if (isStreaming || !isModelReady) {
+      return;
+    }
+    setEditingState(msg.id, msg.content);
+  };
+
+  const handleCancelEdit = (): void => {
+    setEditingState(null, "");
+  };
+
+  const handleSaveEdit = async (msg: ChatMessageItem, idx: number): Promise<void> => {
+    const trimmed = editingDraft.trim();
+    const hasAttachments = Boolean(msg.attachments && msg.attachments.length > 0);
+    if (isStreaming || !isModelReady || (!trimmed && !hasAttachments)) {
+      return;
+    }
+
+    const priorMessages = messages.slice(0, idx);
+    const updatedUserMsg: ChatMessageItem = {
+      ...msg,
+      content: trimmed,
+    };
+
+    setChatError(null);
+    setEditingState(null, "");
+    await streamAssistantReply(priorMessages, updatedUserMsg, {
+      preserveUserOnPreTokenError: true,
+    });
   };
 
   const handleSubmitForm = (event: React.FormEvent): void => {
@@ -909,11 +1006,17 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               </div>
             </div>
           ) : (
-            messages.map((msg) => {
+            messages.map((msg, idx) => {
               const isLastStreamingAssistant =
                 isStreaming &&
                 msg.role === "assistant" &&
                 msg.id === messages[messages.length - 1]?.id;
+              const isEditing = msg.role === "user" && editingMessageId === msg.id;
+              const hasAttachments = Boolean(msg.attachments && msg.attachments.length > 0);
+              const canSaveEdit =
+                !isStreaming && isModelReady && (editingDraft.trim().length > 0 || hasAttachments);
+              const isCopied = copiedMessageId === msg.id;
+
               return (
                 <div
                   key={msg.id}
@@ -921,59 +1024,126 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                   data-role={msg.role}
                   className={`chat-bubble-row ${msg.role}`}
                 >
-                  <div className={`chat-bubble ${msg.role}`}>
-                    {msg.attachments && msg.attachments.length > 0 && (
-                      <div
-                        className="chat-bubble-attachments"
-                        data-testid="chat-message-attachments"
-                      >
-                        {msg.attachments.map((att) =>
-                          att.kind === "image" && att.dataUrl ? (
-                            <img
-                              key={att.id}
-                              src={att.dataUrl}
-                              alt={att.name}
-                              className="chat-bubble-attachment-img"
-                            />
-                          ) : (
-                            <span
-                              key={att.id}
-                              className="chat-bubble-attachment-pill"
-                              title={att.name}
+                  <div className="chat-bubble-column">
+                    <div className={`chat-bubble ${msg.role}`}>
+                      {msg.attachments && msg.attachments.length > 0 && (
+                        <div
+                          className="chat-bubble-attachments"
+                          data-testid="chat-message-attachments"
+                        >
+                          {msg.attachments.map((att) =>
+                            att.kind === "image" && att.dataUrl ? (
+                              <img
+                                key={att.id}
+                                src={att.dataUrl}
+                                alt={att.name}
+                                className="chat-bubble-attachment-img"
+                              />
+                            ) : (
+                              <span
+                                key={att.id}
+                                className="chat-bubble-attachment-pill"
+                                title={att.name}
+                              >
+                                {att.kind === "video" ? "🎬" : "📄"} {att.name} (
+                                {formatFileSize(att.sizeBytes)})
+                              </span>
+                            )
+                          )}
+                        </div>
+                      )}
+                      {isEditing ? (
+                        <div className="chat-edit-box">
+                          <textarea
+                            data-testid="chat-edit-textarea"
+                            className="native-input chat-edit-textarea"
+                            rows={3}
+                            autoFocus
+                            aria-label="Edit message"
+                            value={editingDraft}
+                            onChange={(e) => setEditingDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Escape") {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                handleCancelEdit();
+                                return;
+                              }
+                              if (e.key === "Enter" && !e.shiftKey) {
+                                e.preventDefault();
+                                void handleSaveEdit(msg, idx);
+                              }
+                            }}
+                          />
+                          <div className="chat-edit-controls">
+                            <button
+                              type="button"
+                              data-testid="chat-edit-cancel-btn"
+                              className="native-btn"
+                              onClick={handleCancelEdit}
                             >
-                              {att.kind === "video" ? "🎬" : "📄"} {att.name} (
-                              {formatFileSize(att.sizeBytes)})
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="chat-edit-save-btn"
+                              className="native-btn native-btn-primary"
+                              disabled={!canSaveEdit}
+                              onClick={() => void handleSaveEdit(msg, idx)}
+                            >
+                              Save & Send
+                            </button>
+                          </div>
+                        </div>
+                      ) : msg.role === "assistant" ? (
+                        <div className="chat-bubble-content chat-bubble-content--markdown">
+                          {isLastStreamingAssistant && !msg.content ? (
+                            <span
+                              className="chat-thinking-indicator"
+                              data-testid="chat-thinking-indicator"
+                              aria-label="AI is thinking"
+                            >
+                              <span className="chat-thinking-dot" />
+                              <span className="chat-thinking-dot" />
+                              <span className="chat-thinking-dot" />
                             </span>
-                          )
+                          ) : (
+                            <MarkdownMessage
+                              content={msg.content}
+                              isStreaming={isLastStreamingAssistant}
+                            />
+                          )}
+                        </div>
+                      ) : (
+                        <div className="chat-bubble-content">{msg.content}</div>
+                      )}
+                    </div>
+
+                    {!isLastStreamingAssistant && !isEditing && (
+                      <div className="chat-bubble-actions" data-testid="chat-message-actions">
+                        <button
+                          type="button"
+                          data-testid="chat-copy-msg-btn"
+                          className={`chat-msg-action-btn${isCopied ? " copied" : ""}`}
+                          aria-label={isCopied ? "Copied message" : "Copy message"}
+                          onClick={() => void handleCopyMessage(msg.id, msg.content)}
+                        >
+                          {isCopied ? "Copied" : "Copy"}
+                        </button>
+                        {msg.role === "user" && (
+                          <button
+                            type="button"
+                            data-testid="chat-edit-msg-btn"
+                            className="chat-msg-action-btn"
+                            aria-label="Edit message"
+                            disabled={isStreaming || !isModelReady}
+                            onClick={() => handleStartEdit(msg)}
+                          >
+                            Edit
+                          </button>
                         )}
                       </div>
                     )}
-                    <div className="chat-bubble-content">
-                      {isLastStreamingAssistant && !msg.content ? (
-                        <span
-                          className="chat-thinking-indicator"
-                          data-testid="chat-thinking-indicator"
-                          aria-label="AI is thinking"
-                        >
-                          <span className="chat-thinking-dot" />
-                          <span className="chat-thinking-dot" />
-                          <span className="chat-thinking-dot" />
-                        </span>
-                      ) : (
-                        <>
-                          {msg.content}
-                          {isLastStreamingAssistant && msg.content.length > 0 && (
-                            <span
-                              className="chat-streaming-cursor"
-                              data-testid="chat-streaming-cursor"
-                              aria-hidden="true"
-                            >
-                              ▍
-                            </span>
-                          )}
-                        </>
-                      )}
-                    </div>
                   </div>
                 </div>
               );
