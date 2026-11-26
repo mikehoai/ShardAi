@@ -45,6 +45,7 @@ class LanRoomBeacon:
     total_layers: int = 32
     role: str = "primary"
     modality: str | None = None
+    announced_to_cloud: bool = False
 
 
 class _MdnsResponderProtocol(asyncio.DatagramProtocol):
@@ -72,6 +73,7 @@ class _MdnsResponderProtocol(asyncio.DatagramProtocol):
             "shard_layer_end": self.beacon.shard_layer_end,
             "total_layers": self.beacon.total_layers,
             "role": self.beacon.role,
+            "announced_to_cloud": self.beacon.announced_to_cloud,
         }
         normalized_modality = normalize_beacon_modality(self.beacon.modality)
         if normalized_modality is not None:
@@ -196,6 +198,7 @@ class LanMdnsService:
                 "total_layers": self._active_beacon.total_layers,
                 "role": self._active_beacon.role,
                 "modality": normalize_beacon_modality(self._active_beacon.modality),
+                "announced_to_cloud": self._active_beacon.announced_to_cloud,
                 "ip_address": "127.0.0.1",
             }
 

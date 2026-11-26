@@ -12,6 +12,7 @@ Security & Architecture Notes:
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import aclosing, asynccontextmanager, closing
+import dataclasses
 import inspect
 import ipaddress
 import json
@@ -1984,6 +1985,19 @@ class LocalNodeRuntime:
                     await self.maybe_send_tracker_heartbeat(force=True)
                     if self.state != NodeState.RUNNING:
                         return
+                    if (
+                        lan_mdns_service._active_beacon is not None
+                        and not lan_mdns_service._active_beacon.announced_to_cloud
+                    ):
+                        updated_beacon = dataclasses.replace(
+                            lan_mdns_service._active_beacon,
+                            announced_to_cloud=True,
+                        )
+                        await lan_mdns_service.start_advertising(updated_beacon)
+                        if zeroconf_discovery.is_advertising:
+                            await zeroconf_discovery.start_advertising(updated_beacon)
+                        if self.state != NodeState.RUNNING:
+                            return
                 # Also refresh peer routing table for this room/model without invalidating active peers on transient errors
                 if self.model_id is not None:
                     try:
@@ -2393,6 +2407,30 @@ def _resolve_lan_group_modality(
     return None
 
 
+def _summarize_lan_beacon_group(
+    beacons: list[dict[str, Any]],
+) -> tuple[str, float, bool, float, int, CatalogModelModality | None]:
+    """Aggregate model, RAM, privacy, layer coverage, redundancy, and modality for a beacon list."""
+    model = str(beacons[0].get("model") or "meta-llama/Llama-3.1-8B-Instruct")
+    total_ram = round(sum(float(b.get("ram_gb") or 0.0) for b in beacons), 2)
+    is_private = any(bool(b.get("is_private", False)) for b in beacons)
+    total_layers = max(1, int(beacons[0].get("total_layers") or 32))
+
+    layer_replication: dict[int, int] = {idx: 0 for idx in range(total_layers)}
+    for beacon in beacons:
+        b_start = max(0, int(beacon.get("shard_layer_start") or 0))
+        b_end = min(total_layers - 1, int(beacon.get("shard_layer_end") or (total_layers - 1)))
+        for layer_idx in range(b_start, b_end + 1):
+            layer_replication[layer_idx] = layer_replication.get(layer_idx, 0) + 1
+
+    covered_layers = sum(1 for cnt in layer_replication.values() if cnt > 0)
+    coverage_pct = round((covered_layers / float(total_layers)) * 100.0, 1)
+    min_rep = min(layer_replication.values()) if covered_layers == total_layers else 1
+    redundancy = max(1, min_rep)
+    lan_modality = _resolve_lan_group_modality(beacons, model)
+    return model, total_ram, is_private, coverage_pct, redundancy, lan_modality
+
+
 @app.get("/available-rooms", response_model=list[RoomLobbyItem])
 async def get_available_rooms() -> list[RoomLobbyItem]:
     """Fetch active rooms from Cloudflare Tracker (GET /rooms) merged with LAN mDNS scan."""
@@ -2421,39 +2459,50 @@ async def get_available_rooms() -> list[RoomLobbyItem]:
         lan_groups.setdefault(r_id, []).append(beacon)
 
     for r_id, beacons in lan_groups.items():
-        model = str(beacons[0].get("model") or "meta-llama/Llama-3.1-8B-Instruct")
-        total_ram = round(sum(float(b.get("ram_gb") or 0.0) for b in beacons), 2)
-        is_private = any(bool(b.get("is_private", False)) for b in beacons)
-        total_layers = max(1, int(beacons[0].get("total_layers") or 32))
-
-        layer_replication: dict[int, int] = {idx: 0 for idx in range(total_layers)}
-        for b in beacons:
-            b_start = max(0, int(b.get("shard_layer_start") or 0))
-            b_end = min(total_layers - 1, int(b.get("shard_layer_end") or (total_layers - 1)))
-            for layer_idx in range(b_start, b_end + 1):
-                layer_replication[layer_idx] = layer_replication.get(layer_idx, 0) + 1
-
-        covered_layers = sum(1 for cnt in layer_replication.values() if cnt > 0)
-        coverage_pct = round((covered_layers / float(total_layers)) * 100.0, 1)
-        min_rep = min(layer_replication.values()) if covered_layers == total_layers else 1
-        redundancy = max(1, min_rep)
-
-        lan_modality = _resolve_lan_group_modality(beacons, model)
-
         if r_id in merged:
             existing = merged[r_id]
+            lan_only_beacons = [
+                b
+                for b in beacons
+                if not bool(b.get("announced_to_cloud", False))
+                and not (
+                    runtime.state == NodeState.RUNNING
+                    and runtime.network_status == NetworkStatus.ONLINE
+                    and str(b.get("node_id") or "") == (runtime.node_id or "")
+                )
+            ]
+            if not lan_only_beacons:
+                if existing.modality is None:
+                    backfilled_modality = _resolve_lan_group_modality(beacons, existing.model)
+                    if backfilled_modality is not None:
+                        merged[r_id] = existing.model_copy(
+                            update={"modality": backfilled_modality}
+                        )
+                continue
+
+            (
+                _,
+                lan_only_ram,
+                lan_only_is_private,
+                lan_only_coverage_pct,
+                lan_only_redundancy,
+                lan_only_modality,
+            ) = _summarize_lan_beacon_group(lan_only_beacons)
             merged[r_id] = RoomLobbyItem(
                 room_id=r_id,
                 model=existing.model,
-                modality=existing.modality or lan_modality,
-                nodes_online=existing.nodes_online + len(beacons),
-                total_shared_ram_gb=round(existing.total_shared_ram_gb + total_ram, 2),
-                is_private=existing.is_private or is_private,
+                modality=existing.modality or lan_only_modality,
+                nodes_online=existing.nodes_online + len(lan_only_beacons),
+                total_shared_ram_gb=round(existing.total_shared_ram_gb + lan_only_ram, 2),
+                is_private=existing.is_private or lan_only_is_private,
                 network_scope="hybrid",
-                coverage_percent=max(existing.coverage_percent, coverage_pct),
-                redundancy_factor=max(existing.redundancy_factor, redundancy),
+                coverage_percent=max(existing.coverage_percent, lan_only_coverage_pct),
+                redundancy_factor=max(existing.redundancy_factor, lan_only_redundancy),
             )
         else:
+            model, total_ram, is_private, coverage_pct, redundancy, lan_modality = (
+                _summarize_lan_beacon_group(beacons)
+            )
             merged[r_id] = RoomLobbyItem(
                 room_id=r_id,
                 model=model,
@@ -3295,6 +3344,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             total_layers=final_total_layers,
             role=assigned_role.value,
             modality=node_modality,
+            announced_to_cloud=(network_status == NetworkStatus.ONLINE),
         )
         await lan_mdns_service.start_advertising(lan_beacon)
         if network_status != NetworkStatus.ONLINE or request.network_mode == NetworkMode.LAN:
