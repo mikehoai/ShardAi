@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
+import os
 from pathlib import Path
 import struct
 from typing import Any, BinaryIO
@@ -164,6 +165,47 @@ class LoadedGgufShard:
     shard_layer_start: int
     shard_layer_end: int
     compute_dtype: torch.dtype
+    device: torch.device = torch.device("cpu")
+    materialized_tensors: int = 0
+
+
+_AUTO_ACCELERATOR_MIN_BYTES: int = 8 * 1024 * 1024
+
+
+def select_gguf_torch_device(
+    preferred: str | None = None,
+    kept_bytes: int = 0,
+) -> torch.device:
+    """Choose the best available PyTorch compute device (`cuda`, `mps`, or `cpu`)."""
+    choice = (
+        (preferred if preferred is not None else os.getenv("SHARDAI_TORCH_DEVICE", "auto"))
+        .strip()
+        .lower()
+    )
+    cuda_ok = bool(torch.cuda.is_available())
+    mps_ok = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+
+    if choice == "cuda":
+        selected = torch.device("cuda" if cuda_ok else "cpu")
+    elif choice == "mps":
+        selected = torch.device("mps" if mps_ok else "cpu")
+    elif choice == "cpu":
+        selected = torch.device("cpu")
+    else:
+        if kept_bytes < _AUTO_ACCELERATOR_MIN_BYTES:
+            selected = torch.device("cpu")
+        elif cuda_ok:
+            selected = torch.device("cuda")
+        elif mps_ok:
+            selected = torch.device("mps")
+        else:
+            selected = torch.device("cpu")
+
+    if selected.type == "cpu":
+        cpu_threads = os.cpu_count() or 1
+        if cpu_threads > 1 and torch.get_num_threads() == 1:
+            torch.set_num_threads(min(8, cpu_threads))
+    return selected
 
 
 def _compute_ggml_nbytes(dims_gguf: tuple[int, ...], ggml_type: int) -> int:
@@ -618,12 +660,85 @@ class GgufQuantizedLinear(nn.Module):
             )
         else:
             self.register_parameter("bias", None)
+        self._cached_weight: torch.Tensor | None = None
+
+    def materialize(self, dtype: torch.dtype, device: torch.device) -> int:
+        """Pre-dequantize `raw_weight` onto `(device, dtype)` once and return net RAM byte delta."""
+        if self._cached_weight is not None:
+            if self._cached_weight.device == device and self._cached_weight.dtype == dtype:
+                return 0
+            old_bytes = int(self._cached_weight.numel() * self._cached_weight.element_size())
+            self._cached_weight = self._cached_weight.to(device=device, dtype=dtype).contiguous()
+            if self.bias is not None:
+                self.bias = nn.Parameter(
+                    self.bias.detach().to(device=device, dtype=dtype).contiguous(),
+                    requires_grad=False,
+                )
+            new_bytes = int(self._cached_weight.numel() * self._cached_weight.element_size())
+            return new_bytes - old_bytes
+
+        old_raw_bytes = int(self.raw_weight.numel())
+        with torch.inference_mode():
+            w = _dequantize_blocks_u8(
+                self.raw_weight, ggml_type=self.ggml_type, dtype=torch.float32
+            ).reshape(self.out_features, self.in_features)
+            if self.unpermute_heads is not None:
+                w = _reverse_permute_rope_rows(w, self.unpermute_heads)
+            cached = w.to(device=device, dtype=dtype).contiguous()
+            del w
+            if self.bias is not None:
+                self.bias = nn.Parameter(
+                    self.bias.detach().to(device=device, dtype=dtype).contiguous(),
+                    requires_grad=False,
+                )
+        self._cached_weight = cached
+        self.register_buffer("raw_weight", torch.empty(0, dtype=torch.uint8), persistent=True)
+        new_bytes = int(cached.numel() * cached.element_size())
+        return new_bytes - old_raw_bytes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Dequantize weight on the fly inside `torch.inference_mode()` and apply `F.linear`."""
+        """Run linear projection from materialized weights or fall back to on-the-fly CPU dequantization."""
         with torch.inference_mode():
-            target_dtype = x.dtype
-            bias_t = self.bias.to(dtype=target_dtype) if self.bias is not None else None
+            orig_device = x.device
+            orig_dtype = x.dtype
+
+            if self._cached_weight is not None:
+                w = self._cached_weight
+                x_dev = x if x.device == w.device else x.to(device=w.device)
+                # CPU BLAS SGEMM is dramatically faster than CPU BF16 GEMM on multi-token prefills
+                if (
+                    w.device.type == "cpu"
+                    and w.dtype == torch.bfloat16
+                    and x_dev.ndim >= 2
+                    and x_dev.shape[-2] > 4
+                ):
+                    bias_f32 = (
+                        self.bias.to(device=w.device, dtype=torch.float32)
+                        if self.bias is not None
+                        else None
+                    )
+                    out = F.linear(x_dev.to(torch.float32), w.to(torch.float32), bias_f32)
+                else:
+                    bias_w = (
+                        self.bias.to(device=w.device, dtype=w.dtype)
+                        if self.bias is not None
+                        else None
+                    )
+                    x_cast = x_dev if x_dev.dtype == w.dtype else x_dev.to(dtype=w.dtype)
+                    out = F.linear(x_cast, w, bias_w)
+                if out.device != orig_device or out.dtype != orig_dtype:
+                    out = out.to(device=orig_device, dtype=orig_dtype)
+                return out
+
+            work_dtype = torch.float32 if orig_device.type != "cpu" else orig_dtype
+            x_cpu = x if orig_device.type == "cpu" else x.to(device="cpu", dtype=work_dtype)
+            if x_cpu.dtype != work_dtype:
+                x_cpu = x_cpu.to(dtype=work_dtype)
+            bias_t = (
+                self.bias.to(device="cpu", dtype=work_dtype)
+                if self.bias is not None
+                else None
+            )
             rows_2d = self.raw_weight.view(self.out_features, self._row_bytes)
 
             if (
@@ -632,26 +747,30 @@ class GgufQuantizedLinear(nn.Module):
                 and self.out_features > self.chunk_out_rows
                 and self.unpermute_heads is None
             ):
-                out_shape = (*x.shape[:-1], self.out_features)
-                output = torch.empty(out_shape, dtype=target_dtype, device=x.device)
+                out_shape = (*x_cpu.shape[:-1], self.out_features)
+                output = torch.empty(out_shape, dtype=work_dtype, device="cpu")
                 for r0 in range(0, self.out_features, self.chunk_out_rows):
                     r1 = min(self.out_features, r0 + self.chunk_out_rows)
                     chunk_u8 = rows_2d[r0:r1].reshape(-1)
                     w_chunk = _dequantize_blocks_u8(
-                        chunk_u8, ggml_type=self.ggml_type, dtype=target_dtype
+                        chunk_u8, ggml_type=self.ggml_type, dtype=work_dtype
                     ).reshape(r1 - r0, self.in_features)
                     b_chunk = bias_t[r0:r1] if bias_t is not None else None
-                    output[..., r0:r1] = F.linear(x, w_chunk, b_chunk)
+                    output[..., r0:r1] = F.linear(x_cpu, w_chunk, b_chunk)
                     del w_chunk
+                if output.device != orig_device or output.dtype != orig_dtype:
+                    output = output.to(device=orig_device, dtype=orig_dtype)
                 return output
 
             w = _dequantize_blocks_u8(
-                self.raw_weight, ggml_type=self.ggml_type, dtype=target_dtype
+                self.raw_weight, ggml_type=self.ggml_type, dtype=work_dtype
             ).reshape(self.out_features, self.in_features)
             if self.unpermute_heads is not None:
                 w = _reverse_permute_rope_rows(w, self.unpermute_heads)
-            out = F.linear(x, w, bias_t)
+            out = F.linear(x_cpu, w, bias_t)
             del w
+            if out.device != orig_device or out.dtype != orig_dtype:
+                out = out.to(device=orig_device, dtype=orig_dtype)
             return out
 
 
@@ -684,18 +803,21 @@ class GgufQuantizedEmbedding(nn.Module):
         self.embed_scale: float = float(embed_scale)
         self.output_dtype: torch.dtype = output_dtype
         self._row_bytes: int = row_bytes
+        self.target_device: torch.device = torch.device("cpu")
         self.register_buffer("raw_weight", raw_weight.detach().contiguous(), persistent=True)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Gather only `input_ids` rows and dequantize those rows on the fly."""
         with torch.inference_mode():
-            flat_ids = input_ids.reshape(-1).to(torch.long)
-            selected_u8 = self.raw_weight.index_select(0, flat_ids).reshape(-1)
+            ids_cpu = input_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+            selected_u8 = self.raw_weight.index_select(0, ids_cpu).reshape(-1)
             deq = _dequantize_blocks_u8(
                 selected_u8, ggml_type=self.ggml_type, dtype=self.output_dtype
             ).reshape(*input_ids.shape, self.embedding_dim)
             if self.embed_scale != 1.0:
                 deq = deq * self.embed_scale
+            if self.target_device.type != "cpu":
+                deq = deq.to(device=self.target_device)
             return deq
 
 
@@ -1608,11 +1730,36 @@ class GgufTokenizerAdapter:
 # ---------------------------------------------------------------------------
 
 
+def _iter_layer_linears(layer: GgufDecoderLayer) -> list[GgufQuantizedLinear]:
+    """Return all `GgufQuantizedLinear` projections belonging to one decoder layer."""
+    modules = (
+        layer.self_attn.qkv_proj,
+        layer.self_attn.q_proj,
+        layer.self_attn.k_proj,
+        layer.self_attn.v_proj,
+        layer.self_attn.o_proj,
+        layer.mlp.gate_up_proj,
+        layer.mlp.gate_proj,
+        layer.mlp.up_proj,
+        layer.mlp.down_proj,
+    )
+    return [m for m in modules if isinstance(m, GgufQuantizedLinear)]
+
+
+def _move_norm_module(
+    mod: GgufRMSNorm | None, device: torch.device, dtype: torch.dtype
+) -> None:
+    """Move a lightweight `GgufRMSNorm` module onto `(device, dtype)` cleanly."""
+    if mod is not None:
+        mod.to(device=device, dtype=dtype)
+
+
 def load_gguf_pytorch_shard(
     gguf_path: Path,
     shard_layer_start: int,
     shard_layer_end: int,
     max_ram_mb: int = 4096,
+    device: str | None = None,
 ) -> LoadedGgufShard:
     """Selectively load ONLY `[shard_layer_start..shard_layer_end]` from a GGUF file into pure PyTorch."""
     index = read_gguf_header_and_tensors(gguf_path)
@@ -1638,7 +1785,7 @@ def load_gguf_pytorch_shard(
 
     embed_scale = math.sqrt(float(hidden_dim)) if arch in ("gemma2", "gemma3") else 1.0
 
-    # Estimate kept tensor weight size to choose float32 vs bfloat16 activation compute dtype
+    # Estimate kept tensor weight size to choose hardware device, compute dtype, and materialization budget
     kept_bytes = 0
     for idx in range(clamped_start, clamped_end + 1):
         prefix = f"blk.{idx}."
@@ -1653,10 +1800,8 @@ def load_gguf_pytorch_shard(
         elif "token_embd.weight" in index.tensors:
             kept_bytes += index.tensors["token_embd.weight"].nbytes
 
-    kept_mb = kept_bytes / (1024.0 * 1024.0)
-    compute_dtype = (
-        torch.float32 if (kept_mb * 1.5) <= (max_ram_mb * 0.85) else torch.bfloat16
-    )
+    target_device = select_gguf_torch_device(device, kept_bytes=kept_bytes)
+    budget_bytes = max(1, int(max_ram_mb * 0.80 * 1024 * 1024))
 
     kept_layers: list[GgufDecoderLayer] = []
     with gguf_path.open("rb") as f:
@@ -1675,7 +1820,7 @@ def load_gguf_pytorch_shard(
                 embedding_dim=emb_dim,
                 ggml_type=emb_info.ggml_type,
                 embed_scale=embed_scale,
-                output_dtype=compute_dtype,
+                output_dtype=torch.float32,
             )
             container.embed_tokens = embed_tokens
 
@@ -1702,10 +1847,97 @@ def load_gguf_pytorch_shard(
                 )
                 container.lm_head = lm_head
 
-    container.to(dtype=compute_dtype, device="cpu")
+    decoder_linears: list[GgufQuantizedLinear] = []
+    for layer in kept_layers:
+        decoder_linears.extend(_iter_layer_linears(layer))
+
+    decoder_elems = sum(lin.out_features * lin.in_features for lin in decoder_linears)
+    decoder_raw_bytes = sum(int(lin.raw_weight.numel()) for lin in decoder_linears)
+    non_decoder_bytes = kept_bytes
+
+    if target_device.type == "cuda":
+        bf16_supported = bool(
+            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        )
+        compute_dtype = torch.bfloat16 if bf16_supported else torch.float16
+        mat_dtype = compute_dtype
+    elif target_device.type == "mps":
+        compute_dtype = torch.bfloat16
+        mat_dtype = torch.bfloat16
+    else:
+        f32_total = non_decoder_bytes - decoder_raw_bytes + (decoder_elems * 4)
+        if f32_total <= budget_bytes:
+            compute_dtype = torch.float32
+            mat_dtype = torch.float32
+        else:
+            compute_dtype = torch.bfloat16
+            mat_dtype = torch.bfloat16
+
+    for layer in kept_layers:
+        _move_norm_module(layer.input_layernorm, target_device, compute_dtype)
+        _move_norm_module(layer.post_attention_layernorm, target_device, compute_dtype)
+        _move_norm_module(layer.pre_feedforward_layernorm, target_device, compute_dtype)
+        _move_norm_module(layer.post_feedforward_layernorm, target_device, compute_dtype)
+        _move_norm_module(layer.self_attn.q_norm, target_device, compute_dtype)
+        _move_norm_module(layer.self_attn.k_norm, target_device, compute_dtype)
+    _move_norm_module(norm, target_device, compute_dtype)
+    rotary_emb.to(device=target_device)
+
+    if embed_tokens is not None:
+        embed_tokens.output_dtype = compute_dtype
+        embed_tokens.target_device = target_device
+
+    used_bytes = non_decoder_bytes
+    elem_bytes = 4 if mat_dtype == torch.float32 else 2
+    materialized_count = 0
+    for lin in decoder_linears:
+        projected_delta = (lin.out_features * lin.in_features * elem_bytes) - int(
+            lin.raw_weight.numel()
+        )
+        if (used_bytes + projected_delta) > budget_bytes:
+            continue
+        try:
+            actual_delta = lin.materialize(dtype=mat_dtype, device=target_device)
+            used_bytes += actual_delta
+            materialized_count += 1
+        except RuntimeError as exc:
+            logger.warning(
+                "Stopping weight materialization early on %s after %d tensors (%s)",
+                target_device,
+                materialized_count,
+                exc,
+            )
+            break
+
+    if (
+        lm_head is not None
+        and target_device.type != "mps"
+        and lm_head.out_features <= _DEFAULT_LM_HEAD_CHUNK_ROWS
+    ):
+        lm_delta = (lm_head.out_features * lm_head.in_features * elem_bytes) - int(
+            lm_head.raw_weight.numel()
+        )
+        if (used_bytes + lm_delta) <= int(budget_bytes * 0.7):
+            try:
+                used_bytes += lm_head.materialize(dtype=mat_dtype, device=target_device)
+                materialized_count += 1
+            except RuntimeError:
+                pass
+
     container.eval()
     for param in container.parameters():
         param.requires_grad_(False)
+
+    logger.info(
+        "GGUF shard %d..%d prepared on %s (dtype=%s, materialized=%d/%d linears, est_ram=%.1f MB)",
+        clamped_start,
+        clamped_end,
+        target_device,
+        compute_dtype,
+        materialized_count,
+        len(decoder_linears),
+        used_bytes / (1024.0 * 1024.0),
+    )
 
     tokenizer: GgufTokenizerAdapter | None = None
     if is_head or is_tail:
@@ -1725,4 +1957,6 @@ def load_gguf_pytorch_shard(
         shard_layer_start=clamped_start,
         shard_layer_end=clamped_end,
         compute_dtype=compute_dtype,
+        device=target_device,
+        materialized_tensors=materialized_count,
     )

@@ -2,19 +2,23 @@
 
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
 from p2p.serializer import (
+    AUTO_BF16_WIRE_MIN_BYTES,
     ActivationFrame,
     CompressionCodec,
     DecodedTokenFrame,
     InferenceErrorFrame,
+    InferenceHeartbeatFrame,
     InferenceRequestFrame,
     PacketType,
     deserialize_activation_tensor,
     deserialize_decoded_token,
     deserialize_inference_error,
+    deserialize_inference_heartbeat,
     deserialize_inference_request,
     serialize_activation_tensor,
     serialize_decoded_token,
     serialize_inference_error,
+    serialize_inference_heartbeat,
     serialize_inference_request,
 )
 from p2p.relay_client import RelayClient, validate_relay_url
@@ -38,10 +42,12 @@ from p2p.transport import (
 
 __all__ = [
     "ACK_BYTE",
+    "AUTO_BF16_WIRE_MIN_BYTES",
     "ActivationFrame",
     "CompressionCodec",
     "DecodedTokenFrame",
     "InferenceErrorFrame",
+    "InferenceHeartbeatFrame",
     "InferenceRequestFrame",
     "LanRoomBeacon",
     "NACK_BYTE",
@@ -56,6 +62,7 @@ __all__ = [
     "deserialize_activation_tensor",
     "deserialize_decoded_token",
     "deserialize_inference_error",
+    "deserialize_inference_heartbeat",
     "deserialize_inference_request",
     "dispatch_p2p_frame",
     "encode_envelope",
@@ -65,6 +72,7 @@ __all__ = [
     "serialize_activation_tensor",
     "serialize_decoded_token",
     "serialize_inference_error",
+    "serialize_inference_heartbeat",
     "serialize_inference_request",
     "split_into_chunks",
     "validate_relay_url",

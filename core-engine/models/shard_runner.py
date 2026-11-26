@@ -223,6 +223,7 @@ class ShardModelRunner:
         self._lm_head: Any | None = None
         self._shard_container: Any | None = None
         self._compute_dtype: Any | None = None
+        self._device: Any = "cpu"
         self._sessions: OrderedDict[str, _RequestSession] = OrderedDict()
 
         if hf_model is not None and hf_config is not None:
@@ -543,6 +544,7 @@ class ShardModelRunner:
         self._norm = loaded.norm
         self._lm_head = loaded.lm_head
         self._compute_dtype = loaded.compute_dtype
+        self._device = loaded.device
         self._tokenizer = loaded.tokenizer
         if self._tokenizer is not None:
             self._eos_token_ids = _extract_eos_token_ids(self._hf_config, self._tokenizer)
@@ -851,11 +853,14 @@ class ShardModelRunner:
 
             with torch.inference_mode():
                 session = self._get_or_create_session(request_id, step_index)
+                target_device = self._device
                 if isinstance(input_data, list):
                     if self._embed_tokens is None:
                         raise RuntimeError("Head node embedding layer is not loaded.")
                     ids_tensor = torch.tensor([input_data], dtype=torch.long)
-                    hidden_states = self._embed_tokens(ids_tensor)
+                    hidden_states = self._embed_tokens(ids_tensor).to(
+                        device=target_device, dtype=self._compute_dtype
+                    )
                 else:
                     raw_in = bytes(input_data)
                     if shape is not None:
@@ -866,7 +871,7 @@ class ShardModelRunner:
                     hidden_states = (
                         torch.frombuffer(bytearray(raw_in), dtype=torch.float32)
                         .reshape(1, seq_len, hidden_dim)
-                        .to(dtype=self._compute_dtype)
+                        .to(device=target_device, dtype=self._compute_dtype)
                     )
 
                 seq_len = int(hidden_states.shape[1])
@@ -874,9 +879,11 @@ class ShardModelRunner:
                     session.past_key_values.get_seq_length(self.shard_layer_start)
                 )
                 position_ids = torch.arange(
-                    past_len, past_len + seq_len, dtype=torch.long
+                    past_len, past_len + seq_len, dtype=torch.long, device=target_device
                 ).unsqueeze(0)
-                cache_position = torch.arange(past_len, past_len + seq_len, dtype=torch.long)
+                cache_position = torch.arange(
+                    past_len, past_len + seq_len, dtype=torch.long, device=target_device
+                )
 
                 position_embeddings: Any = None
                 if self._rotary_emb is not None:
@@ -900,6 +907,7 @@ class ShardModelRunner:
                         (1, 1, seq_len, total_kv_len),
                         fill_value=min_val,
                         dtype=hidden_states.dtype,
+                        device=target_device,
                     )
                     attention_mask = torch.triu(mask, diagonal=1 + past_len)
 
@@ -920,7 +928,11 @@ class ShardModelRunner:
                     )
                     hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-                out_f32 = hidden_states.squeeze(0).to(torch.float32).contiguous()
+                out_f32 = (
+                    hidden_states.squeeze(0)
+                    .to(device="cpu", dtype=torch.float32)
+                    .contiguous()
+                )
                 return out_f32.numpy().tobytes(), (int(out_f32.shape[0]), int(out_f32.shape[1]))
 
         if self._native_handle is not None and not self.supports_pipeline_sharding:
@@ -982,11 +994,13 @@ class ShardModelRunner:
                 last_hidden = (
                     torch.frombuffer(bytearray(last_slice), dtype=torch.float32)
                     .reshape(1, 1, self.hidden_dim)
-                    .to(dtype=self._compute_dtype)
+                    .to(device=self._device, dtype=self._compute_dtype)
                 )
 
                 normed = self._norm(last_hidden)
-                logits = self._lm_head(normed)[0, -1, :].to(torch.float32)
+                logits = self._lm_head(normed)[0, -1, :].to(
+                    device="cpu", dtype=torch.float32
+                )
                 softcap = getattr(self._hf_config, "final_logit_softcapping", None)
                 if (
                     not isinstance(softcap, bool)

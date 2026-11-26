@@ -17,11 +17,13 @@ from p2p.serializer import (
     ActivationFrame,
     DecodedTokenFrame,
     InferenceErrorFrame,
+    InferenceHeartbeatFrame,
     InferenceRequestFrame,
     PacketType,
     deserialize_activation_tensor,
     deserialize_decoded_token,
     deserialize_inference_error,
+    deserialize_inference_heartbeat,
     deserialize_inference_request,
 )
 
@@ -152,6 +154,7 @@ async def dispatch_p2p_frame(
     on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
     on_inference_request: Callable[[InferenceRequestFrame], Awaitable[None]] | None = None,
     on_inference_error: Callable[[InferenceErrorFrame], Awaitable[None]] | None = None,
+    on_inference_heartbeat: Callable[[InferenceHeartbeatFrame], Awaitable[None]] | None = None,
 ) -> None:
     """Validate, deserialize, and dispatch a single binary P2P frame."""
     frame_len = len(frame_bytes)
@@ -189,6 +192,10 @@ async def dispatch_p2p_frame(
             )
         inference_err_frame = deserialize_inference_error(frame_bytes)
         await on_inference_error(inference_err_frame)
+    elif pkt_type == int(PacketType.INFERENCE_HEARTBEAT):
+        hb_frame = deserialize_inference_heartbeat(frame_bytes)
+        if on_inference_heartbeat is not None:
+            await on_inference_heartbeat(hb_frame)
     else:
         raise ValueError(f"Unsupported P2P packet type: {pkt_type}")
 
@@ -198,9 +205,10 @@ async def handle_incoming_p2p_stream(
     writer: asyncio.StreamWriter,
     on_activation_frame: Callable[[ActivationFrame], Awaitable[None]],
     on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float = 45.0,
     on_inference_request: Callable[[InferenceRequestFrame], Awaitable[None]] | None = None,
     on_inference_error: Callable[[InferenceErrorFrame], Awaitable[None]] | None = None,
+    on_inference_heartbeat: Callable[[InferenceHeartbeatFrame], Awaitable[None]] | None = None,
 ) -> None:
     """Read, validate, deserialize, and process a binary P2P frame before sending ACK/NACK."""
     try:
@@ -227,6 +235,7 @@ async def handle_incoming_p2p_stream(
             on_token_frame=on_token_frame,
             on_inference_request=on_inference_request,
             on_inference_error=on_inference_error,
+            on_inference_heartbeat=on_inference_heartbeat,
         )
 
         # Acknowledge ONLY after validation, deserialization, and handler execution succeed
@@ -255,6 +264,7 @@ async def receive_activations(
     on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
     on_inference_request: Callable[[InferenceRequestFrame], Awaitable[None]] | None = None,
     on_inference_error: Callable[[InferenceErrorFrame], Awaitable[None]] | None = None,
+    on_inference_heartbeat: Callable[[InferenceHeartbeatFrame], Awaitable[None]] | None = None,
 ) -> asyncio.AbstractServer:
     """Start an async TCP server listening for incoming binary activation streams from peers.
 
@@ -265,6 +275,7 @@ async def receive_activations(
         on_token_frame: Async callback invoked when a Tail Node returns a `DecodedTokenFrame`.
         on_inference_request: Async callback invoked when a non-Head peer proxies an inference request.
         on_inference_error: Async callback invoked when a Head Node returns a terminal inference error.
+        on_inference_heartbeat: Async callback invoked when a Head Node sends a progress heartbeat.
 
     Returns:
         asyncio.AbstractServer: Running asyncio TCP server instance.
@@ -280,6 +291,7 @@ async def receive_activations(
             on_token_frame=on_token_frame,
             on_inference_request=on_inference_request,
             on_inference_error=on_inference_error,
+            on_inference_heartbeat=on_inference_heartbeat,
         )
 
     server = await asyncio.start_server(_client_connected, host=host, port=port)

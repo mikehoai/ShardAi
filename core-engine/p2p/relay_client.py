@@ -257,7 +257,7 @@ class RelayClient:
         self,
         dst_node_id: str,
         frame: bytes,
-        ack_timeout: float = 10.0,
+        ack_timeout: float = 60.0,
     ) -> float:
         """Send a binary P2P frame through the relay to `dst_node_id` and await ACK."""
         if not self.is_connected or self._node_id is None:

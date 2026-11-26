@@ -57,14 +57,17 @@ from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_disc
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
 from p2p.relay_client import RelayClient
 from p2p.serializer import (
+    AUTO_BF16_WIRE_MIN_BYTES,
     MAX_PROXIED_TOKENS,
     ActivationFrame,
     DecodedTokenFrame,
     InferenceErrorFrame,
+    InferenceHeartbeatFrame,
     InferenceRequestFrame,
     serialize_activation_tensor,
     serialize_decoded_token,
     serialize_inference_error,
+    serialize_inference_heartbeat,
     serialize_inference_request,
 )
 from p2p.transport import (
@@ -418,12 +421,29 @@ class LocalNodeRuntime:
         self.p2p_server: asyncio.AbstractServer | None = None
         self.pending_token_queues: dict[str, asyncio.Queue[DecodedTokenFrame]] = {}
         self.pending_proxy_queues: dict[
-            str, asyncio.Queue[DecodedTokenFrame | InferenceErrorFrame]
+            str,
+            asyncio.Queue[
+                DecodedTokenFrame | InferenceErrorFrame | InferenceHeartbeatFrame
+            ],
         ] = {}
         self._proxied_inference_tasks: set[asyncio.Task[None]] = set()
         self.active_request_steps: dict[str, int] = {}
-        self.single_peer_token_timeout_seconds: float = 60.0
-        self.failover_token_timeout_seconds: float = 10.0
+        self.single_peer_token_timeout_seconds: float = float(
+            os.getenv("SHARDAI_SINGLE_PEER_TIMEOUT_SECONDS", "90.0")
+        )
+        self.prefill_token_timeout_seconds: float = float(
+            os.getenv("SHARDAI_PREFILL_TIMEOUT_SECONDS", "180.0")
+        )
+        self.failover_token_timeout_seconds: float = float(
+            os.getenv("SHARDAI_FAILOVER_TIMEOUT_SECONDS", "45.0")
+        )
+        self.proxy_heartbeat_interval_seconds: float = float(
+            os.getenv("SHARDAI_PROXY_HEARTBEAT_INTERVAL_SECONDS", "5.0")
+        )
+        self.sse_keepalive_interval_seconds: float = float(
+            os.getenv("SHARDAI_SSE_KEEPALIVE_INTERVAL_SECONDS", "15.0")
+        )
+        self._peer_step_ema_ms: dict[str, float] = {}
         self.failed_peer_cooldown_seconds: float = 60.0
         self._evicted_peers: dict[str, tuple[float, str, int]] = {}
         self._promoted_peer_ids: dict[str, float] = {}
@@ -438,6 +458,9 @@ class LocalNodeRuntime:
         )
         self._compute_lock: asyncio.Lock | None = None
         self._compute_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._pipeline_turn_lock: asyncio.Lock | None = None
+        self._pipeline_turn_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._queued_pipeline_requests: int = 0
         self._lifecycle_lock: asyncio.Lock | None = None
         self._lifecycle_lock_loop: asyncio.AbstractEventLoop | None = None
         self.tracker_client: SignalingTrackerClient = SignalingTrackerClient(
@@ -456,6 +479,113 @@ class LocalNodeRuntime:
             self._compute_lock = asyncio.Lock()
             self._compute_lock_loop = running_loop
         return self._compute_lock
+
+    def get_pipeline_turn_lock(self) -> asyncio.Lock:
+        """Return the fair FIFO request-turn lock bound to the active event loop."""
+        running_loop = asyncio.get_running_loop()
+        if (
+            self._pipeline_turn_lock is None
+            or self._pipeline_turn_lock_loop is not running_loop
+        ):
+            self._pipeline_turn_lock = asyncio.Lock()
+            self._pipeline_turn_lock_loop = running_loop
+        return self._pipeline_turn_lock
+
+    @asynccontextmanager
+    async def _acquire_pipeline_turn(
+        self, stop_event: threading.Event | None = None
+    ) -> AsyncIterator[bool]:
+        """Acquire the Head pipeline turn lock with responsive stop_event cancellation."""
+        turn_lock = self.get_pipeline_turn_lock()
+        acquired = False
+        self._queued_pipeline_requests += 1
+        try:
+            while not acquired:
+                if stop_event is not None and stop_event.is_set():
+                    yield False
+                    return
+                acquire_task: asyncio.Task[bool] = asyncio.create_task(turn_lock.acquire())
+                try:
+                    while not acquire_task.done():
+                        if stop_event is not None and stop_event.is_set():
+                            acquire_task.cancel()
+                            try:
+                                await acquire_task
+                            except asyncio.CancelledError:
+                                pass
+                            yield False
+                            return
+                        await asyncio.wait({acquire_task}, timeout=0.1)
+                    acquired = acquire_task.result()
+                except BaseException:
+                    if not acquire_task.done():
+                        acquire_task.cancel()
+                        try:
+                            await acquire_task
+                        except asyncio.CancelledError:
+                            pass
+                    elif not acquire_task.cancelled() and acquire_task.exception() is None:
+                        if acquire_task.result():
+                            turn_lock.release()
+                    raise
+        finally:
+            self._queued_pipeline_requests = max(0, self._queued_pipeline_requests - 1)
+
+        try:
+            yield True
+        finally:
+            if acquired and turn_lock.locked():
+                turn_lock.release()
+
+    def record_peer_step_latency(self, peer_id: str, elapsed_ms: float) -> None:
+        """Update bounded exponential moving average step latency for a downstream peer."""
+        if not peer_id or elapsed_ms <= 0.0:
+            return
+        prev = self._peer_step_ema_ms.get(peer_id)
+        updated = elapsed_ms if prev is None else (0.7 * prev + 0.3 * elapsed_ms)
+        self._peer_step_ema_ms[peer_id] = updated
+        while len(self._peer_step_ema_ms) > _MAX_FAILOVER_TRACKED_PEERS:
+            oldest = next(iter(self._peer_step_ema_ms))
+            self._peer_step_ema_ms.pop(oldest, None)
+
+    def resolve_step_timeout(
+        self,
+        step_index: int,
+        candidate_count: int,
+        peer_id: str | None = None,
+    ) -> float:
+        """Compute adaptive per-step timeout for prefill (step 0), decode, and failover."""
+        base = (
+            self.single_peer_token_timeout_seconds
+            if candidate_count <= 1
+            else self.failover_token_timeout_seconds
+        )
+        # Preserve small explicit timeout overrides used in unit tests verbatim.
+        if base < 30.0:
+            return base
+
+        effective = base
+        if peer_id and peer_id in self._peer_step_ema_ms:
+            ema_sec = self._peer_step_ema_ms[peer_id] / 1000.0
+            effective = max(effective, min(300.0, ema_sec * 3.0 + 15.0))
+
+        if step_index == 0:
+            if candidate_count <= 1:
+                effective = max(effective, self.prefill_token_timeout_seconds)
+            else:
+                effective = max(
+                    effective,
+                    min(self.prefill_token_timeout_seconds, base * 2.0),
+                )
+        return effective
+
+    def _should_use_bf16_wire(self, raw_bytes: bytes) -> bool:
+        """Return True when hidden-state tensors should use 16-bit bfloat16 wire encoding."""
+        if os.getenv("SHARDAI_WIRE_BF16", "true").lower() != "true":
+            return False
+        if self.model_runner is None or not self.model_runner.is_real_model:
+            return False
+        return len(raw_bytes) >= AUTO_BF16_WIRE_MIN_BYTES and (len(raw_bytes) % 4) == 0
 
     def get_lifecycle_lock(self) -> asyncio.Lock:
         """Return the lifecycle serialization lock bound to the active event loop."""
@@ -758,6 +888,7 @@ class LocalNodeRuntime:
                 on_token_frame=self.handle_incoming_decoded_token,
                 on_inference_request=self.handle_incoming_inference_request,
                 on_inference_error=self.handle_incoming_inference_error,
+                on_inference_heartbeat=self.handle_incoming_inference_heartbeat,
             )
         finally:
             current_relay_source.reset(token)
@@ -973,6 +1104,12 @@ class LocalNodeRuntime:
                 frame=token_packet,
             )
         elif next_peer is not None:
+            next_candidates = self.find_candidate_peers_for_next_layer(completed_layer)
+            next_timeout = self.resolve_step_timeout(
+                frame.step_index,
+                len(next_candidates),
+                next_candidates[0].peer_id if next_candidates else None,
+            )
             next_frame_bytes: bytes = serialize_activation_tensor(
                 tensor_data=output_tensor_bytes,
                 shape=output_shape,
@@ -986,11 +1123,13 @@ class LocalNodeRuntime:
                 network_congested=congestion_monitor.is_congested,
                 force_compression=True,
                 temperature=frame.temperature,
+                use_bfloat16_wire=self._should_use_bf16_wire(output_tensor_bytes),
             )
             await self.send_with_failover(
                 completed_layer=completed_layer,
                 frame_bytes=next_frame_bytes,
-                ack_timeout_seconds=self.failover_token_timeout_seconds,
+                timeout_seconds=15.0,
+                ack_timeout_seconds=next_timeout,
             )
         else:
             err_msg = (
@@ -1002,16 +1141,31 @@ class LocalNodeRuntime:
 
     @staticmethod
     def _enqueue_proxy_frame(
-        proxy_queue: asyncio.Queue[DecodedTokenFrame | InferenceErrorFrame],
-        frame: DecodedTokenFrame | InferenceErrorFrame,
+        proxy_queue: asyncio.Queue[
+            DecodedTokenFrame | InferenceErrorFrame | InferenceHeartbeatFrame
+        ],
+        frame: DecodedTokenFrame | InferenceErrorFrame | InferenceHeartbeatFrame,
     ) -> None:
-        """Push a decoded token or error into a proxy queue, evicting oldest if full."""
+        """Push a decoded token, error, or heartbeat into a proxy queue cleanly."""
+        if isinstance(frame, InferenceHeartbeatFrame):
+            if not proxy_queue.full():
+                proxy_queue.put_nowait(frame)
+            return
         if proxy_queue.full():
             try:
                 proxy_queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
         proxy_queue.put_nowait(frame)
+
+    async def handle_incoming_inference_heartbeat(
+        self, hb_frame: InferenceHeartbeatFrame
+    ) -> None:
+        """Callback triggered on a proxying non-Head node when the Head sends a keep-alive."""
+        proxy_queue = self.pending_proxy_queues.get(hb_frame.request_id)
+        if proxy_queue is None:
+            return
+        self._enqueue_proxy_frame(proxy_queue, hb_frame)
 
     async def handle_incoming_decoded_token(self, token_frame: DecodedTokenFrame) -> None:
         """Callback triggered when a Tail Node or Head Node returns a decoded token."""
@@ -1143,6 +1297,34 @@ class LocalNodeRuntime:
         saw_eos: bool = False
         send_failed: bool = False
         last_step_idx: int = -1
+        hb_interval: float = max(0.05, float(self.proxy_heartbeat_interval_seconds))
+
+        async def _heartbeat_loop() -> None:
+            """Send periodic keep-alive heartbeats while queued or running slow prefill/decode."""
+            try:
+                while not proxy_stop_event.is_set() and not send_failed:
+                    await asyncio.sleep(hb_interval)
+                    if proxy_stop_event.is_set() or send_failed:
+                        break
+                    is_computing_now = last_step_idx >= 0 or self._queued_pipeline_requests == 0
+                    hb_packet = serialize_inference_heartbeat(
+                        request_id=frame.request_id,
+                        is_computing=is_computing_now,
+                        progress_index=max(0, last_step_idx + 1),
+                    )
+                    try:
+                        await self._send_to_endpoint(
+                            ip=frame.requester_ip,
+                            port=frame.requester_port,
+                            frame=hb_packet,
+                            timeout_seconds=5.0,
+                        )
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        hb_task: asyncio.Task[None] = asyncio.create_task(_heartbeat_loop())
 
         async def _send_error_back(status_code: int, detail: str) -> None:
             if send_failed:
@@ -1254,6 +1436,12 @@ class LocalNodeRuntime:
             )
         finally:
             proxy_stop_event.set()
+            if not hb_task.done():
+                hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     @staticmethod
     def _drain_token_queue_for_step(
@@ -1628,9 +1816,9 @@ class LocalNodeRuntime:
 
         effective_max_tokens: int = max(1, min(int(max_tokens), MAX_PROXIED_TOKENS))
         proxy_request_id: str = str(uuid.uuid4())
-        proxy_queue: asyncio.Queue[DecodedTokenFrame | InferenceErrorFrame] = (
-            asyncio.Queue(maxsize=64)
-        )
+        proxy_queue: asyncio.Queue[
+            DecodedTokenFrame | InferenceErrorFrame | InferenceHeartbeatFrame
+        ] = asyncio.Queue(maxsize=64)
         self.pending_proxy_queues[proxy_request_id] = proxy_queue
 
         try:
@@ -1660,7 +1848,8 @@ class LocalNodeRuntime:
                     await self.send_frame_to_peer(
                         peer=candidate,
                         frame=req_bytes,
-                        timeout_seconds=5.0,
+                        timeout_seconds=15.0,
+                        ack_timeout_seconds=30.0,
                     )
                     selected_head = candidate
                     if idx > 0:
@@ -1685,11 +1874,17 @@ class LocalNodeRuntime:
                     f"All Head Node peers failed to accept proxied inference request: {last_exc}"
                 ) from last_exc
 
+            current_step = 0
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
-                deadline: float = time.monotonic() + self.single_peer_token_timeout_seconds
-                frame: DecodedTokenFrame | InferenceErrorFrame | None = None
+                idle_timeout = self.resolve_step_timeout(
+                    current_step, 1, selected_head.peer_id
+                )
+                deadline: float = time.monotonic() + idle_timeout
+                frame: (
+                    DecodedTokenFrame | InferenceErrorFrame | InferenceHeartbeatFrame | None
+                ) = None
                 while True:
                     if stop_event is not None and stop_event.is_set():
                         return
@@ -1706,9 +1901,12 @@ class LocalNodeRuntime:
                             proxy_queue.get(),
                             timeout=wait_slice,
                         )
-                        break
                     except asyncio.TimeoutError:
                         continue
+                    if isinstance(frame, InferenceHeartbeatFrame):
+                        deadline = time.monotonic() + idle_timeout
+                        continue
+                    break
 
                 if isinstance(frame, InferenceErrorFrame):
                     if (
@@ -1721,6 +1919,7 @@ class LocalNodeRuntime:
                         )
                     raise RuntimeError(frame.detail)
 
+                current_step = frame.step_index + 1
                 yield (
                     proxy_request_id,
                     frame.step_index,
@@ -1762,190 +1961,201 @@ class LocalNodeRuntime:
                     yield item
             return
 
-        next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
-            self.shard_layer_end
-        )
-        if not has_images:
-            self._raise_if_unsupported_gguf_sharding(next_peer_initial)
+        async with self._acquire_pipeline_turn(stop_event=stop_event) as turn_acquired:
+            if not turn_acquired or self.model_runner is None:
+                return
 
-        request_id: str = str(uuid.uuid4())
-        token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue(maxsize=64)
-        self.pending_token_queues[request_id] = token_queue
-        self.active_request_steps[request_id] = 0
-        if self.model_runner.has_native_llama and next_peer_initial is None:
+            next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
+                self.shard_layer_end
+            )
+            if not has_images:
+                self._raise_if_unsupported_gguf_sharding(next_peer_initial)
+
+            request_id: str = str(uuid.uuid4())
+            token_queue: asyncio.Queue[DecodedTokenFrame] = asyncio.Queue(maxsize=64)
+            self.pending_token_queues[request_id] = token_queue
+            self.active_request_steps[request_id] = 0
+            if self.model_runner.has_native_llama and next_peer_initial is None:
+                try:
+                    async with aclosing(
+                        self._stream_native_async(
+                            prompt=prompt,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            stop_event=stop_event,
+                        )
+                    ) as native_stream:
+                        async for step_idx, token_text, is_eos in native_stream:
+                            self.active_request_steps[request_id] = step_idx
+                            yield request_id, step_idx, 0, token_text, is_eos
+                            if is_eos:
+                                break
+                finally:
+                    self.pending_token_queues.pop(request_id, None)
+                    self.active_request_steps.pop(request_id, None)
+                    if self.model_runner is not None:
+                        self.model_runner.release_request_cache(request_id)
+                return
+
             try:
-                async with aclosing(
-                    self._stream_native_async(
-                        prompt=prompt,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stop_event=stop_event,
+                if messages_contain_image(messages):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            "Multimodal image attachments require single-node native vision execution "
+                            "and cannot be routed through multi-peer sharded text tokenization."
+                        ),
                     )
-                ) as native_stream:
-                    async for step_idx, token_text, is_eos in native_stream:
-                        self.active_request_steps[request_id] = step_idx
-                        yield request_id, step_idx, 0, token_text, is_eos
-                        if is_eos:
-                            break
+                if messages and self.model_runner.is_real_model:
+                    token_ids: list[int] = self.model_runner.tokenize_chat(messages)
+                else:
+                    token_ids = self.model_runner.tokenize(prompt)
+                origin_port: int = self.p2p_listen_port or 49152
+
+                for step_idx in range(max_tokens):
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    self.active_request_steps[request_id] = step_idx
+                    step_input_ids: list[int] = (
+                        token_ids
+                        if (step_idx == 0 or not self.model_runner.is_real_model)
+                        else [token_ids[-1]]
+                    )
+                    async with self.get_compute_lock():
+                        hidden_bytes, tensor_shape = await asyncio.to_thread(
+                            self.model_runner.forward_pass,
+                            step_input_ids,
+                            request_id=request_id,
+                            step_index=step_idx,
+                        )
+
+                    next_peer: PeerNodeInfo | None = self.find_next_hop_peer(
+                        self.shard_layer_end
+                    )
+
+                    if (
+                        next_peer is not None
+                        and self.shard_layer_end < (self.total_layers - 1)
+                    ):
+                        candidates = self.find_candidate_peers_for_next_layer(
+                            self.shard_layer_end
+                        )
+                        decoded_frame: DecodedTokenFrame | None = None
+                        last_step_err: Exception | None = None
+                        failed_candidates: list[PeerNodeInfo] = []
+                        use_bf16 = self._should_use_bf16_wire(hidden_bytes)
+
+                        for idx, candidate in enumerate(candidates):
+                            step_timeout = self.resolve_step_timeout(
+                                step_idx, len(candidates), candidate.peer_id
+                            )
+                            advertise_ip: str = _resolve_advertise_ip(
+                                candidate.ip_address,
+                                candidate.port,
+                                public_ip=self.public_ip,
+                            )
+                            binary_frame: bytes = serialize_activation_tensor(
+                                tensor_data=hidden_bytes,
+                                shape=tensor_shape,
+                                request_id=request_id,
+                                origin_ip=advertise_ip,
+                                origin_port=origin_port,
+                                current_layer=self.shard_layer_end,
+                                total_layers=self.total_layers,
+                                step_index=step_idx,
+                                max_tokens=max_tokens,
+                                network_congested=congestion_monitor.is_congested,
+                                force_compression=compress_activations,
+                                temperature=temperature,
+                                use_bfloat16_wire=use_bf16,
+                            )
+                            self._drain_token_queue_for_step(
+                                token_queue,
+                                request_id=request_id,
+                                expected_step=step_idx,
+                                discard_all=(idx > 0),
+                            )
+                            step_t0 = time.perf_counter()
+                            try:
+                                await self.send_frame_to_peer(
+                                    peer=candidate,
+                                    frame=binary_frame,
+                                    timeout_seconds=15.0,
+                                    ack_timeout_seconds=step_timeout,
+                                )
+                                decoded_frame = await self._wait_for_step_token(
+                                    token_queue,
+                                    request_id=request_id,
+                                    expected_step=step_idx,
+                                    timeout_seconds=step_timeout,
+                                )
+                                elapsed_step_ms = (time.perf_counter() - step_t0) * 1000.0
+                                self.record_peer_step_latency(
+                                    candidate.peer_id, elapsed_step_ms
+                                )
+                                if idx > 0:
+                                    promoted = self._promote_failover_peer(
+                                        promoted_peer=candidate,
+                                        failed_peers=failed_candidates,
+                                    )
+                                    logger.info(
+                                        "Pipeline failover succeeded via %s peer %s (%s:%d); "
+                                        "promoted to primary and evicted %d failed peer(s)",
+                                        candidate.role.value,
+                                        promoted.peer_id,
+                                        promoted.ip_address,
+                                        promoted.port,
+                                        len(failed_candidates),
+                                    )
+                                break
+                            except (
+                                TimeoutError,
+                                asyncio.TimeoutError,
+                                OSError,
+                                RuntimeError,
+                            ) as step_exc:
+                                last_step_err = step_exc
+                                failed_candidates.append(candidate)
+                                logger.warning(
+                                    "Peer %s (%s) dropped/timed out at step %d (%s); attempting backup failover...",
+                                    candidate.peer_id,
+                                    candidate.role.value,
+                                    step_idx,
+                                    step_exc,
+                                )
+
+                        if decoded_frame is None:
+                            raise RuntimeError(
+                                f"All primary and backup peers failed at step {step_idx}: {last_step_err}"
+                            )
+                        self.active_request_steps[request_id] = step_idx + 1
+                        token_id = decoded_frame.token_id
+                        token_text = decoded_frame.token_text
+                        is_eos = decoded_frame.is_eos
+                    else:
+                        async with self.get_compute_lock():
+                            token_id, token_text, is_eos = await asyncio.to_thread(
+                                self.model_runner.decode_final_layer_to_token,
+                                hidden_bytes,
+                                step_index=step_idx,
+                                max_tokens=max_tokens,
+                                request_id=request_id,
+                                temperature=temperature,
+                            )
+                        if not self.model_runner.is_real_model:
+                            await asyncio.sleep(0.015)
+
+                    yield request_id, step_idx, token_id, token_text, is_eos
+
+                    token_ids.append(token_id)
+                    if is_eos:
+                        break
             finally:
                 self.pending_token_queues.pop(request_id, None)
                 self.active_request_steps.pop(request_id, None)
                 if self.model_runner is not None:
                     self.model_runner.release_request_cache(request_id)
-            return
-
-        try:
-            if messages_contain_image(messages):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        "Multimodal image attachments require single-node native vision execution "
-                        "and cannot be routed through multi-peer sharded text tokenization."
-                    ),
-                )
-            if messages and self.model_runner.is_real_model:
-                token_ids: list[int] = self.model_runner.tokenize_chat(messages)
-            else:
-                token_ids = self.model_runner.tokenize(prompt)
-            origin_port: int = self.p2p_listen_port or 49152
-
-            for step_idx in range(max_tokens):
-                self.active_request_steps[request_id] = step_idx
-                step_input_ids: list[int] = (
-                    token_ids
-                    if (step_idx == 0 or not self.model_runner.is_real_model)
-                    else [token_ids[-1]]
-                )
-                async with self.get_compute_lock():
-                    hidden_bytes, tensor_shape = await asyncio.to_thread(
-                        self.model_runner.forward_pass,
-                        step_input_ids,
-                        request_id=request_id,
-                        step_index=step_idx,
-                    )
-
-                next_peer: PeerNodeInfo | None = self.find_next_hop_peer(
-                    self.shard_layer_end
-                )
-
-                if (
-                    next_peer is not None
-                    and self.shard_layer_end < (self.total_layers - 1)
-                ):
-                    candidates = self.find_candidate_peers_for_next_layer(
-                        self.shard_layer_end
-                    )
-                    decoded_frame: DecodedTokenFrame | None = None
-                    last_step_err: Exception | None = None
-                    failed_candidates: list[PeerNodeInfo] = []
-                    step_timeout: float = (
-                        self.single_peer_token_timeout_seconds
-                        if len(candidates) == 1
-                        else self.failover_token_timeout_seconds
-                    )
-
-                    for idx, candidate in enumerate(candidates):
-                        advertise_ip: str = _resolve_advertise_ip(
-                            candidate.ip_address,
-                            candidate.port,
-                            public_ip=self.public_ip,
-                        )
-                        binary_frame: bytes = serialize_activation_tensor(
-                            tensor_data=hidden_bytes,
-                            shape=tensor_shape,
-                            request_id=request_id,
-                            origin_ip=advertise_ip,
-                            origin_port=origin_port,
-                            current_layer=self.shard_layer_end,
-                            total_layers=self.total_layers,
-                            step_index=step_idx,
-                            max_tokens=max_tokens,
-                            network_congested=congestion_monitor.is_congested,
-                            force_compression=compress_activations,
-                            temperature=temperature,
-                        )
-                        self._drain_token_queue_for_step(
-                            token_queue,
-                            request_id=request_id,
-                            expected_step=step_idx,
-                            discard_all=(idx > 0),
-                        )
-                        try:
-                            await self.send_frame_to_peer(
-                                peer=candidate,
-                                frame=binary_frame,
-                                timeout_seconds=5.0,
-                                ack_timeout_seconds=step_timeout,
-                            )
-                            decoded_frame = await self._wait_for_step_token(
-                                token_queue,
-                                request_id=request_id,
-                                expected_step=step_idx,
-                                timeout_seconds=step_timeout,
-                            )
-                            if idx > 0:
-                                promoted = self._promote_failover_peer(
-                                    promoted_peer=candidate,
-                                    failed_peers=failed_candidates,
-                                )
-                                logger.info(
-                                    "Pipeline failover succeeded via %s peer %s (%s:%d); "
-                                    "promoted to primary and evicted %d failed peer(s)",
-                                    candidate.role.value,
-                                    promoted.peer_id,
-                                    promoted.ip_address,
-                                    promoted.port,
-                                    len(failed_candidates),
-                                )
-                            break
-                        except (
-                            TimeoutError,
-                            asyncio.TimeoutError,
-                            OSError,
-                            RuntimeError,
-                        ) as step_exc:
-                            last_step_err = step_exc
-                            failed_candidates.append(candidate)
-                            logger.warning(
-                                "Peer %s (%s) dropped/timed out at step %d (%s); attempting backup failover...",
-                                candidate.peer_id,
-                                candidate.role.value,
-                                step_idx,
-                                step_exc,
-                            )
-
-                    if decoded_frame is None:
-                        raise RuntimeError(
-                            f"All primary and backup peers failed at step {step_idx}: {last_step_err}"
-                        )
-                    self.active_request_steps[request_id] = step_idx + 1
-                    token_id = decoded_frame.token_id
-                    token_text = decoded_frame.token_text
-                    is_eos = decoded_frame.is_eos
-                else:
-                    async with self.get_compute_lock():
-                        token_id, token_text, is_eos = await asyncio.to_thread(
-                            self.model_runner.decode_final_layer_to_token,
-                            hidden_bytes,
-                            step_index=step_idx,
-                            max_tokens=max_tokens,
-                            request_id=request_id,
-                            temperature=temperature,
-                        )
-                    if not self.model_runner.is_real_model:
-                        await asyncio.sleep(0.015)
-
-                yield request_id, step_idx, token_id, token_text, is_eos
-
-                token_ids.append(token_id)
-                if is_eos:
-                    break
-        finally:
-            self.pending_token_queues.pop(request_id, None)
-            self.active_request_steps.pop(request_id, None)
-            if self.model_runner is not None:
-                self.model_runner.release_request_cache(request_id)
 
     async def start_p2p_listener(
         self,
@@ -1975,6 +2185,7 @@ class LocalNodeRuntime:
                     on_token_frame=self.handle_incoming_decoded_token,
                     on_inference_request=self.handle_incoming_inference_request,
                     on_inference_error=self.handle_incoming_inference_error,
+                    on_inference_heartbeat=self.handle_incoming_inference_heartbeat,
                 )
                 self.p2p_bind_host = bind_host
                 actual_port = (
@@ -2473,6 +2684,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime._peer_routes.clear()
+        runtime._peer_step_ema_ms.clear()
+        runtime._queued_pipeline_requests = 0
         runtime.public_ip = None
         runtime.upnp_mapped_port = None
         runtime.state = NodeState.STOPPED
@@ -3067,6 +3280,8 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
         runtime._evicted_peers.clear()
         runtime._promoted_peer_ids.clear()
         runtime._peer_routes.clear()
+        runtime._peer_step_ema_ms.clear()
+        runtime._queued_pipeline_requests = 0
         runtime.public_ip = None
         runtime.upnp_mapped_port = None
         runtime.peers = []
@@ -3631,6 +3846,8 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         runtime._evicted_peers.clear()
         runtime._promoted_peer_ids.clear()
         runtime._peer_routes.clear()
+        runtime._peer_step_ema_ms.clear()
+        runtime._queued_pipeline_requests = 0
         runtime.public_ip = None
         runtime.peers = discovered_peers
         runtime._active_start_request = request.model_copy(update={"room_key": None})
@@ -3909,25 +4126,53 @@ async def openai_chat_completions(
                         stop_event=stream_stop_event,
                     )
                 ) as token_stream:
-                    async for _req_id, _step, _tok_id, token_text, _is_eos in token_stream:
-                        if not token_text:
-                            continue
-                        content_chunk = json.dumps(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_ts,
-                                "model": served_model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": token_text},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                        )
-                        yield f"data: {content_chunk}\n\n"
+                    keepalive_interval: float = max(
+                        0.05, float(runtime.sse_keepalive_interval_seconds)
+                    )
+                    next_task: asyncio.Task[tuple[str, int, int, str, bool]] | None = None
+                    try:
+                        while True:
+                            if next_task is None:
+                                next_task = asyncio.create_task(token_stream.__anext__())
+                            done, _pending = await asyncio.wait(
+                                {next_task}, timeout=keepalive_interval
+                            )
+                            if not done:
+                                yield ": keepalive\n\n"
+                                continue
+                            finished_task = next_task
+                            next_task = None
+                            try:
+                                _req_id, _step, _tok_id, token_text, _is_eos = (
+                                    finished_task.result()
+                                )
+                            except StopAsyncIteration:
+                                break
+                            if not token_text:
+                                continue
+                            content_chunk = json.dumps(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": served_model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": token_text},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
+                            yield f"data: {content_chunk}\n\n"
+                    finally:
+                        if next_task is not None and not next_task.done():
+                            next_task.cancel()
+                            try:
+                                await next_task
+                            except (BaseException, asyncio.CancelledError):
+                                pass
             except asyncio.CancelledError:
                 stream_stop_event.set()
                 raise

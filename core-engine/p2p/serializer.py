@@ -18,6 +18,8 @@ from typing import Any
 import uuid
 import zlib
 
+import numpy as np
+
 try:
     import lz4.frame as lz4_frame  # type: ignore[import-not-found]
 
@@ -39,6 +41,10 @@ MAX_PROXIED_TOKENS: int = 4096
 # Automatically compress hidden states >= 32 KB or whenever socket RTT indicates congestion
 DEFAULT_COMPRESSION_THRESHOLD_BYTES: int = 32 * 1024
 
+# Codec flag bit encoding bfloat16 wire tensor truncation (50% wire bandwidth reduction)
+TENSOR_DTYPE_BFLOAT16_FLAG: int = 0x40
+AUTO_BF16_WIRE_MIN_BYTES: int = 16 * 1024
+
 
 class PacketType(IntEnum):
     """Wire message types for the ShardAi binary P2P protocol."""
@@ -47,6 +53,7 @@ class PacketType(IntEnum):
     DECODED_TOKEN = 2
     INFERENCE_REQUEST = 3
     INFERENCE_ERROR = 4
+    INFERENCE_HEARTBEAT = 5
 
 
 class CompressionCodec(IntEnum):
@@ -109,6 +116,14 @@ INFERENCE_REQUEST_HEADER_STRUCT = struct.Struct("!4sBB16s4sHHdI")
 # - H  : status_code (uint16)
 INFERENCE_ERROR_HEADER_STRUCT = struct.Struct("!4sBB16sH")
 
+# 24-byte big-endian binary header for INFERENCE_HEARTBEAT frames:
+# - 4s : magic ("SHRD")
+# - B  : packet_type (PacketType.INFERENCE_HEARTBEAT = 5)
+# - B  : status_flag (0=queued, 1=computing)
+# - 16s: request_id (16-byte UUID)
+# - H  : progress_index (uint16)
+INFERENCE_HEARTBEAT_HEADER_STRUCT = struct.Struct("!4sBB16sH")
+
 
 @dataclass(frozen=True, slots=True)
 class ActivationFrame:
@@ -125,6 +140,7 @@ class ActivationFrame:
     raw_tensor_bytes: bytes
     compression_used: CompressionCodec
     temperature: float = DEFAULT_TEMPERATURE
+    wire_bfloat16: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +175,45 @@ class InferenceErrorFrame:
     request_id: str
     status_code: int
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceHeartbeatFrame:
+    """Keep-alive progress heartbeat returned from a Head Node while queuing or computing."""
+
+    request_id: str
+    is_computing: bool
+    progress_index: int
+
+
+def float32_bytes_to_bfloat16_bytes(raw_f32: bytes) -> bytes:
+    """Truncate contiguous little-endian float32 bytes to bfloat16 (round-to-nearest-even)."""
+    if not raw_f32:
+        return b""
+    if len(raw_f32) % 4 != 0:
+        raise ValueError(
+            f"Float32 buffer length ({len(raw_f32)} bytes) must be a multiple of 4."
+        )
+    words = np.frombuffer(raw_f32, dtype="<u4")
+    is_nan = (words & np.uint32(0x7FFFFFFF)) > np.uint32(0x7F800000)
+    rounding_bias = ((words >> np.uint32(16)) & np.uint32(1)) + np.uint32(0x7FFF)
+    rounded = ((words + rounding_bias) >> np.uint32(16)).astype("<u2")
+    nan_vals = (words >> np.uint32(16)).astype("<u2") | np.uint16(0x0040)
+    bf16_u16 = np.where(is_nan, nan_vals, rounded).astype("<u2")
+    return bf16_u16.tobytes()
+
+
+def bfloat16_bytes_to_float32_bytes(raw_bf16: bytes) -> bytes:
+    """Expand contiguous little-endian bfloat16 bytes back into IEEE-754 float32 bytes."""
+    if not raw_bf16:
+        return b""
+    if len(raw_bf16) % 2 != 0:
+        raise ValueError(
+            f"BFloat16 buffer length ({len(raw_bf16)} bytes) must be a multiple of 2."
+        )
+    bf16_u16 = np.frombuffer(raw_bf16, dtype="<u2")
+    words_f32 = bf16_u16.astype("<u4") << np.uint32(16)
+    return words_f32.tobytes()
 
 
 def extract_contiguous_float32_bytes(
@@ -312,19 +367,28 @@ def serialize_activation_tensor(
     network_congested: bool = False,
     force_compression: bool = True,
     temperature: float = DEFAULT_TEMPERATURE,
+    use_bfloat16_wire: bool = False,
 ) -> bytes:
     """Pack a hidden-state tensor and routing metadata into a compact binary byte stream.
 
     Automatically engages LZ4 or Zlib compression when `force_compression` is True,
-    `network_congested` is True, or the raw tensor size >= 32 KB.
+    `network_congested` is True, or the raw tensor size >= 32 KB. When `use_bfloat16_wire`
+    is True, float32 activations are converted to bfloat16 on the wire (50% bandwidth savings).
     """
     validated_temperature: float = _validate_temperature(temperature)
     raw_bytes: bytes = extract_contiguous_float32_bytes(tensor_data)
-    uncompressed_len: int = len(raw_bytes)
-    if uncompressed_len > MAX_UNCOMPRESSED_TENSOR_BYTES:
+    if len(raw_bytes) > MAX_UNCOMPRESSED_TENSOR_BYTES:
         raise ValueError(
-            f"Raw tensor buffer ({uncompressed_len} bytes) exceeds 64 MB maximum limit."
+            f"Raw tensor buffer ({len(raw_bytes)} bytes) exceeds 64 MB maximum limit."
         )
+
+    wire_bf16_active: bool = bool(
+        use_bfloat16_wire and len(raw_bytes) >= 4 and (len(raw_bytes) % 4) == 0
+    )
+    tensor_bytes: bytes = (
+        float32_bytes_to_bfloat16_bytes(raw_bytes) if wire_bf16_active else raw_bytes
+    )
+    uncompressed_len: int = len(tensor_bytes)
 
     should_compress: bool = (
         force_compression
@@ -333,15 +397,16 @@ def serialize_activation_tensor(
     )
 
     if should_compress and uncompressed_len > 0:
-        wire_payload, codec = _compress_buffer(raw_bytes)
+        wire_payload, codec = _compress_buffer(tensor_bytes)
         # If incompressible noise slightly expands the buffer, send uncompressed
         if len(wire_payload) >= uncompressed_len:
-            wire_payload = raw_bytes
+            wire_payload = tensor_bytes
             codec = CompressionCodec.NONE
     else:
-        wire_payload = raw_bytes
+        wire_payload = tensor_bytes
         codec = CompressionCodec.NONE
 
+    codec_flags: int = int(codec) | (TENSOR_DTYPE_BFLOAT16_FLAG if wire_bf16_active else 0)
     crc: int = zlib.crc32(wire_payload) & 0xFFFFFFFF
     req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
     origin_ip_bytes: bytes = socket.inet_aton(origin_ip)
@@ -349,7 +414,7 @@ def serialize_activation_tensor(
     header: bytes = ACTIVATION_HEADER_STRUCT.pack(
         MAGIC_HEADER,
         int(PacketType.ACTIVATION_TENSOR),
-        int(codec),
+        codec_flags,
         req_uuid_bytes,
         origin_ip_bytes,
         origin_port,
@@ -364,6 +429,18 @@ def serialize_activation_tensor(
         validated_temperature,
     )
     return header + wire_payload
+
+
+def _decode_wire_tensor(
+    payload_slice: bytes, codec_val: int, uncompressed_len: int
+) -> tuple[bytes, CompressionCodec, bool]:
+    """Extract dtype/codec flags, bounded-decompress payload, and expand bfloat16 to float32."""
+    is_bf16 = bool(codec_val & TENSOR_DTYPE_BFLOAT16_FLAG)
+    codec = CompressionCodec(codec_val & ~TENSOR_DTYPE_BFLOAT16_FLAG)
+    raw_wire = _decompress_buffer(payload_slice, codec, uncompressed_len)
+    if is_bf16:
+        return bfloat16_bytes_to_float32_bytes(raw_wire), codec, True
+    return raw_wire, codec, False
 
 
 def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
@@ -412,8 +489,9 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         actual_crc: int = zlib.crc32(payload_slice) & 0xFFFFFFFF
         if actual_crc == expected_crc:
             validated_temperature: float = _validate_temperature(temperature)
-            codec = CompressionCodec(codec_val)
-            raw_tensor = _decompress_buffer(payload_slice, codec, uncompressed_len)
+            raw_tensor, codec, wire_bfloat16 = _decode_wire_tensor(
+                payload_slice, codec_val, uncompressed_len
+            )
             return ActivationFrame(
                 request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
                 origin_ip=socket.inet_ntoa(origin_ip_bytes),
@@ -426,6 +504,7 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
                 raw_tensor_bytes=raw_tensor,
                 compression_used=codec,
                 temperature=validated_temperature,
+                wire_bfloat16=wire_bfloat16,
             )
         v2_crc_mismatch = (expected_crc, actual_crc)
 
@@ -461,8 +540,9 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
             f"(expected {reported_expected:#x}, got {reported_actual:#x})"
         )
 
-    codec = CompressionCodec(codec_val)
-    raw_tensor = _decompress_buffer(legacy_payload_slice, codec, uncompressed_len)
+    raw_tensor, codec, wire_bfloat16 = _decode_wire_tensor(
+        legacy_payload_slice, codec_val, uncompressed_len
+    )
 
     return ActivationFrame(
         request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
@@ -476,6 +556,7 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         raw_tensor_bytes=raw_tensor,
         compression_used=codec,
         temperature=DEFAULT_TEMPERATURE,
+        wire_bfloat16=wire_bfloat16,
     )
 
 
@@ -700,4 +781,42 @@ def deserialize_inference_error(frame_bytes: bytes) -> InferenceErrorFrame:
         request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
         status_code=status_code,
         detail=detail_slice.decode("utf-8", errors="replace"),
+    )
+
+
+def serialize_inference_heartbeat(
+    request_id: str,
+    is_computing: bool = True,
+    progress_index: int = 0,
+) -> bytes:
+    """Pack a compact 24-byte INFERENCE_HEARTBEAT progress keep-alive frame."""
+    req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
+    clamped_progress: int = max(0, min(65535, int(progress_index)))
+    return INFERENCE_HEARTBEAT_HEADER_STRUCT.pack(
+        MAGIC_HEADER,
+        int(PacketType.INFERENCE_HEARTBEAT),
+        1 if is_computing else 0,
+        req_uuid_bytes,
+        clamped_progress,
+    )
+
+
+def deserialize_inference_heartbeat(frame_bytes: bytes) -> InferenceHeartbeatFrame:
+    """Unpack a 24-byte INFERENCE_HEARTBEAT frame received from a Head Node peer."""
+    if len(frame_bytes) != INFERENCE_HEARTBEAT_HEADER_STRUCT.size:
+        raise ValueError(
+            f"Invalid heartbeat frame size: expected {INFERENCE_HEARTBEAT_HEADER_STRUCT.size} "
+            f"bytes, got {len(frame_bytes)}"
+        )
+
+    magic, pkt_type, status_flag, req_uuid_bytes, progress_index = (
+        INFERENCE_HEARTBEAT_HEADER_STRUCT.unpack(frame_bytes)
+    )
+    if magic != MAGIC_HEADER or pkt_type != int(PacketType.INFERENCE_HEARTBEAT):
+        raise ValueError("Invalid header in inference heartbeat frame.")
+
+    return InferenceHeartbeatFrame(
+        request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
+        is_computing=bool(status_flag),
+        progress_index=progress_index,
     )
