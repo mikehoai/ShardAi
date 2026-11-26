@@ -10,6 +10,7 @@ Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
 
 from dataclasses import dataclass
 from enum import IntEnum
+import ipaddress
 import json
 import math
 import socket
@@ -354,6 +355,18 @@ def _validate_temperature(temperature: float) -> float:
     return temp_float
 
 
+def _pack_ipv4_or_loopback(ip_str: str) -> bytes:
+    """Pack an IPv4 address into 4 bytes, or map IPv6 addresses to loopback `127.0.0.1`."""
+    cleaned = ip_str.strip().split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return socket.inet_aton(ip_str)
+    if addr.version == 4:
+        return addr.packed
+    return b"\x7f\x00\x00\x01"
+
+
 def serialize_activation_tensor(
     tensor_data: bytes | bytearray | memoryview | Any,
     shape: tuple[int, int],
@@ -409,7 +422,7 @@ def serialize_activation_tensor(
     codec_flags: int = int(codec) | (TENSOR_DTYPE_BFLOAT16_FLAG if wire_bf16_active else 0)
     crc: int = zlib.crc32(wire_payload) & 0xFFFFFFFF
     req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
-    origin_ip_bytes: bytes = socket.inet_aton(origin_ip)
+    origin_ip_bytes: bytes = _pack_ipv4_or_loopback(origin_ip)
 
     header: bytes = ACTIVATION_HEADER_STRUCT.pack(
         MAGIC_HEADER,
@@ -623,7 +636,7 @@ def serialize_inference_request(
         )
     validated_temperature: float = _validate_temperature(temperature)
     req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
-    requester_ip_bytes: bytes = socket.inet_aton(requester_ip)
+    requester_ip_bytes: bytes = _pack_ipv4_or_loopback(requester_ip)
 
     body_bytes: bytes = json.dumps(
         {"prompt": prompt, "messages": messages},
