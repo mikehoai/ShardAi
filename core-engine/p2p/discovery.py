@@ -70,6 +70,7 @@ def _beacon_to_txt(beacon: LanRoomBeacon) -> dict[str, str]:
         "shard_layer_end": str(beacon.shard_layer_end),
         "total_layers": str(beacon.total_layers),
         "role": beacon.role,
+        "announced_to_cloud": "1" if beacon.announced_to_cloud else "0",
     }
     normalized_modality = normalize_beacon_modality(beacon.modality)
     if normalized_modality is not None:
@@ -184,6 +185,7 @@ class ZeroconfLanDiscovery:
             "total_layers": _safe_int(txt.get("total_layers"), 32),
             "role": txt.get("role") or "primary",
             "modality": normalize_beacon_modality(txt.get("modality") or txt.get("mod")),
+            "announced_to_cloud": txt.get("announced_to_cloud") == "1",
             "ip_address": addresses[0] if addresses else "127.0.0.1",
             "source": "zeroconf",
         }
