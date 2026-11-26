@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import sys
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -15,7 +16,12 @@ import httpx
 import numpy as np
 import pytest
 import torch  # type: ignore[import-not-found]
-from transformers import AutoModelForCausalLM, LlamaConfig, Qwen2Config  # type: ignore[import-not-found]
+from transformers import (  # type: ignore[import-not-found]
+    AutoModelForCausalLM,
+    Gemma2Config,
+    LlamaConfig,
+    Qwen2Config,
+)
 
 import main as main_module
 from main import LocalNodeRuntime, app, runtime, start_node, stop_node
@@ -949,3 +955,365 @@ async def test_start_node_post_download_sync_reannounces_real_gguf_layers(
         assert announce_bodies[1]["max_layers_can_hold"] >= 1
     finally:
         await stop_node()
+
+
+# ---------------------------------------------------------------------------
+# 6. Pure-PyTorch GGUF Loader Without `transformers` & Edge-Case Architectures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gguf_sharded_pipeline_works_without_transformers_installed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2-node `llama` GGUF pipeline runs cleanly with `transformers` completely blocked."""
+    torch.manual_seed(99)
+    cfg = LlamaConfig(
+        vocab_size=256,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=128,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+        attention_bias=False,
+        rope_parameters={
+            "rope_theta": 1000000.0,
+            "rope_type": "default",
+            "partial_rotary_factor": 0.5,
+        },
+    )
+    ref_model = AutoModelForCausalLM.from_config(cfg).eval()
+    with torch.no_grad():
+        for name, param in ref_model.named_parameters():
+            if "norm" in name:
+                param.fill_(1.0)
+            else:
+                param.mul_(0.3)
+
+    vocab_tokens = [f"<tok_{i}>" for i in range(256)]
+    vocab_tokens[0] = "<unk>"
+    vocab_tokens[1] = "<s>"
+    vocab_tokens[2] = "</s>"
+    vocab_tokens[3] = "Hello"
+    vocab_tokens[4] = " "
+    vocab_tokens[5] = "world"
+
+    kvs: list[tuple[str, int, Any]] = [
+        ("general.architecture", 8, "llama"),
+        ("general.alignment", 4, 32),
+        ("llama.block_count", 4, cfg.num_hidden_layers),
+        ("llama.embedding_length", 4, cfg.hidden_size),
+        ("llama.feed_forward_length", 4, cfg.intermediate_size),
+        ("llama.context_length", 4, cfg.max_position_embeddings),
+        ("llama.attention.head_count", 4, cfg.num_attention_heads),
+        ("llama.attention.head_count_kv", 4, cfg.num_key_value_heads),
+        ("llama.attention.key_length", 4, cfg.head_dim),
+        ("llama.attention.layer_norm_rms_epsilon", 6, float(cfg.rms_norm_eps)),
+        ("llama.rope.freq_base", 6, 1000000.0),
+        ("llama.rope.dimension_count", 4, 16),
+        ("tokenizer.ggml.tokens", 9, vocab_tokens),
+        ("tokenizer.ggml.bos_token_id", 4, 1),
+        ("tokenizer.ggml.eos_token_id", 4, 2),
+        ("tokenizer.ggml.add_bos_token", 7, False),
+    ]
+
+    hf_to_gguf = {
+        "model.embed_tokens.weight": "token_embd.weight",
+        "model.norm.weight": "output_norm.weight",
+        "lm_head.weight": "output.weight",
+    }
+    gguf_tensors: list[tuple[str, tuple[int, ...], int, bytes]] = []
+    updated_state: dict[str, torch.Tensor] = {}
+
+    for hf_name, tensor in ref_model.state_dict().items():
+        t_out = tensor.detach().cpu().to(torch.float32)
+        if hf_name in hf_to_gguf:
+            g_name = hf_to_gguf[hf_name]
+        else:
+            parts = hf_name.split(".", 3)
+            idx = parts[2]
+            leaf = parts[3]
+            leaf_map = {
+                "input_layernorm.weight": "attn_norm.weight",
+                "post_attention_layernorm.weight": "ffn_norm.weight",
+                "self_attn.q_proj.weight": "attn_q.weight",
+                "self_attn.k_proj.weight": "attn_k.weight",
+                "self_attn.v_proj.weight": "attn_v.weight",
+                "self_attn.o_proj.weight": "attn_output.weight",
+                "mlp.gate_proj.weight": "ffn_gate.weight",
+                "mlp.up_proj.weight": "ffn_up.weight",
+                "mlp.down_proj.weight": "ffn_down.weight",
+            }
+            g_name = f"blk.{idx}.{leaf_map[leaf]}"
+
+        t_store = t_out
+        if "self_attn.q_proj.weight" in hf_name:
+            t_store = (
+                t_out.reshape(cfg.num_attention_heads, 2, cfg.head_dim // 2, cfg.hidden_size)
+                .swapaxes(1, 2)
+                .reshape_as(t_out)
+            )
+        elif "self_attn.k_proj.weight" in hf_name:
+            t_store = (
+                t_out.reshape(cfg.num_key_value_heads, 2, cfg.head_dim // 2, cfg.hidden_size)
+                .swapaxes(1, 2)
+                .reshape_as(t_out)
+            )
+
+        if t_store.ndim == 2:
+            raw, ref_arr = _encode_q8_0(t_store.numpy())
+            gguf_tensors.append((g_name, tuple(t_store.shape), GGML_TYPE_Q8_0, raw))
+            ref_t = torch.from_numpy(ref_arr)
+            if "self_attn.q_proj.weight" in hf_name:
+                ref_t = _reverse_permute_rope_rows(ref_t, cfg.num_attention_heads)
+            elif "self_attn.k_proj.weight" in hf_name:
+                ref_t = _reverse_permute_rope_rows(ref_t, cfg.num_key_value_heads)
+            updated_state[hf_name] = ref_t
+        else:
+            raw_f32 = t_store.numpy().astype("<f4").tobytes()
+            gguf_tensors.append((g_name, tuple(t_store.shape), GGML_TYPE_F32, raw_f32))
+            updated_state[hf_name] = t_out
+
+    ref_model.load_state_dict(updated_state)
+    gguf_path = tmp_path / "minitron-style-llama.gguf"
+    _write_gguf_file(gguf_path, kvs=kvs, tensors=gguf_tensors)
+
+    # Completely block `transformers` imports during shard loading, cache creation, and inference
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    monkeypatch.setitem(sys.modules, "transformers.cache_utils", None)
+
+    head = LocalNodeRuntime()
+    tail = LocalNodeRuntime()
+    head.state = NodeState.RUNNING
+    head.model_id = "bartowski/Mistral-NeMo-Minitron-Test-GGUF"
+    head.shard_layer_start = 0
+    head.shard_layer_end = 1
+    head.total_layers = 4
+    head.model_runner = ShardModelRunner(
+        model_id=head.model_id,
+        model_path=str(gguf_path),
+        shard_layer_start=0,
+        shard_layer_end=1,
+        total_layers=4,
+        max_ram_mb=2048,
+    )
+
+    tail.state = NodeState.RUNNING
+    tail.model_id = head.model_id
+    tail.shard_layer_start = 2
+    tail.shard_layer_end = 3
+    tail.total_layers = 4
+    tail.model_runner = ShardModelRunner(
+        model_id=tail.model_id,
+        model_path=str(gguf_path),
+        shard_layer_start=2,
+        shard_layer_end=3,
+        total_layers=4,
+        max_ram_mb=2048,
+    )
+
+    assert head.model_runner.is_real_model is True
+    assert head.model_runner.supports_pipeline_sharding is True
+    assert tail.model_runner.supports_pipeline_sharding is True
+    assert head.model_runner._hf_config.rotary_dim == 16
+    assert head.model_runner._hf_config.tie_word_embeddings is False
+
+    prompt_ids = head.model_runner.tokenize("Hello world")
+    expected_ids: list[int] = []
+    with torch.inference_mode():
+        cur_ids = torch.tensor([prompt_ids], dtype=torch.long)
+        for _ in range(4):
+            logits = ref_model(cur_ids).logits[:, -1, :]
+            next_id = int(torch.argmax(logits, dim=-1).item())
+            expected_ids.append(next_id)
+            cur_ids = torch.cat([cur_ids, torch.tensor([[next_id]])], dim=1)
+
+    head_port = await head.start_p2p_listener(port=0)
+    tail_port = await tail.start_p2p_listener(port=0)
+    head.p2p_listen_port = head_port
+    tail.p2p_listen_port = tail_port
+    head.peers = [
+        PeerNodeInfo(
+            peer_id="llama-tail",
+            ip_address="127.0.0.1",
+            port=tail_port,
+            shard_layer_start=2,
+            shard_layer_end=3,
+            role=PeerRole.PRIMARY,
+        )
+    ]
+    tail.peers = [
+        PeerNodeInfo(
+            peer_id="llama-head",
+            ip_address="127.0.0.1",
+            port=head_port,
+            shard_layer_start=0,
+            shard_layer_end=1,
+            role=PeerRole.PRIMARY,
+        )
+    ]
+
+    try:
+        produced_ids: list[int] = []
+        async for _rid, _step, tok_id, _text, _eos in head.stream_p2p_pipeline_tokens(
+            prompt="Hello world",
+            max_tokens=4,
+            temperature=0.0,
+        ):
+            produced_ids.append(tok_id)
+        assert produced_ids == expected_ids
+    finally:
+        await head.stop_p2p_listener()
+        await tail.stop_p2p_listener()
+        head.model_runner.release()
+        tail.model_runner.release()
+
+
+def test_gguf_decoder_handles_non_standard_head_dim_and_gemma2_softcapping(
+    tmp_path: Path,
+) -> None:
+    """Non-standard `head_dim` (`64 / 4 != 32`) and Gemma2 sandwich norms + softcapping match HF."""
+    torch.manual_seed(2025)
+    cfg = Gemma2Config(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        query_pre_attn_scalar=256,
+        sliding_window=3,
+        attn_logit_softcapping=50.0,
+        final_logit_softcapping=30.0,
+        tie_word_embeddings=True,
+        rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+    )
+    ref_model = AutoModelForCausalLM.from_config(cfg).eval()
+    with torch.no_grad():
+        for name, param in ref_model.named_parameters():
+            if "norm" in name:
+                # Non-trivial zero-centered HF norm weights -> GGUF stores `1.0 + param`
+                param.uniform_(-0.2, 0.2)
+            else:
+                param.mul_(0.3)
+
+    vocab_tokens = [f"<tok_{i}>" for i in range(64)]
+    kvs: list[tuple[str, int, Any]] = [
+        ("general.architecture", 8, "gemma2"),
+        ("general.alignment", 4, 32),
+        ("gemma2.block_count", 4, cfg.num_hidden_layers),
+        ("gemma2.embedding_length", 4, cfg.hidden_size),
+        ("gemma2.feed_forward_length", 4, cfg.intermediate_size),
+        ("gemma2.context_length", 4, cfg.max_position_embeddings),
+        ("gemma2.attention.head_count", 4, cfg.num_attention_heads),
+        ("gemma2.attention.head_count_kv", 4, cfg.num_key_value_heads),
+        ("gemma2.attention.key_length", 4, cfg.head_dim),
+        ("gemma2.attention.layer_norm_rms_epsilon", 6, float(cfg.rms_norm_eps)),
+        ("gemma2.attention.sliding_window", 4, int(cfg.sliding_window)),
+        ("gemma2.attention.query_pre_attn_scalar", 6, float(cfg.query_pre_attn_scalar)),
+        ("gemma2.attn_logit_softcapping", 6, float(cfg.attn_logit_softcapping)),
+        ("gemma2.final_logit_softcapping", 6, float(cfg.final_logit_softcapping)),
+        ("gemma2.rope.freq_base", 6, 10000.0),
+        ("tokenizer.ggml.tokens", 9, vocab_tokens),
+        ("tokenizer.ggml.bos_token_id", 4, 2),
+        ("tokenizer.ggml.eos_token_id", 4, 1),
+    ]
+
+    gguf_tensors: list[tuple[str, tuple[int, ...], int, bytes]] = []
+    for hf_name, tensor in ref_model.state_dict().items():
+        if hf_name == "lm_head.weight":
+            continue
+        t_out = tensor.detach().cpu().to(torch.float32)
+        if hf_name == "model.embed_tokens.weight":
+            g_name = "token_embd.weight"
+        elif hf_name == "model.norm.weight":
+            g_name = "output_norm.weight"
+            t_out = t_out + 1.0
+        else:
+            parts = hf_name.split(".", 3)
+            idx = parts[2]
+            leaf = parts[3]
+            leaf_map = {
+                "input_layernorm.weight": "attn_norm.weight",
+                "post_attention_layernorm.weight": "post_attention_norm.weight",
+                "pre_feedforward_layernorm.weight": "ffn_norm.weight",
+                "post_feedforward_layernorm.weight": "post_ffw_norm.weight",
+                "self_attn.q_proj.weight": "attn_q.weight",
+                "self_attn.k_proj.weight": "attn_k.weight",
+                "self_attn.v_proj.weight": "attn_v.weight",
+                "self_attn.o_proj.weight": "attn_output.weight",
+                "mlp.gate_proj.weight": "ffn_gate.weight",
+                "mlp.up_proj.weight": "ffn_up.weight",
+                "mlp.down_proj.weight": "ffn_down.weight",
+            }
+            g_name = f"blk.{idx}.{leaf_map[leaf]}"
+            if "norm" in leaf:
+                t_out = t_out + 1.0
+
+        gguf_tensors.append(
+            (g_name, tuple(t_out.shape), GGML_TYPE_F32, t_out.numpy().astype("<f4").tobytes())
+        )
+
+    gguf_path = tmp_path / "tiny-gemma2.gguf"
+    _write_gguf_file(gguf_path, kvs=kvs, tensors=gguf_tensors)
+
+    head = ShardModelRunner(
+        model_id="google/gemma-2-test",
+        model_path=str(gguf_path),
+        shard_layer_start=0,
+        shard_layer_end=0,
+        total_layers=2,
+        max_ram_mb=1024,
+    )
+    tail = ShardModelRunner(
+        model_id="google/gemma-2-test",
+        model_path=str(gguf_path),
+        shard_layer_start=1,
+        shard_layer_end=1,
+        total_layers=2,
+        max_ram_mb=1024,
+    )
+
+    try:
+        assert head._hf_config.head_dim == 32
+        assert head._hf_config.hidden_size == 64
+        assert head._hf_config.num_attention_heads == 4
+        assert head._hf_config.attn_logit_softcapping == pytest.approx(50.0)
+        assert tail._hf_config.final_logit_softcapping == pytest.approx(30.0)
+        assert head._layers[0].pre_feedforward_layernorm is not None
+        assert head._layers[0].post_feedforward_layernorm is not None
+
+        # Multi-token prompt (> sliding_window=3) + 3 greedy decode steps
+        prompt_ids = [2, 10, 20, 30, 40]
+        expected_ids: list[int] = []
+        with torch.inference_mode():
+            cur_ids = torch.tensor([prompt_ids], dtype=torch.long)
+            for _ in range(3):
+                logits = ref_model(cur_ids).logits[:, -1, :]
+                next_id = int(torch.argmax(logits, dim=-1).item())
+                expected_ids.append(next_id)
+                cur_ids = torch.cat([cur_ids, torch.tensor([[next_id]])], dim=1)
+
+        produced_ids: list[int] = []
+        next_input: list[int] = prompt_ids
+        for step in range(3):
+            h0, s0 = head.forward_pass(next_input, request_id="gemma2-req", step_index=step)
+            h1, _ = tail.forward_pass(h0, shape=s0, request_id="gemma2-req", step_index=step)
+            tok_id, _text, _eos = tail.decode_final_layer_to_token(
+                h1, step_index=step, max_tokens=3, request_id="gemma2-req", temperature=0.0
+            )
+            produced_ids.append(tok_id)
+            next_input = [tok_id]
+
+        assert produced_ids == expected_ids
+    finally:
+        head.release()
+        tail.release()
