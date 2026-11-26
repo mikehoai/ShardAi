@@ -54,10 +54,15 @@ from models.shard_runner import ShardModelRunner, messages_contain_image
 from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
 from p2p.serializer import (
+    MAX_PROXIED_TOKENS,
     ActivationFrame,
     DecodedTokenFrame,
+    InferenceErrorFrame,
+    InferenceRequestFrame,
     serialize_activation_tensor,
     serialize_decoded_token,
+    serialize_inference_error,
+    serialize_inference_request,
 )
 from p2p.transport import (
     congestion_monitor,
@@ -344,6 +349,7 @@ def _heartbeat_interval_seconds() -> float:
 
 
 _MAX_FAILOVER_TRACKED_PEERS: int = 256
+_MAX_CONCURRENT_PROXIED_TASKS: int = 16
 
 
 class LocalNodeRuntime:
@@ -389,6 +395,10 @@ class LocalNodeRuntime:
         self.model_runner: ShardModelRunner | None = None
         self.p2p_server: asyncio.AbstractServer | None = None
         self.pending_token_queues: dict[str, asyncio.Queue[DecodedTokenFrame]] = {}
+        self.pending_proxy_queues: dict[
+            str, asyncio.Queue[DecodedTokenFrame | InferenceErrorFrame]
+        ] = {}
+        self._proxied_inference_tasks: set[asyncio.Task[None]] = set()
         self.active_request_steps: dict[str, int] = {}
         self.single_peer_token_timeout_seconds: float = 60.0
         self.failover_token_timeout_seconds: float = 10.0
@@ -460,6 +470,28 @@ class LocalNodeRuntime:
         """Locate the highest-priority downstream P2P peer for `completed_layer + 1`."""
         candidates = self.find_candidate_peers_for_next_layer(completed_layer)
         return candidates[0] if candidates else None
+
+    def find_head_node_peers(self) -> list[PeerNodeInfo]:
+        """Return ordered Head Node peers (`shard_layer_start == 0`), Primary first then largest coverage."""
+        head_peers = [peer for peer in self.peers if peer.shard_layer_start == 0]
+        head_peers.sort(
+            key=lambda p: (
+                0 if p.role == PeerRole.PRIMARY else 1,
+                -p.shard_layer_end,
+            )
+        )
+        return head_peers
+
+    async def cleanup_proxy_state(self) -> None:
+        """Cancel active proxied inference tasks and clear pending proxy queues."""
+        tasks = list(self._proxied_inference_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._proxied_inference_tasks.clear()
+        self.pending_proxy_queues.clear()
 
     def _prune_failover_state(self, now: float | None = None) -> None:
         """Expire old failover quarantine/promotion entries and enforce bounded map size."""
@@ -624,33 +656,52 @@ class LocalNodeRuntime:
             f"All primary and backup peers failed for layer {completed_layer + 1}: {last_exc}"
         ) from last_exc
 
-    def _is_authorized_activation_origin(self, origin_ip: str, origin_port: int) -> bool:
-        """Verify `frame.origin_ip`/`origin_port` matches the head node or a verified peer."""
-        if not (1 <= origin_port <= 65535):
+    @staticmethod
+    def _matches_peer_endpoint(
+        peers: list[PeerNodeInfo], ip: str, port: int
+    ) -> bool:
+        """Verify `(ip, port)` is a valid non-unspecified/multicast/link-local endpoint in `peers`."""
+        if not (1 <= port <= 65535):
             return False
         try:
-            origin_addr = ipaddress.ip_address(origin_ip.strip().split("%", 1)[0])
+            target_addr = ipaddress.ip_address(ip.strip().split("%", 1)[0])
         except ValueError:
             return False
 
-        if origin_addr.is_unspecified or origin_addr.is_multicast or origin_addr.is_link_local:
+        if (
+            target_addr.is_unspecified
+            or target_addr.is_multicast
+            or target_addr.is_link_local
+        ):
             return False
 
+        for peer in peers:
+            if peer.port != port:
+                continue
+            try:
+                peer_addr = ipaddress.ip_address(
+                    peer.ip_address.strip().split("%", 1)[0]
+                )
+            except ValueError:
+                continue
+            if peer_addr == target_addr:
+                return True
+        return False
+
+    def _is_authorized_peer_endpoint(self, ip: str, port: int) -> bool:
+        """Verify `(ip, port)` matches a registered peer in `self.peers`."""
+        if not self.peers:
+            return False
+        return self._matches_peer_endpoint(self.peers, ip, port)
+
+    def _is_authorized_activation_origin(self, origin_ip: str, origin_port: int) -> bool:
+        """Verify `frame.origin_ip`/`origin_port` matches the head node or a verified peer."""
         if not self.peers:
             return False
 
         head_peers = [peer for peer in self.peers if peer.shard_layer_start == 0]
         allowed_peers = head_peers if head_peers else self.peers
-        for peer in allowed_peers:
-            if peer.port != origin_port:
-                continue
-            try:
-                peer_addr = ipaddress.ip_address(peer.ip_address.strip().split("%", 1)[0])
-            except ValueError:
-                continue
-            if peer_addr == origin_addr:
-                return True
-        return False
+        return self._matches_peer_endpoint(allowed_peers, origin_ip, origin_port)
 
     async def handle_incoming_activation(self, frame: ActivationFrame) -> None:
         """Callback triggered by `receive_activations` when an upstream peer pushes a tensor."""
@@ -747,8 +798,26 @@ class LocalNodeRuntime:
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
+    @staticmethod
+    def _enqueue_proxy_frame(
+        proxy_queue: asyncio.Queue[DecodedTokenFrame | InferenceErrorFrame],
+        frame: DecodedTokenFrame | InferenceErrorFrame,
+    ) -> None:
+        """Push a decoded token or error into a proxy queue, evicting oldest if full."""
+        if proxy_queue.full():
+            try:
+                proxy_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        proxy_queue.put_nowait(frame)
+
     async def handle_incoming_decoded_token(self, token_frame: DecodedTokenFrame) -> None:
-        """Callback triggered on the Head Node when the Tail Node returns a decoded token."""
+        """Callback triggered when a Tail Node or Head Node returns a decoded token."""
+        proxy_queue = self.pending_proxy_queues.get(token_frame.request_id)
+        if proxy_queue is not None:
+            self._enqueue_proxy_frame(proxy_queue, token_frame)
+            return
+
         queue = self.pending_token_queues.get(token_frame.request_id)
         if queue is None:
             logger.debug(
@@ -780,6 +849,209 @@ class LocalNodeRuntime:
             except asyncio.QueueEmpty:
                 pass
         queue.put_nowait(token_frame)
+
+    async def handle_incoming_inference_error(
+        self, error_frame: InferenceErrorFrame
+    ) -> None:
+        """Callback triggered on a proxying non-Head node when the Head Node returns an error."""
+        proxy_queue = self.pending_proxy_queues.get(error_frame.request_id)
+        if proxy_queue is None:
+            logger.debug(
+                "Dropping inference error frame for inactive/unknown proxy request %s (status=%d).",
+                error_frame.request_id,
+                error_frame.status_code,
+            )
+            return
+        self._enqueue_proxy_frame(proxy_queue, error_frame)
+
+    async def handle_incoming_inference_request(
+        self, frame: InferenceRequestFrame
+    ) -> None:
+        """Callback triggered on a Head Node when a non-Head peer proxies an inference request."""
+        if self.model_runner is None or self.state != NodeState.RUNNING:
+            logger.warning(
+                "Rejecting incoming proxied inference request because node is not RUNNING."
+            )
+            raise RuntimeError(
+                "Node is not RUNNING and cannot process incoming proxied inference requests."
+            )
+
+        if not self.model_runner.is_head_node:
+            logger.warning(
+                "Rejecting incoming proxied inference request on non-Head node (layers %d..%d).",
+                self.shard_layer_start,
+                self.shard_layer_end,
+            )
+            raise RuntimeError(
+                "Non-Head node cannot accept proxied inference requests."
+            )
+
+        if not self._is_authorized_peer_endpoint(
+            frame.requester_ip, frame.requester_port
+        ):
+            logger.warning(
+                "Rejecting incoming proxied inference request from unauthorized peer %s:%d.",
+                frame.requester_ip,
+                frame.requester_port,
+            )
+            raise RuntimeError(
+                f"Rejected proxied inference request from unauthorized peer "
+                f"{frame.requester_ip}:{frame.requester_port}."
+            )
+
+        if len(self._proxied_inference_tasks) >= _MAX_CONCURRENT_PROXIED_TASKS:
+            logger.warning(
+                "Rejecting incoming proxied inference request %s: reached max concurrent limit (%d).",
+                frame.request_id,
+                _MAX_CONCURRENT_PROXIED_TASKS,
+            )
+            raise RuntimeError(
+                "Head Node reached maximum concurrent proxied inference capacity."
+            )
+
+        try:
+            self.validate_pipeline_preflight(
+                has_image_attachments=messages_contain_image(frame.messages)
+            )
+        except HTTPException as exc:
+            err_packet: bytes = serialize_inference_error(
+                request_id=frame.request_id,
+                status_code=exc.status_code,
+                detail=str(exc.detail),
+            )
+            await send_activations(
+                peer_ip=frame.requester_ip,
+                byte_stream=err_packet,
+                peer_port=frame.requester_port,
+                timeout_seconds=5.0,
+            )
+            return
+
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._run_proxied_inference_task(frame)
+        )
+        self._proxied_inference_tasks.add(task)
+        task.add_done_callback(self._proxied_inference_tasks.discard)
+
+    async def _run_proxied_inference_task(
+        self, frame: InferenceRequestFrame
+    ) -> None:
+        """Run a proxied inference request on the Head Node and stream tokens back to the requester."""
+        proxy_stop_event = threading.Event()
+        saw_eos: bool = False
+        send_failed: bool = False
+        last_step_idx: int = -1
+
+        async def _send_error_back(status_code: int, detail: str) -> None:
+            if send_failed:
+                return
+            err_packet: bytes = serialize_inference_error(
+                request_id=frame.request_id,
+                status_code=status_code,
+                detail=detail,
+            )
+            try:
+                await send_activations(
+                    peer_ip=frame.requester_ip,
+                    byte_stream=err_packet,
+                    peer_port=frame.requester_port,
+                    timeout_seconds=5.0,
+                )
+            except Exception as err_send_exc:
+                logger.warning(
+                    "Failed to return InferenceErrorFrame to %s:%d for request %s: %s",
+                    frame.requester_ip,
+                    frame.requester_port,
+                    frame.request_id,
+                    err_send_exc,
+                )
+
+        try:
+            async with aclosing(
+                self.stream_p2p_pipeline_tokens(
+                    prompt=frame.prompt,
+                    max_tokens=frame.max_tokens,
+                    compress_activations=frame.compress_activations,
+                    messages=frame.messages,
+                    temperature=frame.temperature,
+                    stop_event=proxy_stop_event,
+                )
+            ) as token_stream:
+                async for _req_id, step_idx, token_id, token_text, is_eos in token_stream:
+                    last_step_idx = step_idx
+                    if is_eos:
+                        saw_eos = True
+                    token_packet: bytes = serialize_decoded_token(
+                        request_id=frame.request_id,
+                        step_index=step_idx,
+                        token_id=token_id,
+                        token_text=token_text,
+                        is_eos=is_eos,
+                    )
+                    try:
+                        await send_activations(
+                            peer_ip=frame.requester_ip,
+                            byte_stream=token_packet,
+                            peer_port=frame.requester_port,
+                            timeout_seconds=5.0,
+                        )
+                    except Exception as send_exc:
+                        send_failed = True
+                        proxy_stop_event.set()
+                        logger.warning(
+                            "Failed to stream proxied token to %s:%d for request %s: %s",
+                            frame.requester_ip,
+                            frame.requester_port,
+                            frame.request_id,
+                            send_exc,
+                        )
+                        break
+                    if is_eos:
+                        break
+
+            if not saw_eos and not send_failed and not proxy_stop_event.is_set():
+                eos_packet: bytes = serialize_decoded_token(
+                    request_id=frame.request_id,
+                    step_index=last_step_idx + 1,
+                    token_id=0,
+                    token_text="",
+                    is_eos=True,
+                )
+                try:
+                    await send_activations(
+                        peer_ip=frame.requester_ip,
+                        byte_stream=eos_packet,
+                        peer_port=frame.requester_port,
+                        timeout_seconds=5.0,
+                    )
+                except Exception as eos_send_exc:
+                    send_failed = True
+                    logger.warning(
+                        "Failed to send final EOS token to %s:%d for request %s: %s",
+                        frame.requester_ip,
+                        frame.requester_port,
+                        frame.request_id,
+                        eos_send_exc,
+                    )
+        except asyncio.CancelledError:
+            proxy_stop_event.set()
+            raise
+        except HTTPException as exc:
+            proxy_stop_event.set()
+            await _send_error_back(exc.status_code, str(exc.detail))
+        except Exception as exc:
+            proxy_stop_event.set()
+            logger.error(
+                "Proxied inference task failed for request %s: %s",
+                frame.request_id,
+                exc,
+            )
+            await _send_error_back(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                str(exc),
+            )
+        finally:
+            proxy_stop_event.set()
 
     @staticmethod
     def _drain_token_queue_for_step(
@@ -899,13 +1171,19 @@ class LocalNodeRuntime:
                 ),
             )
         if not self.model_runner.is_head_node:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"This node hosts layers {self.shard_layer_start}..{self.shard_layer_end}. "
-                    "Inference requests must enter via a Head Node holding layer 0."
-                ),
-            )
+            head_peers = self.find_head_node_peers()
+            if not head_peers:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"This node hosts layers {self.shard_layer_start}..{self.shard_layer_end}. "
+                        "Inference requests must enter via a Head Node holding layer 0, "
+                        "and no Head Node peer is currently registered."
+                    ),
+                )
+            if not has_image_attachments:
+                self._raise_if_unsupported_gguf_sharding(head_peers[0])
+            return
 
         next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
             self.shard_layer_end
@@ -1121,6 +1399,137 @@ class LocalNodeRuntime:
                     except asyncio.QueueEmpty:
                         break
 
+    async def _stream_via_head_node_proxy(
+        self,
+        prompt: str,
+        max_tokens: int,
+        compress_activations: bool = True,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        stop_event: threading.Event | None = None,
+    ) -> AsyncIterator[tuple[str, int, int, str, bool]]:
+        """Proxy an inference request from a non-Head node to an authorized Head Node peer."""
+        head_peers = self.find_head_node_peers()
+        if not head_peers:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"This node hosts layers {self.shard_layer_start}..{self.shard_layer_end}. "
+                    "Inference requests must enter via a Head Node holding layer 0, "
+                    "and no Head Node peer is currently registered."
+                ),
+            )
+        if self.p2p_listen_port is None:
+            raise RuntimeError(
+                "Local P2P listener port is not bound; cannot receive proxied tokens from Head Node."
+            )
+
+        effective_max_tokens: int = max(1, min(int(max_tokens), MAX_PROXIED_TOKENS))
+        proxy_request_id: str = str(uuid.uuid4())
+        proxy_queue: asyncio.Queue[DecodedTokenFrame | InferenceErrorFrame] = (
+            asyncio.Queue(maxsize=64)
+        )
+        self.pending_proxy_queues[proxy_request_id] = proxy_queue
+
+        try:
+            selected_head: PeerNodeInfo | None = None
+            last_exc: Exception | None = None
+            failed_heads: list[PeerNodeInfo] = []
+
+            for idx, candidate in enumerate(head_peers):
+                if stop_event is not None and stop_event.is_set():
+                    return
+                advertise_ip: str = _resolve_advertise_ip(
+                    candidate.ip_address, candidate.port
+                )
+                req_bytes: bytes = serialize_inference_request(
+                    request_id=proxy_request_id,
+                    requester_ip=advertise_ip,
+                    requester_port=self.p2p_listen_port,
+                    prompt=prompt,
+                    messages=messages,
+                    max_tokens=effective_max_tokens,
+                    temperature=temperature,
+                    compress_activations=compress_activations,
+                )
+                try:
+                    await send_activations(
+                        peer_ip=candidate.ip_address,
+                        byte_stream=req_bytes,
+                        peer_port=candidate.port,
+                        timeout_seconds=5.0,
+                    )
+                    selected_head = candidate
+                    if idx > 0:
+                        self._promote_failover_peer(
+                            promoted_peer=candidate,
+                            failed_peers=failed_heads,
+                        )
+                    break
+                except (TimeoutError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                    last_exc = exc
+                    failed_heads.append(candidate)
+                    logger.warning(
+                        "Head Node %s (%s:%d) failed to accept proxied request (%s); trying backup Head...",
+                        candidate.peer_id,
+                        candidate.ip_address,
+                        candidate.port,
+                        exc,
+                    )
+
+            if selected_head is None:
+                raise RuntimeError(
+                    f"All Head Node peers failed to accept proxied inference request: {last_exc}"
+                ) from last_exc
+
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                deadline: float = time.monotonic() + self.single_peer_token_timeout_seconds
+                frame: DecodedTokenFrame | InferenceErrorFrame | None = None
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    remaining: float = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise RuntimeError(
+                            f"Timed out waiting for proxied inference token from Head Node "
+                            f"{selected_head.peer_id} ({selected_head.ip_address}:{selected_head.port}) "
+                            f"for request {proxy_request_id}."
+                        )
+                    wait_slice: float = min(0.25, remaining)
+                    try:
+                        frame = await asyncio.wait_for(
+                            proxy_queue.get(),
+                            timeout=wait_slice,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+
+                if isinstance(frame, InferenceErrorFrame):
+                    if (
+                        400 <= frame.status_code < 500
+                        or frame.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+                    ):
+                        raise HTTPException(
+                            status_code=frame.status_code,
+                            detail=frame.detail,
+                        )
+                    raise RuntimeError(frame.detail)
+
+                yield (
+                    proxy_request_id,
+                    frame.step_index,
+                    frame.token_id,
+                    frame.token_text,
+                    frame.is_eos,
+                )
+                if frame.is_eos:
+                    break
+        finally:
+            self.pending_proxy_queues.pop(proxy_request_id, None)
+
     async def stream_p2p_pipeline_tokens(
         self,
         prompt: str,
@@ -1134,6 +1543,21 @@ class LocalNodeRuntime:
         has_images: bool = messages_contain_image(messages)
         self.validate_pipeline_preflight(has_image_attachments=has_images)
         assert self.model_runner is not None
+
+        if not self.model_runner.is_head_node:
+            async with aclosing(
+                self._stream_via_head_node_proxy(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    compress_activations=compress_activations,
+                    messages=messages,
+                    temperature=temperature,
+                    stop_event=stop_event,
+                )
+            ) as proxied_stream:
+                async for item in proxied_stream:
+                    yield item
+            return
 
         next_peer_initial: PeerNodeInfo | None = self.find_next_hop_peer(
             self.shard_layer_end
@@ -1345,6 +1769,8 @@ class LocalNodeRuntime:
                     port=candidate_port,
                     on_activation_frame=self.handle_incoming_activation,
                     on_token_frame=self.handle_incoming_decoded_token,
+                    on_inference_request=self.handle_incoming_inference_request,
+                    on_inference_error=self.handle_incoming_inference_error,
                 )
                 self.p2p_bind_host = bind_host
                 actual_port = (
@@ -1815,6 +2241,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.close()
         await runtime.stop_p2p_listener()
+        await runtime.cleanup_proxy_state()
         await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime.state = NodeState.STOPPED
@@ -2356,6 +2783,7 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
                     cleanup_exc,
                 )
     finally:
+        await runtime.cleanup_proxy_state()
         await _release_model_runner_async()
         runtime.memory_manager.release_all()
         runtime.pending_token_queues.clear()
@@ -3095,6 +3523,22 @@ async def openai_chat_completions(
     served_model: str = request.model or runtime.model_id or "shardai-p2p-model"
 
     if has_images:
+        if runtime.model_runner is not None and not runtime.model_runner.is_head_node:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": {
+                        "message": (
+                            f"Model '{served_model}' cannot process image or vision attachments while "
+                            "running on a non-Head sharded peer. Multimodal vision inference "
+                            "requires single-node (Solo) Head execution."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "messages",
+                        "code": "vision_sharded_mode_not_supported",
+                    }
+                },
+            )
         if runtime.model_runner is None or not runtime.model_runner.has_vision_support:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
