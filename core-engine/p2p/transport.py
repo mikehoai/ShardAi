@@ -6,6 +6,7 @@ between ShardAi nodes with `TCP_NODELAY`, explicit timeouts, and congestion dete
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 import logging
 import socket
 import struct
@@ -33,6 +34,14 @@ NACK_BYTE: bytes = b"\x15"
 DEFAULT_P2P_PORT: int = 49152
 MAX_WIRE_FRAME_BYTES: int = 68 * 1024 * 1024  # 68 MB max wire frame
 CONGESTION_RTT_THRESHOLD_MS: float = 25.0
+
+current_relay_source: ContextVar[str | None] = ContextVar(
+    "current_relay_source", default=None
+)
+
+
+class PeerUnreachableError(OSError):
+    """Raised when a TCP connection to a peer cannot be established."""
 
 
 class BandwidthCongestionMonitor:
@@ -90,10 +99,15 @@ async def send_activations(
     )
     start_ns: int = time.perf_counter_ns()
 
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, resolved_port),
-        timeout=timeout_seconds,
-    )
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, resolved_port),
+            timeout=timeout_seconds,
+        )
+    except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+        raise PeerUnreachableError(
+            f"Unable to connect to peer {host}:{resolved_port}: {exc}"
+        ) from exc
     try:
         # Disable Nagle's algorithm for immediate low-latency tensor streaming
         raw_sock: socket.SocketType | None = writer.get_extra_info("socket")
@@ -132,6 +146,53 @@ async def send_activations(
             pass
 
 
+async def dispatch_p2p_frame(
+    frame_bytes: bytes,
+    on_activation_frame: Callable[[ActivationFrame], Awaitable[None]],
+    on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
+    on_inference_request: Callable[[InferenceRequestFrame], Awaitable[None]] | None = None,
+    on_inference_error: Callable[[InferenceErrorFrame], Awaitable[None]] | None = None,
+) -> None:
+    """Validate, deserialize, and dispatch a single binary P2P frame."""
+    frame_len = len(frame_bytes)
+    if frame_len <= 0 or frame_len > MAX_WIRE_FRAME_BYTES:
+        raise ValueError(f"Rejected invalid P2P frame length: {frame_len} bytes")
+
+    if frame_len < 6 or frame_bytes[:4] != MAGIC_HEADER:
+        raise ValueError("Received malformed frame with invalid magic bytes.")
+
+    pkt_type: int = frame_bytes[4]
+    if pkt_type == int(PacketType.ACTIVATION_TENSOR):
+        activation_frame = await asyncio.to_thread(
+            deserialize_activation_tensor,
+            frame_bytes,
+        )
+        await on_activation_frame(activation_frame)
+    elif pkt_type == int(PacketType.DECODED_TOKEN):
+        if on_token_frame is None:
+            raise ValueError(
+                "Received DECODED_TOKEN frame but no on_token_frame handler is registered."
+            )
+        token_frame = deserialize_decoded_token(frame_bytes)
+        await on_token_frame(token_frame)
+    elif pkt_type == int(PacketType.INFERENCE_REQUEST):
+        if on_inference_request is None:
+            raise ValueError(
+                "Received INFERENCE_REQUEST frame but no on_inference_request handler is registered."
+            )
+        inference_req_frame = deserialize_inference_request(frame_bytes)
+        await on_inference_request(inference_req_frame)
+    elif pkt_type == int(PacketType.INFERENCE_ERROR):
+        if on_inference_error is None:
+            raise ValueError(
+                "Received INFERENCE_ERROR frame but no on_inference_error handler is registered."
+            )
+        inference_err_frame = deserialize_inference_error(frame_bytes)
+        await on_inference_error(inference_err_frame)
+    else:
+        raise ValueError(f"Unsupported P2P packet type: {pkt_type}")
+
+
 async def handle_incoming_p2p_stream(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -160,39 +221,13 @@ async def handle_incoming_p2p_stream(
             timeout=timeout_seconds,
         )
 
-        if len(frame_bytes) < 6 or frame_bytes[:4] != MAGIC_HEADER:
-            raise ValueError("Received malformed frame with invalid magic bytes.")
-
-        pkt_type: int = frame_bytes[4]
-        if pkt_type == int(PacketType.ACTIVATION_TENSOR):
-            activation_frame = await asyncio.to_thread(
-                deserialize_activation_tensor,
-                frame_bytes,
-            )
-            await on_activation_frame(activation_frame)
-        elif pkt_type == int(PacketType.DECODED_TOKEN):
-            if on_token_frame is None:
-                raise ValueError(
-                    "Received DECODED_TOKEN frame but no on_token_frame handler is registered."
-                )
-            token_frame = deserialize_decoded_token(frame_bytes)
-            await on_token_frame(token_frame)
-        elif pkt_type == int(PacketType.INFERENCE_REQUEST):
-            if on_inference_request is None:
-                raise ValueError(
-                    "Received INFERENCE_REQUEST frame but no on_inference_request handler is registered."
-                )
-            inference_req_frame = deserialize_inference_request(frame_bytes)
-            await on_inference_request(inference_req_frame)
-        elif pkt_type == int(PacketType.INFERENCE_ERROR):
-            if on_inference_error is None:
-                raise ValueError(
-                    "Received INFERENCE_ERROR frame but no on_inference_error handler is registered."
-                )
-            inference_err_frame = deserialize_inference_error(frame_bytes)
-            await on_inference_error(inference_err_frame)
-        else:
-            raise ValueError(f"Unsupported P2P packet type: {pkt_type}")
+        await dispatch_p2p_frame(
+            frame_bytes=frame_bytes,
+            on_activation_frame=on_activation_frame,
+            on_token_frame=on_token_frame,
+            on_inference_request=on_inference_request,
+            on_inference_error=on_inference_error,
+        )
 
         # Acknowledge ONLY after validation, deserialization, and handler execution succeed
         writer.write(ACK_BYTE)

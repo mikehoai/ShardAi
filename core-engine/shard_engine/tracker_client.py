@@ -9,13 +9,16 @@ Complies with `.antigravity/rules.md`:
 import asyncio
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import logging
 import random
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
+
+from p2p.relay_client import validate_relay_url
 
 from shard_engine.schemas import (
     PeerNodeInfo,
@@ -43,6 +46,9 @@ class AnnounceAssignment:
     role: PeerRole
     peers: list[PeerNodeInfo]
     peers_authoritative: bool = True
+    observed_ip: str | None = None
+    relay_url: str | None = None
+    relay_token: str | None = None
 
 
 def _normalize_peer(
@@ -414,12 +420,51 @@ class SignalingTrackerClient:
             except Exception as exc:
                 logger.debug("Optional follow-up fetch_peers skipped: %s", exc)
 
+        observed_ip: str | None = None
+        raw_observed_ip = inner_data.get(
+            "observed_ip", response_data.get("observed_ip")
+        )
+        if isinstance(raw_observed_ip, str) and raw_observed_ip.strip():
+            try:
+                observed_ip = str(ipaddress.ip_address(raw_observed_ip.strip()))
+            except ValueError:
+                observed_ip = None
+
+        relay_url: str | None = None
+        relay_token: str | None = None
+        raw_relay = inner_data.get("relay", response_data.get("relay"))
+        if isinstance(raw_relay, dict):
+            raw_relay_url = raw_relay.get("url")
+            raw_relay_token = raw_relay.get("token")
+            tracker_host = urlparse(self.base_url).hostname
+            if (
+                isinstance(raw_relay_url, str)
+                and isinstance(raw_relay_token, str)
+                and raw_relay_token.strip()
+                and tracker_host
+            ):
+                try:
+                    relay_url = validate_relay_url(
+                        raw_relay_url, allowed_host=tracker_host
+                    )
+                    relay_token = raw_relay_token.strip()
+                except ValueError as relay_exc:
+                    logger.warning(
+                        "Ignoring invalid tracker relay configuration: %s",
+                        relay_exc,
+                    )
+                    relay_url = None
+                    relay_token = None
+
         return AnnounceAssignment(
             assigned_start_layer=assigned_start,
             assigned_end_layer=assigned_end,
             role=assigned_role,
             peers=normalized,
             peers_authoritative=peers_authoritative,
+            observed_ip=observed_ip,
+            relay_url=relay_url,
+            relay_token=relay_token,
         )
 
     async def register_node_and_fetch_peers(

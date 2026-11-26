@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 from typing import Any, Literal
+from urllib.parse import urlparse
 import uuid
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -54,6 +55,7 @@ from models.downloader import (
 from models.shard_runner import ShardModelRunner, messages_contain_image
 from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
+from p2p.relay_client import RelayClient
 from p2p.serializer import (
     MAX_PROXIED_TOKENS,
     ActivationFrame,
@@ -66,10 +68,14 @@ from p2p.serializer import (
     serialize_inference_request,
 )
 from p2p.transport import (
+    PeerUnreachableError,
     congestion_monitor,
+    current_relay_source,
+    dispatch_p2p_frame,
     receive_activations,
     send_activations,
 )
+from p2p.upnp import UpnpPortMapper
 from shard_engine.memory_manager import (
     ShardMemoryManager,
     calculate_max_layers,
@@ -234,13 +240,26 @@ def _extract_prompt_from_messages(messages: list[ChatMessage]) -> str:
     return "\n".join(parts) if parts else "Hello"
 
 
-def _resolve_advertise_ip(target_peer_ip: str, target_peer_port: int) -> str:
+def _resolve_advertise_ip(
+    target_peer_ip: str,
+    target_peer_port: int,
+    *,
+    public_ip: str | None = None,
+) -> str:
     """Resolve the local IPv4 address reachable by `target_peer_ip` for return token frames."""
     explicit_ip = os.getenv("SHARDAI_ADVERTISE_IP", "").strip()
     if explicit_ip:
         return explicit_ip
     if target_peer_ip.startswith("127.") or target_peer_ip == "localhost":
         return "127.0.0.1"
+    effective_public_ip = public_ip if public_ip is not None else runtime.public_ip
+    if effective_public_ip:
+        try:
+            target_addr = ipaddress.ip_address(target_peer_ip.strip().split("%", 1)[0])
+            if target_addr.is_global:
+                return effective_public_ip
+        except ValueError:
+            pass
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect((target_peer_ip, target_peer_port))
@@ -351,6 +370,8 @@ def _heartbeat_interval_seconds() -> float:
 
 _MAX_FAILOVER_TRACKED_PEERS: int = 256
 _MAX_CONCURRENT_PROXIED_TASKS: int = 16
+_PEER_ROUTE_TTL_SECONDS: float = 60.0
+_MAX_PEER_ROUTES: int = 256
 
 
 class LocalNodeRuntime:
@@ -406,6 +427,11 @@ class LocalNodeRuntime:
         self.failed_peer_cooldown_seconds: float = 60.0
         self._evicted_peers: dict[str, tuple[float, str, int]] = {}
         self._promoted_peer_ids: dict[str, float] = {}
+        self.public_ip: str | None = None
+        self.relay_client: RelayClient = RelayClient()
+        self.upnp_mapper: UpnpPortMapper = UpnpPortMapper()
+        self.upnp_mapped_port: int | None = None
+        self._peer_routes: dict[str, tuple[str, float]] = {}
         self.native_stream_queue_maxsize: int = NATIVE_STREAM_QUEUE_MAXSIZE
         self.native_cancel_wait_timeout_seconds: float = (
             NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS
@@ -598,6 +624,176 @@ class LocalNodeRuntime:
         self.recompute_local_coverage()
         return promoted_entry
 
+    def _prune_peer_routes(self, now: float | None = None) -> None:
+        """Expire cached peer route entries and enforce bounded cache size."""
+        current_time = time.monotonic() if now is None else now
+        expired_ids = [
+            peer_id
+            for peer_id, (_route, expires_at) in self._peer_routes.items()
+            if current_time >= expires_at
+        ]
+        for peer_id in expired_ids:
+            self._peer_routes.pop(peer_id, None)
+        while len(self._peer_routes) > _MAX_PEER_ROUTES:
+            oldest_peer_id = next(iter(self._peer_routes))
+            self._peer_routes.pop(oldest_peer_id, None)
+
+    def _get_cached_peer_route(self, peer_id: str) -> str | None:
+        """Return cached route (`'direct'` or `'relay'`) if present and unexpired."""
+        now = time.monotonic()
+        self._prune_peer_routes(now=now)
+        entry = self._peer_routes.get(peer_id)
+        if entry is None:
+            return None
+        route, expires_at = entry
+        if now >= expires_at:
+            self._peer_routes.pop(peer_id, None)
+            return None
+        return route
+
+    def _set_cached_peer_route(self, peer_id: str, route: str) -> None:
+        """Cache a peer transport route (`'direct'` or `'relay'`) for 60 seconds."""
+        now = time.monotonic()
+        self._peer_routes[peer_id] = (route, now + _PEER_ROUTE_TTL_SECONDS)
+        self._prune_peer_routes(now=now)
+
+    async def send_frame_to_peer(
+        self,
+        peer: PeerNodeInfo,
+        frame: bytes,
+        timeout_seconds: float = 5.0,
+        ack_timeout_seconds: float | None = None,
+    ) -> float:
+        """Send a binary frame directly over TCP, falling back to relay only on `PeerUnreachableError`."""
+        ack_wait = timeout_seconds if ack_timeout_seconds is None else ack_timeout_seconds
+        cached_route = self._get_cached_peer_route(peer.peer_id)
+        if cached_route == "relay" and self.relay_client.is_connected:
+            return await self.relay_client.send_frame(
+                peer.peer_id, frame, ack_timeout=ack_wait
+            )
+
+        direct_connect_timeout = (
+            min(2.0, timeout_seconds) if self.relay_client.is_connected else timeout_seconds
+        )
+        send_kwargs: dict[str, Any] = {
+            "peer_ip": peer.ip_address,
+            "byte_stream": frame,
+            "peer_port": peer.port,
+            "timeout_seconds": direct_connect_timeout,
+        }
+        if ack_timeout_seconds is not None:
+            send_kwargs["ack_timeout_seconds"] = ack_timeout_seconds
+        try:
+            rtt_ms = await send_activations(**send_kwargs)
+            self._set_cached_peer_route(peer.peer_id, "direct")
+            return rtt_ms
+        except PeerUnreachableError:
+            if not self.relay_client.is_connected:
+                raise
+            rtt_ms = await self.relay_client.send_frame(
+                peer.peer_id, frame, ack_timeout=ack_wait
+            )
+            self._set_cached_peer_route(peer.peer_id, "relay")
+            return rtt_ms
+
+    def _peer_for_endpoint(self, ip: str, port: int) -> PeerNodeInfo | None:
+        """Return the matching `PeerNodeInfo` for `(ip, port)` if known in `self.peers`."""
+        try:
+            target_addr = ipaddress.ip_address(ip.strip().split("%", 1)[0])
+        except ValueError:
+            return None
+        for peer in self.peers:
+            if peer.port != port:
+                continue
+            try:
+                peer_addr = ipaddress.ip_address(peer.ip_address.strip().split("%", 1)[0])
+            except ValueError:
+                continue
+            if peer_addr == target_addr:
+                return peer
+        return None
+
+    async def _send_to_endpoint(
+        self,
+        ip: str,
+        port: int,
+        frame: bytes,
+        timeout_seconds: float = 5.0,
+        ack_timeout_seconds: float | None = None,
+    ) -> float:
+        """Send a return frame to a peer via relay-aware routing when a matching peer exists."""
+        relay_src = current_relay_source.get()
+        peer: PeerNodeInfo | None = None
+        if relay_src is not None:
+            for candidate in self.peers:
+                if candidate.peer_id == relay_src:
+                    peer = candidate
+                    break
+        if peer is None:
+            peer = self._peer_for_endpoint(ip, port)
+        if peer is not None:
+            return await self.send_frame_to_peer(
+                peer=peer,
+                frame=frame,
+                timeout_seconds=timeout_seconds,
+                ack_timeout_seconds=ack_timeout_seconds,
+            )
+        send_kwargs: dict[str, Any] = {
+            "peer_ip": ip,
+            "byte_stream": frame,
+            "peer_port": port,
+            "timeout_seconds": timeout_seconds,
+        }
+        if ack_timeout_seconds is not None:
+            send_kwargs["ack_timeout_seconds"] = ack_timeout_seconds
+        return await send_activations(**send_kwargs)
+
+    async def _handle_relay_frame(self, frame_bytes: bytes, src_node_id: str) -> None:
+        """Dispatch an incoming relay frame with `current_relay_source` bound for auth & return routing."""
+        token = current_relay_source.set(src_node_id)
+        try:
+            await dispatch_p2p_frame(
+                frame_bytes=frame_bytes,
+                on_activation_frame=self.handle_incoming_activation,
+                on_token_frame=self.handle_incoming_decoded_token,
+                on_inference_request=self.handle_incoming_inference_request,
+                on_inference_error=self.handle_incoming_inference_error,
+            )
+        finally:
+            current_relay_source.reset(token)
+
+    async def _apply_tracker_assignment_network_info(
+        self,
+        assignment: AnnounceAssignment,
+        node_id: str,
+    ) -> None:
+        """Update `public_ip` and start/refresh the tracker relay client from an announce response."""
+        if assignment.observed_ip is not None:
+            self.public_ip = assignment.observed_ip
+
+        if not (assignment.relay_url and assignment.relay_token):
+            return
+
+        allowed_host = urlparse(self.tracker_client.base_url).hostname
+        try:
+            if self.relay_client.is_started:
+                self.relay_client.update_credentials(
+                    assignment.relay_url, assignment.relay_token
+                )
+            else:
+                await self.relay_client.start(
+                    url=assignment.relay_url,
+                    token=assignment.relay_token,
+                    node_id=node_id,
+                    on_frame=self._handle_relay_frame,
+                    allowed_host=allowed_host,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not start or update tracker relay connection: %s",
+                exc,
+            )
+
     async def send_with_failover(
         self,
         completed_layer: int,
@@ -616,10 +812,9 @@ class LocalNodeRuntime:
         failed_candidates: list[PeerNodeInfo] = []
         for idx, candidate in enumerate(candidates):
             try:
-                await send_activations(
-                    peer_ip=candidate.ip_address,
-                    byte_stream=frame_bytes,
-                    peer_port=candidate.port,
+                await self.send_frame_to_peer(
+                    peer=candidate,
+                    frame=frame_bytes,
                     timeout_seconds=timeout_seconds,
                     ack_timeout_seconds=ack_timeout_seconds,
                 )
@@ -693,11 +888,17 @@ class LocalNodeRuntime:
         """Verify `(ip, port)` matches a registered peer in `self.peers`."""
         if not self.peers:
             return False
+        relay_src = current_relay_source.get()
+        if relay_src is not None and relay_src not in {p.peer_id for p in self.peers}:
+            return False
         return self._matches_peer_endpoint(self.peers, ip, port)
 
     def _is_authorized_activation_origin(self, origin_ip: str, origin_port: int) -> bool:
         """Verify `frame.origin_ip`/`origin_port` matches the head node or a verified peer."""
         if not self.peers:
+            return False
+        relay_src = current_relay_source.get()
+        if relay_src is not None and relay_src not in {p.peer_id for p in self.peers}:
             return False
 
         head_peers = [peer for peer in self.peers if peer.shard_layer_start == 0]
@@ -766,10 +967,10 @@ class LocalNodeRuntime:
                 token_text=token_text,
                 is_eos=is_eos,
             )
-            await send_activations(
-                peer_ip=frame.origin_ip,
-                byte_stream=token_packet,
-                peer_port=frame.origin_port,
+            await self._send_to_endpoint(
+                ip=frame.origin_ip,
+                port=frame.origin_port,
+                frame=token_packet,
             )
         elif next_peer is not None:
             next_frame_bytes: bytes = serialize_activation_tensor(
@@ -920,10 +1121,10 @@ class LocalNodeRuntime:
                 status_code=exc.status_code,
                 detail=str(exc.detail),
             )
-            await send_activations(
-                peer_ip=frame.requester_ip,
-                byte_stream=err_packet,
-                peer_port=frame.requester_port,
+            await self._send_to_endpoint(
+                ip=frame.requester_ip,
+                port=frame.requester_port,
+                frame=err_packet,
                 timeout_seconds=5.0,
             )
             return
@@ -952,10 +1153,10 @@ class LocalNodeRuntime:
                 detail=detail,
             )
             try:
-                await send_activations(
-                    peer_ip=frame.requester_ip,
-                    byte_stream=err_packet,
-                    peer_port=frame.requester_port,
+                await self._send_to_endpoint(
+                    ip=frame.requester_ip,
+                    port=frame.requester_port,
+                    frame=err_packet,
                     timeout_seconds=5.0,
                 )
             except Exception as err_send_exc:
@@ -990,10 +1191,10 @@ class LocalNodeRuntime:
                         is_eos=is_eos,
                     )
                     try:
-                        await send_activations(
-                            peer_ip=frame.requester_ip,
-                            byte_stream=token_packet,
-                            peer_port=frame.requester_port,
+                        await self._send_to_endpoint(
+                            ip=frame.requester_ip,
+                            port=frame.requester_port,
+                            frame=token_packet,
                             timeout_seconds=5.0,
                         )
                     except Exception as send_exc:
@@ -1019,10 +1220,10 @@ class LocalNodeRuntime:
                     is_eos=True,
                 )
                 try:
-                    await send_activations(
-                        peer_ip=frame.requester_ip,
-                        byte_stream=eos_packet,
-                        peer_port=frame.requester_port,
+                    await self._send_to_endpoint(
+                        ip=frame.requester_ip,
+                        port=frame.requester_port,
+                        frame=eos_packet,
                         timeout_seconds=5.0,
                     )
                 except Exception as eos_send_exc:
@@ -1441,7 +1642,9 @@ class LocalNodeRuntime:
                 if stop_event is not None and stop_event.is_set():
                     return
                 advertise_ip: str = _resolve_advertise_ip(
-                    candidate.ip_address, candidate.port
+                    candidate.ip_address,
+                    candidate.port,
+                    public_ip=self.public_ip,
                 )
                 req_bytes: bytes = serialize_inference_request(
                     request_id=proxy_request_id,
@@ -1454,10 +1657,9 @@ class LocalNodeRuntime:
                     compress_activations=compress_activations,
                 )
                 try:
-                    await send_activations(
-                        peer_ip=candidate.ip_address,
-                        byte_stream=req_bytes,
-                        peer_port=candidate.port,
+                    await self.send_frame_to_peer(
+                        peer=candidate,
+                        frame=req_bytes,
                         timeout_seconds=5.0,
                     )
                     selected_head = candidate
@@ -1645,7 +1847,9 @@ class LocalNodeRuntime:
 
                     for idx, candidate in enumerate(candidates):
                         advertise_ip: str = _resolve_advertise_ip(
-                            candidate.ip_address, candidate.port
+                            candidate.ip_address,
+                            candidate.port,
+                            public_ip=self.public_ip,
                         )
                         binary_frame: bytes = serialize_activation_tensor(
                             tensor_data=hidden_bytes,
@@ -1668,10 +1872,9 @@ class LocalNodeRuntime:
                             discard_all=(idx > 0),
                         )
                         try:
-                            await send_activations(
-                                peer_ip=candidate.ip_address,
-                                byte_stream=binary_frame,
-                                peer_port=candidate.port,
+                            await self.send_frame_to_peer(
+                                peer=candidate,
+                                frame=binary_frame,
                                 timeout_seconds=5.0,
                                 ack_timeout_seconds=step_timeout,
                             )
@@ -1917,6 +2120,9 @@ class LocalNodeRuntime:
                 return False, None
             self._last_heartbeat_at = time.monotonic()
             self.last_tracker_reachable = True
+            await self._apply_tracker_assignment_network_info(
+                assignment, heartbeat_req.node_id
+            )
             hb_peers: list[PeerNodeInfo] | None = (
                 self._apply_peer_failover_overrides(
                     [p for p in assignment.peers if p.peer_id != self.node_id]
@@ -2166,6 +2372,9 @@ class LocalNodeRuntime:
             ssd_offload_active=self.ssd_offload_active if is_running else False,
             source_type=self.source_type if is_running else None,
             model_fingerprint=self.model_fingerprint if is_running else None,
+            public_ip=self.public_ip if is_running else None,
+            upnp_mapped=(self.upnp_mapped_port is not None) if is_running else False,
+            relay_connected=self.relay_client.is_connected if is_running else False,
             message=message,
         )
 
@@ -2252,12 +2461,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         runtime._active_max_layers_can_hold = 0
         runtime._last_heartbeat_at = 0.0
         await runtime.stop_coverage_monitor()
+        await runtime.relay_client.stop()
+        try:
+            await asyncio.wait_for(runtime.upnp_mapper.cleanup(), timeout=2.0)
+        except Exception:
+            pass
         await lan_mdns_service.stop_advertising()
         await zeroconf_discovery.close()
         await runtime.stop_p2p_listener()
         await runtime.cleanup_proxy_state()
         await _release_model_runner_async()
         runtime.memory_manager.release_all()
+        runtime._peer_routes.clear()
+        runtime.public_ip = None
+        runtime.upnp_mapped_port = None
         runtime.state = NodeState.STOPPED
 
 
@@ -2808,6 +3025,14 @@ async def start_node(
         return await _start_node_unlocked(request)
 
 
+async def _cleanup_upnp_mapping_bounded() -> None:
+    """Best-effort bounded UPnP port-mapping teardown."""
+    try:
+        await asyncio.wait_for(runtime.upnp_mapper.cleanup(), timeout=2.0)
+    except Exception:
+        pass
+
+
 async def _release_runtime_resources(target_state: NodeState) -> None:
     """Release all local runtime resources, listeners, and metadata cleanly."""
     runtime.session_token = None
@@ -2819,6 +3044,8 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
     try:
         for cleanup_step in (
             runtime.stop_coverage_monitor,
+            runtime.relay_client.stop,
+            _cleanup_upnp_mapping_bounded,
             lan_mdns_service.stop_advertising,
             zeroconf_discovery.stop_advertising,
             runtime.stop_p2p_listener,
@@ -2839,6 +3066,9 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
         runtime.active_request_steps.clear()
         runtime._evicted_peers.clear()
         runtime._promoted_peer_ids.clear()
+        runtime._peer_routes.clear()
+        runtime.public_ip = None
+        runtime.upnp_mapped_port = None
         runtime.peers = []
         runtime.node_id = None
         runtime.model_id = None
@@ -3004,6 +3234,16 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             network_mode=request.network_mode,
         )
         request.p2p_listen_port = bound_port
+        runtime.upnp_mapped_port = None
+        if request.network_mode == NetworkMode.INTERNET:
+            try:
+                mapped = await asyncio.wait_for(
+                    runtime.upnp_mapper.ensure_port_mapped(bound_port),
+                    timeout=3.0,
+                )
+                runtime.upnp_mapped_port = bound_port if mapped else None
+            except Exception:
+                runtime.upnp_mapped_port = None
         if request.node_id in ("shardai-client-01", "local-node-01"):
             host_slug = (
                 re.sub(r"[^A-Za-z0-9-]+", "-", socket.gethostname().split(".")[0]).strip("-")
@@ -3018,6 +3258,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         discovered_peers: list[PeerNodeInfo] = []
         cloud_online: bool = False
         last_announce_monotonic: float = 0.0
+        latest_assignment: AnnounceAssignment | None = None
         initial_modality: CatalogModelModality = _resolve_node_modality(
             request.model_id,
             mmproj_filename=request.mmproj_filename,
@@ -3033,6 +3274,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                         modality=initial_modality,
                     )
                 )
+                latest_assignment = assignment
                 cloud_online = True
                 announced_to_tracker = True
                 last_announce_monotonic = time.monotonic()
@@ -3238,6 +3480,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                         modality=post_download_modality,
                     )
                 )
+                latest_assignment = post_assignment
                 last_announce_monotonic = time.monotonic()
                 discovered_peers = [
                     peer for peer in post_assignment.peers if peer.peer_id != request.node_id
@@ -3387,11 +3630,18 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         runtime.total_layers = final_total_layers
         runtime._evicted_peers.clear()
         runtime._promoted_peer_ids.clear()
+        runtime._peer_routes.clear()
+        runtime.public_ip = None
         runtime.peers = discovered_peers
         runtime._active_start_request = request.model_copy(update={"room_key": None})
         runtime._active_max_layers_can_hold = max_layers_can_hold
         runtime._last_heartbeat_at = last_announce_monotonic if cloud_online else 0.0
         runtime.state = NodeState.RUNNING
+
+        if latest_assignment is not None:
+            await runtime._apply_tracker_assignment_network_info(
+                latest_assignment, request.node_id
+            )
 
         # Compute initial coverage_percent & is_swarm_ready, then monitor every 5s
         await runtime.refresh_room_coverage()
