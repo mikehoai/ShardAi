@@ -17,10 +17,21 @@ from p2p.serializer import (
     serialize_inference_error,
     serialize_inference_request,
 )
+from p2p.relay_client import RelayClient, validate_relay_url
+from p2p.relay_envelope import (
+    RelayEnvelope,
+    RelayPacketKind,
+    decode_envelope,
+    encode_envelope,
+    split_into_chunks,
+)
 from p2p.transport import (
     ACK_BYTE,
     NACK_BYTE,
+    PeerUnreachableError,
     congestion_monitor,
+    current_relay_source,
+    dispatch_p2p_frame,
     receive_activations,
     send_activations,
 )
@@ -35,11 +46,19 @@ __all__ = [
     "LanRoomBeacon",
     "NACK_BYTE",
     "PacketType",
+    "PeerUnreachableError",
+    "RelayClient",
+    "RelayEnvelope",
+    "RelayPacketKind",
     "congestion_monitor",
+    "current_relay_source",
+    "decode_envelope",
     "deserialize_activation_tensor",
     "deserialize_decoded_token",
     "deserialize_inference_error",
     "deserialize_inference_request",
+    "dispatch_p2p_frame",
+    "encode_envelope",
     "lan_mdns_service",
     "receive_activations",
     "send_activations",
@@ -47,4 +66,6 @@ __all__ = [
     "serialize_decoded_token",
     "serialize_inference_error",
     "serialize_inference_request",
+    "split_into_chunks",
+    "validate_relay_url",
 ]

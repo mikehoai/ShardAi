@@ -410,6 +410,9 @@ class NodeStatusResponse(BaseModel):
     ssd_offload_active: bool = False
     source_type: ModelSourceType | None = None
     model_fingerprint: str | None = None
+    public_ip: str | None = None
+    upnp_mapped: bool = False
+    relay_connected: bool = False
     message: str = ""
 
 
