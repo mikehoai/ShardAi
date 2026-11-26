@@ -25,7 +25,11 @@ import threading
 import time
 from typing import Any
 
-from models.gguf_shard_loader import can_load_gguf_pytorch_shard, load_gguf_pytorch_shard
+from models.gguf_shard_loader import (
+    GgufSimpleKVCache,
+    can_load_gguf_pytorch_shard,
+    load_gguf_pytorch_shard,
+)
 
 logger = logging.getLogger("shardai.models.runner")
 
@@ -208,6 +212,7 @@ class ShardModelRunner:
 
         # PyTorch layer-sharded components
         self._is_real_pytorch: bool = False
+        self._use_simple_kv_cache: bool = False
         self._hf_config: Any | None = None
         self._tokenizer: Any | None = None
         self._eos_token_ids: set[int] = set()
@@ -511,7 +516,7 @@ class ShardModelRunner:
                 max_ram_mb=self.max_ram_mb,
             )
         except Exception as exc:
-            logger.error(
+            logger.exception(
                 "Failed to load GGUF PyTorch shard for %s (layers %d..%d): %s",
                 gguf_path,
                 self.shard_layer_start,
@@ -521,6 +526,8 @@ class ShardModelRunner:
             raise RuntimeError(
                 f"Failed to load GGUF PyTorch shard from '{gguf_path}': {exc}. Please reload the model."
             ) from exc
+
+        self._use_simple_kv_cache = True
 
         self._hf_config = loaded.hf_config
         self.total_layers = loaded.total_layers
@@ -712,11 +719,19 @@ class ShardModelRunner:
         """Retrieve or create a bounded KV-cache session for `request_id`."""
         self._evict_expired_sessions()
         if step_index == 0 or request_id not in self._sessions:
-            from transformers.cache_utils import DynamicCache  # type: ignore[import-not-found]
+            if self._use_simple_kv_cache:
+                past_key_values: Any = GgufSimpleKVCache()
+            else:
+                from transformers.cache_utils import DynamicCache  # type: ignore[import-not-found]
+
+                try:
+                    past_key_values = DynamicCache(config=self._hf_config)
+                except TypeError:
+                    past_key_values = DynamicCache()
 
             session = _RequestSession(
                 created_at=time.monotonic(),
-                past_key_values=DynamicCache(config=self._hf_config),
+                past_key_values=past_key_values,
             )
             self._sessions[request_id] = session
             self._evict_expired_sessions()
@@ -973,7 +988,11 @@ class ShardModelRunner:
                 normed = self._norm(last_hidden)
                 logits = self._lm_head(normed)[0, -1, :].to(torch.float32)
                 softcap = getattr(self._hf_config, "final_logit_softcapping", None)
-                if isinstance(softcap, (int, float)) and softcap > 0:
+                if (
+                    not isinstance(softcap, bool)
+                    and isinstance(softcap, (int, float))
+                    and softcap > 0
+                ):
                     logits = torch.tanh(logits / float(softcap)) * float(softcap)
 
                 session = self._sessions.get(request_id)
@@ -1056,6 +1075,7 @@ class ShardModelRunner:
                 close_tok()
         self._eos_token_ids.clear()
         self._is_real_pytorch = False
+        self._use_simple_kv_cache = False
 
         with self._native_lock:
             if self._native_handle is not None:

@@ -9,8 +9,10 @@ loading unowned layers into RAM or pre-dequantizing full weight matrices:
   row-chunked projection for large vocabularies and `GgufQuantizedEmbedding`)
   that store raw quantized `uint8` bytes and dequantize on the fly inside
   `torch.inference_mode()`.
-- Zero-RAM `meta`-device Hugging Face skeleton slicing so each peer loads ONLY
-  its assigned `[shard_layer_start..shard_layer_end]` tensors.
+- Pure-PyTorch decoder layer reconstruction (`GgufModelConfig`, `GgufRMSNorm`,
+  `GgufRotaryEmbedding`, `GgufAttention`, `GgufMLP`, `GgufDecoderLayer`, and
+  `GgufSimpleKVCache`) with zero external model-framework dependencies, loading
+  ONLY each peer's assigned `[shard_layer_start..shard_layer_end]` tensors.
 """
 
 from __future__ import annotations
@@ -221,6 +223,7 @@ def _should_store_metadata_key(key: str) -> bool:
         ".attention.value_length",
         ".attention.layer_norm_rms_epsilon",
         ".attention.sliding_window",
+        ".attention.query_pre_attn_scalar",
         ".rope.freq_base",
         ".rope.dimension_count",
         ".final_logit_softcapping",
@@ -697,22 +700,370 @@ class GgufQuantizedEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Hugging Face Config Reconstruction & Selective Layer Loading
+# Pure-PyTorch GGUF Model Config, KV-Cache & Decoder Modules
 # ---------------------------------------------------------------------------
 
 
-def _build_hf_config_from_gguf(index: GgufFileIndex) -> Any:
-    """Reconstruct a `transformers` config object from GGUF header metadata."""
-    from transformers import (  # type: ignore[import-not-found]
-        Gemma2Config,
-        Gemma3TextConfig,
-        LlamaConfig,
-        MistralConfig,
-        Phi3Config,
-        Qwen2Config,
-        Qwen3Config,
-    )
+@dataclass(frozen=True)
+class GgufModelConfig:
+    """Pure-PyTorch model architecture configuration reconstructed from GGUF metadata."""
 
+    arch: str
+    model_type: str
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    max_position_embeddings: int
+    rms_norm_eps: float
+    rope_theta: float
+    rotary_dim: int
+    sliding_window: int | None
+    final_logit_softcapping: float | None
+    attn_logit_softcapping: float | None
+    query_pre_attn_scalar: float
+    tie_word_embeddings: bool
+    bos_token_id: int | None
+    eos_token_id: int | None
+    pad_token_id: int | None
+
+
+class GgufSimpleKVCache:
+    """Minimal layer-indexed KV-cache supporting partial shards (`shard_layer_start > 0`)."""
+
+    def __init__(self) -> None:
+        self._cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Return cached sequence length for `layer_idx` (or 0 if unpopulated)."""
+        entry = self._cache.get(layer_idx)
+        if entry is None:
+            return 0
+        return int(entry[0].shape[-2])
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append new key/value states for `layer_idx` and return concatenated `(k, v)`."""
+        entry = self._cache.get(layer_idx)
+        if entry is None:
+            k_out = key_states
+            v_out = value_states
+        else:
+            prev_k, prev_v = entry
+            k_out = torch.cat([prev_k, key_states], dim=-2)
+            v_out = torch.cat([prev_v, value_states], dim=-2)
+        self._cache[layer_idx] = (k_out, v_out)
+        return k_out, v_out
+
+    def clear(self) -> None:
+        """Release all cached key/value tensors."""
+        self._cache.clear()
+
+
+class GgufRMSNorm(nn.Module):
+    """Pure-PyTorch RMSNorm reading GGUF effective norm weights directly."""
+
+    def __init__(self, weight: torch.Tensor, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps: float = float(eps)
+        self.weight: nn.Parameter = nn.Parameter(weight.detach().contiguous(), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize along the last dimension in float32 and scale by `self.weight`."""
+        x_f32 = x.to(torch.float32)
+        variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
+        normed = x_f32 * torch.rsqrt(variance + self.eps)
+        return (normed * self.weight.to(torch.float32)).to(x.dtype)
+
+
+class GgufRotaryEmbedding(nn.Module):
+    """Pure-PyTorch Rotary Position Embedding (RoPE) supporting full and partial dimensions."""
+
+    def __init__(self, rotary_dim: int, rope_theta: float = 10000.0) -> None:
+        super().__init__()
+        self.rotary_dim: int = int(rotary_dim)
+        self.rope_theta: float = float(rope_theta)
+        self.inv_freq: torch.Tensor = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / float(self.rotary_dim)
+            )
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute `(cos, sin)` tensors in `hidden_states.dtype` for `position_ids`."""
+        inv_freq = self.inv_freq.to(device=hidden_states.device, dtype=torch.float32)
+        freqs = position_ids.to(device=hidden_states.device, dtype=torch.float32)[..., None] * inv_freq
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=hidden_states.dtype)
+        sin = emb.sin().to(dtype=hidden_states.dtype)
+        return cos, sin
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the second half of the last dimension into the negated first half."""
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply half-split RoPE to the first `rotary_dim` channels of `q` and `k`."""
+    cos_u = cos.unsqueeze(1)
+    sin_u = sin.unsqueeze(1)
+    if rotary_dim < q.shape[-1]:
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+        q_rot = (q_rot * cos_u) + (_rotate_half(q_rot) * sin_u)
+        k_rot = (k_rot * cos_u) + (_rotate_half(k_rot) * sin_u)
+        return torch.cat((q_rot, q_pass), dim=-1), torch.cat((k_rot, k_pass), dim=-1)
+    q_embed = (q * cos_u) + (_rotate_half(q) * sin_u)
+    k_embed = (k * cos_u) + (_rotate_half(k) * sin_u)
+    return q_embed, k_embed
+
+
+class GgufAttention(nn.Module):
+    """Pure-PyTorch multi-head / grouped-query self-attention for GGUF decoder layers."""
+
+    def __init__(
+        self,
+        *,
+        layer_idx: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        rotary_dim: int,
+        attn_scale: float,
+        attn_logit_softcapping: float | None = None,
+        sliding_window: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.layer_idx: int = layer_idx
+        self.num_heads: int = num_heads
+        self.num_kv_heads: int = num_kv_heads
+        self.num_kv_groups: int = max(1, num_heads // num_kv_heads)
+        self.head_dim: int = head_dim
+        self.rotary_dim: int = rotary_dim
+        self.attn_scale: float = float(attn_scale)
+        self.attn_logit_softcapping: float | None = attn_logit_softcapping
+        self.sliding_window: int | None = sliding_window
+
+        self.q_proj: nn.Module | None = None
+        self.k_proj: nn.Module | None = None
+        self.v_proj: nn.Module | None = None
+        self.qkv_proj: nn.Module | None = None
+        self.o_proj: nn.Module | None = None
+        self.q_norm: GgufRMSNorm | None = None
+        self.k_norm: GgufRMSNorm | None = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Compute GQA self-attention with RoPE, KV-cache, sliding window, and optional softcapping."""
+        del position_ids
+        bsz, seq_len, _ = hidden_states.shape
+        if self.qkv_proj is not None:
+            qkv = self.qkv_proj(hidden_states)
+            q_size = self.num_heads * self.head_dim
+            kv_size = self.num_kv_heads * self.head_dim
+            q_flat = qkv[..., :q_size]
+            k_flat = qkv[..., q_size : q_size + kv_size]
+            v_flat = qkv[..., q_size + kv_size :]
+        else:
+            if self.q_proj is None or self.k_proj is None or self.v_proj is None:
+                raise RuntimeError(f"Attention projections missing on layer {self.layer_idx}")
+            q_flat = self.q_proj(hidden_states)
+            k_flat = self.k_proj(hidden_states)
+            v_flat = self.v_proj(hidden_states)
+
+        query_states = q_flat.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = k_flat.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value_states = v_flat.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = _apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, self.rotary_dim
+            )
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx
+            )
+
+        if self.num_kv_groups > 1:
+            key_states = key_states.repeat_interleave(self.num_kv_groups, dim=1)
+            value_states = value_states.repeat_interleave(self.num_kv_groups, dim=1)
+
+        kv_len = int(key_states.shape[-2])
+        eff_mask = attention_mask
+        if (
+            self.sliding_window is not None
+            and self.sliding_window > 0
+            and kv_len > self.sliding_window
+        ):
+            past_len = kv_len - seq_len
+            q_pos = torch.arange(past_len, kv_len, device=query_states.device).unsqueeze(1)
+            k_pos = torch.arange(kv_len, device=query_states.device).unsqueeze(0)
+            too_old = (q_pos - k_pos) >= self.sliding_window
+            if too_old.any():
+                min_val = torch.finfo(query_states.dtype).min
+                win_mask = torch.zeros(
+                    (1, 1, seq_len, kv_len),
+                    dtype=query_states.dtype,
+                    device=query_states.device,
+                ).masked_fill(too_old.unsqueeze(0).unsqueeze(0), min_val)
+                eff_mask = win_mask if eff_mask is None else torch.minimum(eff_mask, win_mask)
+
+        if self.attn_logit_softcapping is not None and self.attn_logit_softcapping > 0:
+            cap = float(self.attn_logit_softcapping)
+            attn_weights = (
+                torch.matmul(query_states, key_states.transpose(-2, -1)) * self.attn_scale
+            )
+            attn_weights = torch.tanh(attn_weights / cap) * cap
+            if eff_mask is not None:
+                attn_weights = attn_weights + eff_mask
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+                query_states.dtype
+            )
+            attn_output = torch.matmul(attn_weights, value_states)
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=eff_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.attn_scale,
+            )
+
+        if self.o_proj is None:
+            raise RuntimeError(f"Attention o_proj missing on layer {self.layer_idx}")
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .reshape(bsz, seq_len, self.num_heads * self.head_dim)
+        )
+        return self.o_proj(attn_output)
+
+
+class GgufMLP(nn.Module):
+    """Pure-PyTorch gated MLP supporting SwiGLU, GeGLU (`gemma2`/`gemma3`), and fused `phi3`."""
+
+    def __init__(self, use_gelu_tanh: bool = False) -> None:
+        super().__init__()
+        self.use_gelu_tanh: bool = use_gelu_tanh
+        self.gate_proj: nn.Module | None = None
+        self.up_proj: nn.Module | None = None
+        self.gate_up_proj: nn.Module | None = None
+        self.down_proj: nn.Module | None = None
+
+    def _activate(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_gelu_tanh:
+            return F.gelu(x, approximate="tanh")
+        return F.silu(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply gated activation and down projection."""
+        if self.down_proj is None:
+            raise RuntimeError("MLP down_proj is not initialized")
+        if self.gate_up_proj is not None:
+            up_states = self.gate_up_proj(x)
+            gate, up = up_states.chunk(2, dim=-1)
+            return self.down_proj(self._activate(gate) * up)
+        if self.gate_proj is None or self.up_proj is None:
+            raise RuntimeError("MLP gate_proj/up_proj are not initialized")
+        return self.down_proj(self._activate(self.gate_proj(x)) * self.up_proj(x))
+
+
+class GgufDecoderLayer(nn.Module):
+    """Pure-PyTorch decoder block compatible with `ShardModelRunner.forward_pass`."""
+
+    def __init__(
+        self,
+        *,
+        self_attn: GgufAttention,
+        mlp: GgufMLP,
+        input_layernorm: GgufRMSNorm,
+        post_attention_layernorm: GgufRMSNorm,
+        pre_feedforward_layernorm: GgufRMSNorm | None = None,
+        post_feedforward_layernorm: GgufRMSNorm | None = None,
+    ) -> None:
+        super().__init__()
+        self.self_attn: GgufAttention = self_attn
+        self.mlp: GgufMLP = mlp
+        self.input_layernorm: GgufRMSNorm = input_layernorm
+        self.post_attention_layernorm: GgufRMSNorm = post_attention_layernorm
+        self.pre_feedforward_layernorm: GgufRMSNorm | None = pre_feedforward_layernorm
+        self.post_feedforward_layernorm: GgufRMSNorm | None = post_feedforward_layernorm
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool = True,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor]:
+        """Run pre-norm (or Gemma sandwich-norm) self-attention + MLP with residual connections."""
+        del cache_position
+        residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+        attn_out = self.self_attn(
+            normed,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values if use_cache else None,
+            position_embeddings=position_embeddings,
+        )
+        if (
+            self.pre_feedforward_layernorm is not None
+            and self.post_feedforward_layernorm is not None
+        ):
+            attn_out = self.post_attention_layernorm(attn_out)
+            hidden_states = residual + attn_out
+            residual = hidden_states
+            ffn_out = self.mlp(self.pre_feedforward_layernorm(hidden_states))
+            ffn_out = self.post_feedforward_layernorm(ffn_out)
+            hidden_states = residual + ffn_out
+        else:
+            hidden_states = residual + attn_out
+            residual = hidden_states
+            ffn_out = self.mlp(self.post_attention_layernorm(hidden_states))
+            hidden_states = residual + ffn_out
+        return (hidden_states,)
+
+
+def _build_model_config_from_gguf(index: GgufFileIndex) -> GgufModelConfig:
+    """Reconstruct a pure-PyTorch `GgufModelConfig` from GGUF header metadata."""
     arch = str(index.metadata.get("general.architecture") or "").strip().lower()
     if arch not in SUPPORTED_GGUF_ARCHITECTURES:
         raise ValueError(f"Unsupported GGUF architecture: '{arch}'")
@@ -726,14 +1077,56 @@ def _build_hf_config_from_gguf(index: GgufFileIndex) -> Any:
     max_position_embeddings = int(_meta("context_length", 2048))
     num_attention_heads = int(_meta("attention.head_count"))
     num_key_value_heads = int(_meta("attention.head_count_kv", num_attention_heads))
+
     head_dim_raw = _meta("attention.key_length")
-    head_dim = int(head_dim_raw) if head_dim_raw is not None else (hidden_size // num_attention_heads)
+    if head_dim_raw is not None and int(head_dim_raw) > 0:
+        head_dim = int(head_dim_raw)
+    elif (
+        "blk.0.attn_q.weight" in index.tensors
+        and int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) > 0
+        and int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) % num_attention_heads == 0
+    ):
+        head_dim = int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) // num_attention_heads
+    else:
+        head_dim = hidden_size // num_attention_heads
+
     rms_norm_eps = float(_meta("attention.layer_norm_rms_epsilon", 1e-6))
     rope_theta = float(_meta("rope.freq_base", 10000.0))
+
     rope_dim_raw = _meta("rope.dimension_count")
-    sliding_window = _meta("attention.sliding_window")
-    final_logit_softcapping = _meta("final_logit_softcapping")
-    attn_logit_softcapping = _meta("attn_logit_softcapping")
+    if rope_dim_raw is not None and 0 < int(rope_dim_raw) <= head_dim:
+        rotary_dim = int(rope_dim_raw)
+    else:
+        rotary_dim = head_dim
+
+    sliding_window_raw = _meta("attention.sliding_window")
+    sliding_window = (
+        int(sliding_window_raw)
+        if sliding_window_raw is not None and int(sliding_window_raw) > 0
+        else None
+    )
+
+    final_softcap_raw = _meta("final_logit_softcapping")
+    final_logit_softcapping = (
+        float(final_softcap_raw)
+        if final_softcap_raw is not None and float(final_softcap_raw) > 0.0
+        else None
+    )
+
+    attn_softcap_raw = _meta("attn_logit_softcapping")
+    attn_logit_softcapping = (
+        float(attn_softcap_raw)
+        if attn_softcap_raw is not None and float(attn_softcap_raw) > 0.0
+        else None
+    )
+
+    q_scalar_raw = _meta("attention.query_pre_attn_scalar")
+    if q_scalar_raw is not None and float(q_scalar_raw) > 0.0:
+        query_pre_attn_scalar = float(q_scalar_raw)
+    elif arch in ("gemma2", "gemma3"):
+        query_pre_attn_scalar = 256.0
+    else:
+        query_pre_attn_scalar = float(head_dim)
 
     if "token_embd.weight" in index.tensors:
         vocab_size = int(index.tensors["token_embd.weight"].shape_pt[0])
@@ -745,78 +1138,39 @@ def _build_hf_config_from_gguf(index: GgufFileIndex) -> Any:
         raise ValueError("Unable to determine vocab_size from GGUF tensors or metadata")
 
     tie_word_embeddings = "output.weight" not in index.tensors
-    has_attn_bias = "blk.0.attn_q.bias" in index.tensors
-    bos_token_id = index.metadata.get("tokenizer.ggml.bos_token_id")
-    eos_token_id = index.metadata.get("tokenizer.ggml.eos_token_id")
-    pad_token_id = index.metadata.get("tokenizer.ggml.padding_token_id")
+    bos_raw = index.metadata.get("tokenizer.ggml.bos_token_id")
+    eos_raw = index.metadata.get("tokenizer.ggml.eos_token_id")
+    pad_raw = index.metadata.get("tokenizer.ggml.padding_token_id")
 
-    rope_params: dict[str, Any] = {"rope_theta": rope_theta, "rope_type": "default"}
-    if rope_dim_raw is not None and head_dim > 0 and int(rope_dim_raw) != head_dim:
-        rope_params["partial_rotary_factor"] = float(int(rope_dim_raw)) / float(head_dim)
+    bos_token_id = int(bos_raw) if bos_raw is not None else None
+    eos_token_id = int(eos_raw) if eos_raw is not None else None
+    pad_token_id = (
+        int(pad_raw) if pad_raw is not None and 0 <= int(pad_raw) < vocab_size else None
+    )
 
-    common_kwargs: dict[str, Any] = {
-        "vocab_size": vocab_size,
-        "hidden_size": hidden_size,
-        "intermediate_size": intermediate_size,
-        "num_hidden_layers": num_hidden_layers,
-        "num_attention_heads": num_attention_heads,
-        "num_key_value_heads": num_key_value_heads,
-        "head_dim": head_dim,
-        "max_position_embeddings": max_position_embeddings,
-        "rms_norm_eps": rms_norm_eps,
-        "tie_word_embeddings": tie_word_embeddings,
-        "rope_parameters": rope_params,
-        "use_cache": True,
-    }
-    if bos_token_id is not None:
-        common_kwargs["bos_token_id"] = int(bos_token_id)
-    if eos_token_id is not None:
-        common_kwargs["eos_token_id"] = int(eos_token_id)
-    if pad_token_id is not None and int(pad_token_id) < vocab_size:
-        common_kwargs["pad_token_id"] = int(pad_token_id)
-
-    if arch == "llama":
-        common_kwargs["attention_bias"] = has_attn_bias
-        return LlamaConfig(**common_kwargs)
-    if arch == "mistral":
-        if sliding_window is not None:
-            common_kwargs["sliding_window"] = int(sliding_window)
-        return MistralConfig(**common_kwargs)
-    if arch == "qwen2":
-        if sliding_window is not None:
-            common_kwargs["sliding_window"] = int(sliding_window)
-        return Qwen2Config(**common_kwargs)
-    if arch == "qwen3":
-        common_kwargs["attention_bias"] = has_attn_bias
-        if sliding_window is not None:
-            common_kwargs["sliding_window"] = int(sliding_window)
-        return Qwen3Config(**common_kwargs)
-    if arch == "gemma2":
-        common_kwargs["attention_bias"] = has_attn_bias
-        if sliding_window is not None:
-            common_kwargs["sliding_window"] = int(sliding_window)
-        if final_logit_softcapping is not None:
-            common_kwargs["final_logit_softcapping"] = float(final_logit_softcapping)
-        if attn_logit_softcapping is not None:
-            common_kwargs["attn_logit_softcapping"] = float(attn_logit_softcapping)
-        return Gemma2Config(**common_kwargs)
-    if arch == "gemma3":
-        common_kwargs["attention_bias"] = has_attn_bias
-        if sliding_window is not None:
-            common_kwargs["sliding_window"] = int(sliding_window)
-        if final_logit_softcapping is not None:
-            common_kwargs["final_logit_softcapping"] = float(final_logit_softcapping)
-        if attn_logit_softcapping is not None:
-            common_kwargs["attn_logit_softcapping"] = float(attn_logit_softcapping)
-        return Gemma3TextConfig(**common_kwargs)
-    if arch == "phi3":
-        if sliding_window is not None:
-            common_kwargs["sliding_window"] = int(sliding_window)
-        # Phi3Config validates pad/eos token IDs against vocab_size
-        common_kwargs.setdefault("pad_token_id", 0)
-        common_kwargs.setdefault("eos_token_id", min(1, vocab_size - 1))
-        return Phi3Config(**common_kwargs)
-    raise ValueError(f"Unsupported GGUF architecture: '{arch}'")
+    return GgufModelConfig(
+        arch=arch,
+        model_type=arch,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        max_position_embeddings=max_position_embeddings,
+        rms_norm_eps=rms_norm_eps,
+        rope_theta=rope_theta,
+        rotary_dim=rotary_dim,
+        sliding_window=sliding_window,
+        final_logit_softcapping=final_logit_softcapping,
+        attn_logit_softcapping=attn_logit_softcapping,
+        query_pre_attn_scalar=query_pre_attn_scalar,
+        tie_word_embeddings=tie_word_embeddings,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    )
 
 
 def _read_tensor_raw_u8(f: BinaryIO, index: GgufFileIndex, t_info: GgufTensorInfo) -> torch.Tensor:
@@ -874,86 +1228,69 @@ def _make_linear_from_gguf(
     )
 
 
-def _set_norm_weight(
-    norm_module: nn.Module,
+def _make_norm_from_gguf(
     f: BinaryIO,
     index: GgufFileIndex,
     tensor_name: str,
     *,
-    gemma_offset: bool,
-) -> None:
-    """Load 1D RMSNorm weights (subtracting 1.0 for Gemma2/Gemma3 zero-centered norm)."""
-    if tensor_name not in index.tensors:
-        return
-    w = _read_tensor_dense(f, index, index.tensors[tensor_name], dtype=torch.float32)
-    if gemma_offset:
-        w = w - 1.0
-    norm_module.register_parameter("weight", nn.Parameter(w, requires_grad=False))
+    fallback_dim: int,
+    eps: float,
+) -> GgufRMSNorm:
+    """Load 1D RMSNorm effective weights directly from GGUF."""
+    if tensor_name in index.tensors:
+        w = _read_tensor_dense(f, index, index.tensors[tensor_name], dtype=torch.float32)
+    else:
+        w = torch.ones(fallback_dim, dtype=torch.float32)
+    return GgufRMSNorm(weight=w, eps=eps)
 
 
-def _apply_layer_weights(
-    layer: nn.Module,
+def _build_layer_from_gguf(
     layer_idx: int,
-    arch: str,
-    hf_config: Any,
+    cfg: GgufModelConfig,
     f: BinaryIO,
     index: GgufFileIndex,
-) -> None:
-    """Selectively seek-read and attach quantized projections & norms for one layer."""
-    gemma_offset = arch in ("gemma2", "gemma3")
+) -> GgufDecoderLayer:
+    """Construct one `GgufDecoderLayer` by selectively seek-reading its quantized weights."""
+    arch = cfg.arch
+    gemma_sandwich = arch in ("gemma2", "gemma3")
     is_llama_rope_perm = arch in ("llama", "mistral")
-    n_heads = int(getattr(hf_config, "num_attention_heads"))
-    n_kv_heads = int(getattr(hf_config, "num_key_value_heads", n_heads))
-
     prefix = f"blk.{layer_idx}"
-    attn = layer.self_attn
-    mlp = layer.mlp
 
-    # Norms
-    _set_norm_weight(
-        layer.input_layernorm, f, index, f"{prefix}.attn_norm.weight", gemma_offset=gemma_offset
-    )
-    if gemma_offset:
-        _set_norm_weight(
-            layer.post_attention_layernorm,
-            f,
-            index,
-            f"{prefix}.post_attention_norm.weight",
-            gemma_offset=True,
-        )
-        _set_norm_weight(
-            layer.pre_feedforward_layernorm,
-            f,
-            index,
-            f"{prefix}.ffn_norm.weight",
-            gemma_offset=True,
-        )
-        _set_norm_weight(
-            layer.post_feedforward_layernorm,
-            f,
-            index,
-            f"{prefix}.post_ffw_norm.weight",
-            gemma_offset=True,
-        )
+    if arch == "gemma2":
+        layer_sw = cfg.sliding_window if ((layer_idx + 1) % 2) else None
+    elif arch == "gemma3":
+        layer_sw = cfg.sliding_window if ((layer_idx + 1) % 6) else None
     else:
-        _set_norm_weight(
-            layer.post_attention_layernorm,
+        layer_sw = cfg.sliding_window
+
+    attn = GgufAttention(
+        layer_idx=layer_idx,
+        num_heads=cfg.num_attention_heads,
+        num_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        rotary_dim=cfg.rotary_dim,
+        attn_scale=cfg.query_pre_attn_scalar**-0.5,
+        attn_logit_softcapping=cfg.attn_logit_softcapping,
+        sliding_window=layer_sw,
+    )
+
+    if f"{prefix}.attn_q_norm.weight" in index.tensors:
+        attn.q_norm = _make_norm_from_gguf(
             f,
             index,
-            f"{prefix}.ffn_norm.weight",
-            gemma_offset=False,
+            f"{prefix}.attn_q_norm.weight",
+            fallback_dim=cfg.head_dim,
+            eps=cfg.rms_norm_eps,
+        )
+    if f"{prefix}.attn_k_norm.weight" in index.tensors:
+        attn.k_norm = _make_norm_from_gguf(
+            f,
+            index,
+            f"{prefix}.attn_k_norm.weight",
+            fallback_dim=cfg.head_dim,
+            eps=cfg.rms_norm_eps,
         )
 
-    if hasattr(attn, "q_norm"):
-        _set_norm_weight(
-            attn.q_norm, f, index, f"{prefix}.attn_q_norm.weight", gemma_offset=gemma_offset
-        )
-    if hasattr(attn, "k_norm"):
-        _set_norm_weight(
-            attn.k_norm, f, index, f"{prefix}.attn_k_norm.weight", gemma_offset=gemma_offset
-        )
-
-    # Attention projections
     if arch == "phi3" and f"{prefix}.attn_qkv.weight" in index.tensors:
         attn.qkv_proj = _make_linear_from_gguf(
             f, index, f"{prefix}.attn_qkv.weight", f"{prefix}.attn_qkv.bias"
@@ -965,7 +1302,7 @@ def _apply_layer_weights(
                 index,
                 f"{prefix}.attn_q.weight",
                 f"{prefix}.attn_q.bias",
-                unpermute_heads=n_heads if is_llama_rope_perm else None,
+                unpermute_heads=cfg.num_attention_heads if is_llama_rope_perm else None,
             )
         if f"{prefix}.attn_k.weight" in index.tensors:
             attn.k_proj = _make_linear_from_gguf(
@@ -973,7 +1310,7 @@ def _apply_layer_weights(
                 index,
                 f"{prefix}.attn_k.weight",
                 f"{prefix}.attn_k.bias",
-                unpermute_heads=n_kv_heads if is_llama_rope_perm else None,
+                unpermute_heads=cfg.num_key_value_heads if is_llama_rope_perm else None,
             )
         if f"{prefix}.attn_v.weight" in index.tensors:
             attn.v_proj = _make_linear_from_gguf(
@@ -985,8 +1322,12 @@ def _apply_layer_weights(
             f, index, f"{prefix}.attn_output.weight", f"{prefix}.attn_output.bias"
         )
 
-    # MLP projections
-    if arch == "phi3" and f"{prefix}.ffn_up.weight" in index.tensors and hasattr(mlp, "gate_up_proj"):
+    mlp = GgufMLP(use_gelu_tanh=gemma_sandwich)
+    if (
+        arch == "phi3"
+        and f"{prefix}.ffn_up.weight" in index.tensors
+        and f"{prefix}.ffn_gate.weight" not in index.tensors
+    ):
         mlp.gate_up_proj = _make_linear_from_gguf(
             f, index, f"{prefix}.ffn_up.weight", f"{prefix}.ffn_up.bias"
         )
@@ -1003,6 +1344,55 @@ def _apply_layer_weights(
         mlp.down_proj = _make_linear_from_gguf(
             f, index, f"{prefix}.ffn_down.weight", f"{prefix}.ffn_down.bias"
         )
+
+    input_layernorm = _make_norm_from_gguf(
+        f,
+        index,
+        f"{prefix}.attn_norm.weight",
+        fallback_dim=cfg.hidden_size,
+        eps=cfg.rms_norm_eps,
+    )
+    if gemma_sandwich:
+        post_attention_layernorm = _make_norm_from_gguf(
+            f,
+            index,
+            f"{prefix}.post_attention_norm.weight",
+            fallback_dim=cfg.hidden_size,
+            eps=cfg.rms_norm_eps,
+        )
+        pre_feedforward_layernorm = _make_norm_from_gguf(
+            f,
+            index,
+            f"{prefix}.ffn_norm.weight",
+            fallback_dim=cfg.hidden_size,
+            eps=cfg.rms_norm_eps,
+        )
+        post_feedforward_layernorm = _make_norm_from_gguf(
+            f,
+            index,
+            f"{prefix}.post_ffw_norm.weight",
+            fallback_dim=cfg.hidden_size,
+            eps=cfg.rms_norm_eps,
+        )
+    else:
+        post_attention_layernorm = _make_norm_from_gguf(
+            f,
+            index,
+            f"{prefix}.ffn_norm.weight",
+            fallback_dim=cfg.hidden_size,
+            eps=cfg.rms_norm_eps,
+        )
+        pre_feedforward_layernorm = None
+        post_feedforward_layernorm = None
+
+    return GgufDecoderLayer(
+        self_attn=attn,
+        mlp=mlp,
+        input_layernorm=input_layernorm,
+        post_attention_layernorm=post_attention_layernorm,
+        pre_feedforward_layernorm=pre_feedforward_layernorm,
+        post_feedforward_layernorm=post_feedforward_layernorm,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1224,51 +1614,29 @@ def load_gguf_pytorch_shard(
     shard_layer_end: int,
     max_ram_mb: int = 4096,
 ) -> LoadedGgufShard:
-    """Selectively load ONLY `[shard_layer_start..shard_layer_end]` from a GGUF file into PyTorch."""
-    from transformers import AutoModelForCausalLM  # type: ignore[import-not-found]
-
+    """Selectively load ONLY `[shard_layer_start..shard_layer_end]` from a GGUF file into pure PyTorch."""
     index = read_gguf_header_and_tensors(gguf_path)
     arch = str(index.metadata.get("general.architecture") or "").strip().lower()
     if arch not in SUPPORTED_GGUF_ARCHITECTURES:
         raise ValueError(f"Unsupported GGUF architecture: '{arch}'")
 
-    hf_config = _build_hf_config_from_gguf(index)
-    total_layers = int(getattr(hf_config, "num_hidden_layers"))
-    hidden_dim = int(getattr(hf_config, "hidden_size"))
+    cfg = _build_model_config_from_gguf(index)
+    total_layers = cfg.num_hidden_layers
+    hidden_dim = cfg.hidden_size
     clamped_start = max(0, min(shard_layer_start, total_layers - 1))
     clamped_end = max(clamped_start, min(shard_layer_end, total_layers - 1))
     is_head = clamped_start == 0
     is_tail = clamped_end >= (total_layers - 1)
 
-    with torch.device("meta"):
-        meta_model = AutoModelForCausalLM.from_config(hf_config)
-
-    inner_meta = getattr(meta_model, "model", meta_model)
-    kept_layers: list[Any] = [
-        inner_meta.layers[idx] for idx in range(clamped_start, clamped_end + 1)
-    ]
-
     container = nn.Module()
-    container.layers = nn.ModuleList(kept_layers)
+    rotary_emb = GgufRotaryEmbedding(rotary_dim=cfg.rotary_dim, rope_theta=cfg.rope_theta)
+    container.rotary_emb = rotary_emb
 
-    rotary_emb: Any | None = None
-    if hasattr(inner_meta, "rotary_emb") and inner_meta.rotary_emb is not None:
-        rotary_cls = type(inner_meta.rotary_emb)
-        rotary_emb = rotary_cls(config=hf_config)
-        container.rotary_emb = rotary_emb
+    embed_tokens: GgufQuantizedEmbedding | None = None
+    norm: GgufRMSNorm | None = None
+    lm_head: GgufQuantizedLinear | None = None
 
-    embed_tokens: Any | None = None
-    norm: Any | None = None
-    lm_head: Any | None = None
-
-    if is_tail and hasattr(inner_meta, "norm"):
-        norm = inner_meta.norm
-        container.norm = norm
-
-    del meta_model
-
-    gemma_offset = arch in ("gemma2", "gemma3")
-    embed_scale = math.sqrt(float(hidden_dim)) if gemma_offset else 1.0
+    embed_scale = math.sqrt(float(hidden_dim)) if arch in ("gemma2", "gemma3") else 1.0
 
     # Estimate kept tensor weight size to choose float32 vs bfloat16 activation compute dtype
     kept_bytes = 0
@@ -1290,9 +1658,12 @@ def load_gguf_pytorch_shard(
         torch.float32 if (kept_mb * 1.5) <= (max_ram_mb * 0.85) else torch.bfloat16
     )
 
+    kept_layers: list[GgufDecoderLayer] = []
     with gguf_path.open("rb") as f:
-        for idx, layer in zip(range(clamped_start, clamped_end + 1), kept_layers):
-            _apply_layer_weights(layer, idx, arch, hf_config, f, index)
+        for idx in range(clamped_start, clamped_end + 1):
+            kept_layers.append(_build_layer_from_gguf(idx, cfg, f, index))
+
+        container.layers = nn.ModuleList(kept_layers)
 
         if is_head and "token_embd.weight" in index.tensors:
             emb_info = index.tensors["token_embd.weight"]
@@ -1309,10 +1680,14 @@ def load_gguf_pytorch_shard(
             container.embed_tokens = embed_tokens
 
         if is_tail:
-            if norm is not None:
-                _set_norm_weight(
-                    norm, f, index, "output_norm.weight", gemma_offset=gemma_offset
-                )
+            norm = _make_norm_from_gguf(
+                f,
+                index,
+                "output_norm.weight",
+                fallback_dim=hidden_dim,
+                eps=cfg.rms_norm_eps,
+            )
+            container.norm = norm
             lm_tensor_name = (
                 "output.weight"
                 if "output.weight" in index.tensors
@@ -1337,7 +1712,7 @@ def load_gguf_pytorch_shard(
         tokenizer = GgufTokenizerAdapter(index)
 
     return LoadedGgufShard(
-        hf_config=hf_config,
+        hf_config=cfg,
         container=container,
         layers=kept_layers,
         rotary_emb=rotary_emb,
