@@ -25,6 +25,8 @@ import threading
 import time
 from typing import Any
 
+from models.gguf_shard_loader import can_load_gguf_pytorch_shard, load_gguf_pytorch_shard
+
 logger = logging.getLogger("shardai.models.runner")
 
 DEFAULT_HIDDEN_DIM: int = 4096
@@ -228,8 +230,14 @@ class ShardModelRunner:
             candidate = Path(self.model_path)
             if candidate.is_dir() and (candidate / "config.json").is_file():
                 self._init_pytorch_shard_from_dir(candidate)
-            elif candidate.is_file() and candidate.suffix.lower() == ".gguf" and candidate.stat().st_size > 1_048_576:
-                self._init_llama_cpp(str(candidate), self.n_layers)
+            elif candidate.is_file() and candidate.suffix.lower() == ".gguf":
+                if (
+                    not (self.is_head_node and self.is_tail_node)
+                    and can_load_gguf_pytorch_shard(candidate)
+                ):
+                    self._init_pytorch_shard_from_gguf(candidate)
+                elif candidate.stat().st_size > 1_048_576:
+                    self._init_llama_cpp(str(candidate), self.n_layers)
 
     @property
     def is_real_model(self) -> bool:
@@ -492,6 +500,61 @@ class ShardModelRunner:
             raise RuntimeError(
                 f"Failed to load PyTorch model shard from '{model_dir}': {exc}. Please reload the model."
             ) from exc
+
+    def _init_pytorch_shard_from_gguf(self, gguf_path: Path) -> None:
+        """Load ONLY the assigned transformer layers from a `.gguf` file into quantized PyTorch."""
+        try:
+            loaded = load_gguf_pytorch_shard(
+                gguf_path=gguf_path,
+                shard_layer_start=self.shard_layer_start,
+                shard_layer_end=self.shard_layer_end,
+                max_ram_mb=self.max_ram_mb,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to load GGUF PyTorch shard for %s (layers %d..%d): %s",
+                gguf_path,
+                self.shard_layer_start,
+                self.shard_layer_end,
+                exc,
+            )
+            raise RuntimeError(
+                f"Failed to load GGUF PyTorch shard from '{gguf_path}': {exc}. Please reload the model."
+            ) from exc
+
+        self._hf_config = loaded.hf_config
+        self.total_layers = loaded.total_layers
+        self.hidden_dim = loaded.hidden_dim
+        self.shard_layer_start = loaded.shard_layer_start
+        self.shard_layer_end = loaded.shard_layer_end
+        self.n_layers = max(1, self.shard_layer_end - self.shard_layer_start + 1)
+
+        self._shard_container = loaded.container
+        self._layers = loaded.layers
+        self._rotary_emb = loaded.rotary_emb
+        self._embed_tokens = loaded.embed_tokens
+        self._norm = loaded.norm
+        self._lm_head = loaded.lm_head
+        self._compute_dtype = loaded.compute_dtype
+        self._tokenizer = loaded.tokenizer
+        if self._tokenizer is not None:
+            self._eos_token_ids = _extract_eos_token_ids(self._hf_config, self._tokenizer)
+        else:
+            cfg_eos = getattr(self._hf_config, "eos_token_id", None)
+            if isinstance(cfg_eos, int):
+                self._eos_token_ids = {cfg_eos}
+        self._is_real_pytorch = True
+        logger.info(
+            "Loaded GGUF PyTorch shard for %s: layers %d..%d/%d (dtype=%s, role=%s)",
+            self.model_id,
+            self.shard_layer_start,
+            self.shard_layer_end,
+            self.total_layers,
+            self._compute_dtype,
+            "HEAD+TAIL"
+            if (self.is_head_node and self.is_tail_node)
+            else ("HEAD" if self.is_head_node else ("TAIL" if self.is_tail_node else "MIDDLE")),
+        )
 
     def _init_llama_cpp(self, gguf_path: str, n_layers: int) -> None:
         """Initialize `llama_cpp.Llama` when an explicit real `.gguf` file is provided."""
@@ -800,11 +863,19 @@ class ShardModelRunner:
                 ).unsqueeze(0)
                 cache_position = torch.arange(past_len, past_len + seq_len, dtype=torch.long)
 
-                position_embeddings = (
-                    self._rotary_emb(hidden_states, position_ids)
-                    if self._rotary_emb is not None
-                    else None
-                )
+                position_embeddings: Any = None
+                if self._rotary_emb is not None:
+                    layer_types = getattr(self._hf_config, "layer_types", None)
+                    if (
+                        getattr(self._hf_config, "model_type", "") == "gemma3_text"
+                        and isinstance(layer_types, (list, tuple))
+                    ):
+                        position_embeddings = {
+                            lt: self._rotary_emb(hidden_states, position_ids, lt)
+                            for lt in set(layer_types)
+                        }
+                    else:
+                        position_embeddings = self._rotary_emb(hidden_states, position_ids)
 
                 attention_mask: torch.Tensor | None = None
                 if seq_len > 1:
@@ -818,6 +889,11 @@ class ShardModelRunner:
                     attention_mask = torch.triu(mask, diagonal=1 + past_len)
 
                 for layer in self._layers:
+                    layer_pos_emb = (
+                        position_embeddings.get(getattr(layer, "attention_type", "full_attention"))
+                        if isinstance(position_embeddings, dict)
+                        else position_embeddings
+                    )
                     layer_out = layer(
                         hidden_states,
                         attention_mask=attention_mask,
@@ -825,7 +901,7 @@ class ShardModelRunner:
                         past_key_values=session.past_key_values,
                         use_cache=True,
                         cache_position=cache_position,
-                        position_embeddings=position_embeddings,
+                        position_embeddings=layer_pos_emb,
                     )
                     hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
@@ -896,6 +972,9 @@ class ShardModelRunner:
 
                 normed = self._norm(last_hidden)
                 logits = self._lm_head(normed)[0, -1, :].to(torch.float32)
+                softcap = getattr(self._hf_config, "final_logit_softcapping", None)
+                if isinstance(softcap, (int, float)) and softcap > 0:
+                    logits = torch.tanh(logits / float(softcap)) * float(softcap)
 
                 session = self._sessions.get(request_id)
                 if session is None:
@@ -969,7 +1048,13 @@ class ShardModelRunner:
         self._lm_head = None
         self._shard_container = None
         self._hf_config = None
+        tokenizer = self._tokenizer
         self._tokenizer = None
+        if tokenizer is not None:
+            close_tok = getattr(tokenizer, "close", None)
+            if callable(close_tok):
+                close_tok()
+        self._eos_token_ids.clear()
         self._is_real_pytorch = False
 
         with self._native_lock:

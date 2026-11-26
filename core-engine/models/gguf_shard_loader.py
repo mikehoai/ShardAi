@@ -1,0 +1,1353 @@
+"""Selective Memory-Mapped GGUF Quantized PyTorch Shard Loader.
+
+Enables distributed multi-node pipeline parallelism for `.gguf` models without
+loading unowned layers into RAM or pre-dequantizing full weight matrices:
+- Bounds-checked GGUF v2/v3 binary header & tensor table parser (`zero pickle`).
+- Vectorized GGML dequantization for F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
+  Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, and Q6_K.
+- Memory-safe quantized `nn.Module` layers (`GgufQuantizedLinear` with optional
+  row-chunked projection for large vocabularies and `GgufQuantizedEmbedding`)
+  that store raw quantized `uint8` bytes and dequantize on the fly inside
+  `torch.inference_mode()`.
+- Zero-RAM `meta`-device Hugging Face skeleton slicing so each peer loads ONLY
+  its assigned `[shard_layer_start..shard_layer_end]` tensors.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import logging
+import math
+from pathlib import Path
+import struct
+from typing import Any, BinaryIO
+
+import numpy as np
+import torch  # type: ignore[import-not-found]
+import torch.nn as nn  # type: ignore[import-not-found]
+import torch.nn.functional as F  # type: ignore[import-not-found]
+
+from models.gguf_reader import (
+    _GGUF_MAGIC,
+    _GGUF_TYPE_ARRAY,
+    _GGUF_TYPE_BOOL,
+    _GGUF_TYPE_FLOAT32,
+    _GGUF_TYPE_FLOAT64,
+    _GGUF_TYPE_INT8,
+    _GGUF_TYPE_INT16,
+    _GGUF_TYPE_INT32,
+    _GGUF_TYPE_INT64,
+    _GGUF_TYPE_STRING,
+    _GGUF_TYPE_UINT8,
+    _GGUF_TYPE_UINT16,
+    _GGUF_TYPE_UINT32,
+    _GGUF_TYPE_UINT64,
+    _MAX_GGUF_ARRAY_ELEMENTS,
+    _MAX_GGUF_STRING_BYTES,
+    _SCALAR_SIZES,
+    _read_gguf_string,
+    _skip_gguf_value,
+)
+
+logger = logging.getLogger("shardai.models.gguf_shard_loader")
+
+SUPPORTED_GGUF_ARCHITECTURES: frozenset[str] = frozenset(
+    {"llama", "mistral", "qwen2", "qwen3", "gemma2", "gemma3", "phi3"}
+)
+
+_MAX_GGUF_KV_COUNT = 100_000
+_MAX_GGUF_TENSOR_COUNT = 100_000
+_DEFAULT_ALIGNMENT = 32
+_DEFAULT_LM_HEAD_CHUNK_ROWS = 16384
+
+# GGML tensor quantization type IDs (exact `enum ggml_type` from ggml.h)
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
+GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4_1 = 3
+GGML_TYPE_Q5_0 = 6
+GGML_TYPE_Q5_1 = 7
+GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q2_K = 10
+GGML_TYPE_Q3_K = 11
+GGML_TYPE_Q4_K = 12
+GGML_TYPE_Q5_K = 13
+GGML_TYPE_Q6_K = 14
+GGML_TYPE_BF16 = 30
+
+# ggml_type -> (block_elements, block_bytes)
+GGML_TYPE_INFO: dict[int, tuple[int, int]] = {
+    GGML_TYPE_F32: (1, 4),
+    GGML_TYPE_F16: (1, 2),
+    GGML_TYPE_Q4_0: (32, 18),
+    GGML_TYPE_Q4_1: (32, 20),
+    GGML_TYPE_Q5_0: (32, 22),
+    GGML_TYPE_Q5_1: (32, 24),
+    GGML_TYPE_Q8_0: (32, 34),
+    GGML_TYPE_Q2_K: (256, 84),
+    GGML_TYPE_Q3_K: (256, 110),
+    GGML_TYPE_Q4_K: (256, 144),
+    GGML_TYPE_Q5_K: (256, 176),
+    GGML_TYPE_Q6_K: (256, 210),
+    GGML_TYPE_BF16: (1, 2),
+}
+
+_SCALAR_STRUCT_FMTS: dict[int, str] = {
+    _GGUF_TYPE_UINT8: "<B",
+    _GGUF_TYPE_INT8: "<b",
+    _GGUF_TYPE_UINT16: "<H",
+    _GGUF_TYPE_INT16: "<h",
+    _GGUF_TYPE_UINT32: "<I",
+    _GGUF_TYPE_INT32: "<i",
+    _GGUF_TYPE_FLOAT32: "<f",
+    _GGUF_TYPE_BOOL: "<?",
+    _GGUF_TYPE_UINT64: "<Q",
+    _GGUF_TYPE_INT64: "<q",
+    _GGUF_TYPE_FLOAT64: "<d",
+}
+
+_SKIPPED_LARGE_ARRAY_KEYS: frozenset[str] = frozenset(
+    {
+        "tokenizer.ggml.tokens",
+        "tokenizer.ggml.merges",
+        "tokenizer.ggml.scores",
+        "tokenizer.ggml.token_type",
+    }
+)
+
+
+@dataclass(frozen=True)
+class GgufTensorInfo:
+    """Metadata and byte location of one tensor inside a GGUF file."""
+
+    name: str
+    dims_gguf: tuple[int, ...]
+    shape_pt: tuple[int, ...]
+    ggml_type: int
+    rel_offset: int
+    nbytes: int
+
+
+@dataclass
+class GgufFileIndex:
+    """Parsed GGUF v2/v3 header metadata and tensor table without loading tensor payloads."""
+
+    path: Path
+    version: int
+    alignment: int
+    tensor_count: int
+    kv_count: int
+    metadata: dict[str, Any]
+    tensors: dict[str, GgufTensorInfo]
+    data_offset: int
+    file_size: int
+    tokens_value_offset: int | None = None
+    vocab_size_from_tokens: int | None = None
+
+
+@dataclass
+class LoadedGgufShard:
+    """Sliced PyTorch shard modules and metadata loaded selectively from a GGUF file."""
+
+    hf_config: Any
+    container: nn.Module
+    layers: list[Any]
+    rotary_emb: Any | None
+    embed_tokens: Any | None
+    norm: Any | None
+    lm_head: Any | None
+    tokenizer: Any | None
+    total_layers: int
+    hidden_dim: int
+    shard_layer_start: int
+    shard_layer_end: int
+    compute_dtype: torch.dtype
+
+
+def _compute_ggml_nbytes(dims_gguf: tuple[int, ...], ggml_type: int) -> int:
+    """Compute exact packed byte length for a GGUF tensor shape and GGML type."""
+    if ggml_type not in GGML_TYPE_INFO:
+        raise ValueError(f"Unsupported GGML tensor type ID: {ggml_type}")
+    if not dims_gguf:
+        raise ValueError("Tensor must have at least 1 dimension")
+    block_elems, block_bytes = GGML_TYPE_INFO[ggml_type]
+    inner_dim = dims_gguf[0]
+    if inner_dim <= 0 or inner_dim % block_elems != 0:
+        raise ValueError(
+            f"Inner GGUF dimension {inner_dim} is not a positive multiple of block_elems={block_elems} "
+            f"for ggml_type={ggml_type}"
+        )
+    outer_rows = 1
+    for dim in dims_gguf[1:]:
+        if dim <= 0:
+            raise ValueError(f"Invalid non-positive GGUF dimension in {dims_gguf}")
+        outer_rows *= dim
+    return (inner_dim // block_elems) * block_bytes * outer_rows
+
+
+def _read_scalar_value(f: BinaryIO, value_type: int) -> Any:
+    """Read one GGUF scalar metadata value."""
+    fmt = _SCALAR_STRUCT_FMTS[value_type]
+    size = _SCALAR_SIZES[value_type]
+    raw = f.read(size)
+    if len(raw) < size:
+        raise EOFError(f"Unexpected EOF reading GGUF scalar type {value_type}")
+    (val,) = struct.unpack(fmt, raw)
+    return val
+
+
+def _should_store_metadata_key(key: str) -> bool:
+    """Return True if `key` is needed for config or tokenizer construction."""
+    if key in {
+        "general.architecture",
+        "general.alignment",
+        "general.name",
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.padding_token_id",
+        "tokenizer.ggml.unknown_token_id",
+        "tokenizer.ggml.add_bos_token",
+        "tokenizer.chat_template",
+    }:
+        return True
+    suffixes = (
+        ".block_count",
+        ".embedding_length",
+        ".feed_forward_length",
+        ".context_length",
+        ".attention.head_count",
+        ".attention.head_count_kv",
+        ".attention.key_length",
+        ".attention.value_length",
+        ".attention.layer_norm_rms_epsilon",
+        ".attention.sliding_window",
+        ".rope.freq_base",
+        ".rope.dimension_count",
+        ".final_logit_softcapping",
+        ".attn_logit_softcapping",
+    )
+    return any(key.endswith(suffix) for suffix in suffixes)
+
+
+def _skip_large_string_array_fast(f: BinaryIO, count: int) -> None:
+    """Quickly skip an array of GGUF strings with bounds checks."""
+    if count > _MAX_GGUF_ARRAY_ELEMENTS:
+        raise ValueError(
+            f"GGUF array element count ({count}) exceeds safety cap ({_MAX_GGUF_ARRAY_ELEMENTS})"
+        )
+    for _ in range(count):
+        raw_len = f.read(8)
+        if len(raw_len) < 8:
+            raise EOFError("Unexpected EOF skipping GGUF string array element")
+        (slen,) = struct.unpack("<Q", raw_len)
+        if slen > _MAX_GGUF_STRING_BYTES:
+            raise ValueError(f"Suspicious GGUF string length: {slen}")
+        if slen > 0:
+            f.seek(slen, 1)
+
+
+def read_gguf_header_and_tensors(gguf_path: Path) -> GgufFileIndex:
+    """Parse GGUF v2/v3 header metadata and tensor index with strict bounds checks."""
+    if not gguf_path.is_file():
+        raise FileNotFoundError(f"GGUF file not found: {gguf_path}")
+    file_size = gguf_path.stat().st_size
+    if file_size < 24:
+        raise ValueError(f"GGUF file too small ({file_size} bytes): {gguf_path}")
+
+    with gguf_path.open("rb") as f:
+        header = f.read(24)
+        if len(header) < 24 or header[:4] != _GGUF_MAGIC:
+            raise ValueError("Invalid GGUF magic header")
+        version, tensor_count, kv_count = struct.unpack("<IQQ", header[4:24])
+        if version not in (2, 3):
+            raise ValueError(f"Unsupported GGUF version: {version}")
+        if tensor_count == 0 or tensor_count > _MAX_GGUF_TENSOR_COUNT:
+            raise ValueError(f"Invalid GGUF tensor_count: {tensor_count}")
+        if kv_count > _MAX_GGUF_KV_COUNT:
+            raise ValueError(f"Invalid GGUF kv_count: {kv_count}")
+
+        metadata: dict[str, Any] = {}
+        tokens_value_offset: int | None = None
+        vocab_size_from_tokens: int | None = None
+
+        for _ in range(kv_count):
+            key = _read_gguf_string(f)
+            type_raw = f.read(4)
+            if len(type_raw) < 4:
+                raise EOFError(f"Unexpected EOF reading value type for key '{key}'")
+            (val_type,) = struct.unpack("<I", type_raw)
+
+            if key in _SKIPPED_LARGE_ARRAY_KEYS and val_type == _GGUF_TYPE_ARRAY:
+                if key == "tokenizer.ggml.tokens":
+                    tokens_value_offset = f.tell()
+                arr_hdr = f.read(12)
+                if len(arr_hdr) < 12:
+                    raise EOFError(f"Unexpected EOF reading array header for '{key}'")
+                elem_type, count = struct.unpack("<IQ", arr_hdr)
+                if count > _MAX_GGUF_ARRAY_ELEMENTS:
+                    raise ValueError(
+                        f"GGUF array element count ({count}) exceeds safety cap ({_MAX_GGUF_ARRAY_ELEMENTS})"
+                    )
+                if key == "tokenizer.ggml.tokens":
+                    vocab_size_from_tokens = int(count)
+                if elem_type in _SCALAR_SIZES:
+                    f.seek(_SCALAR_SIZES[elem_type] * count, 1)
+                elif elem_type == _GGUF_TYPE_STRING:
+                    _skip_large_string_array_fast(f, int(count))
+                else:
+                    for _ in range(count):
+                        _skip_gguf_value(f, elem_type, depth=1)
+                continue
+
+            if _should_store_metadata_key(key):
+                if val_type in _SCALAR_STRUCT_FMTS:
+                    metadata[key] = _read_scalar_value(f, val_type)
+                    continue
+                if val_type == _GGUF_TYPE_STRING:
+                    metadata[key] = _read_gguf_string(f)
+                    continue
+
+            _skip_gguf_value(f, val_type)
+
+        raw_alignment = metadata.get("general.alignment", _DEFAULT_ALIGNMENT)
+        alignment = int(raw_alignment) if isinstance(raw_alignment, int) else _DEFAULT_ALIGNMENT
+        if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+            raise ValueError(f"Invalid GGUF alignment: {alignment}")
+
+        tensors: dict[str, GgufTensorInfo] = {}
+        for _ in range(tensor_count):
+            t_name = _read_gguf_string(f)
+            nd_raw = f.read(4)
+            if len(nd_raw) < 4:
+                raise EOFError(f"Unexpected EOF reading ndims for tensor '{t_name}'")
+            (n_dims,) = struct.unpack("<I", nd_raw)
+            if n_dims == 0 or n_dims > 4:
+                raise ValueError(f"Invalid GGUF tensor ndims={n_dims} for '{t_name}'")
+            dims_raw = f.read(8 * n_dims)
+            if len(dims_raw) < 8 * n_dims:
+                raise EOFError(f"Unexpected EOF reading dims for tensor '{t_name}'")
+            dims_gguf = tuple(int(d) for d in struct.unpack(f"<{n_dims}Q", dims_raw))
+            meta_raw = f.read(12)
+            if len(meta_raw) < 12:
+                raise EOFError(f"Unexpected EOF reading type/offset for tensor '{t_name}'")
+            ggml_type, rel_offset = struct.unpack("<IQ", meta_raw)
+            nbytes = _compute_ggml_nbytes(dims_gguf, int(ggml_type))
+            tensors[t_name] = GgufTensorInfo(
+                name=t_name,
+                dims_gguf=dims_gguf,
+                shape_pt=tuple(reversed(dims_gguf)),
+                ggml_type=int(ggml_type),
+                rel_offset=int(rel_offset),
+                nbytes=nbytes,
+            )
+
+        pos = f.tell()
+        data_offset = ((pos + alignment - 1) // alignment) * alignment
+        if data_offset > file_size:
+            raise ValueError(
+                f"GGUF data_offset ({data_offset}) exceeds file_size ({file_size})"
+            )
+
+        for t_info in tensors.values():
+            end_pos = data_offset + t_info.rel_offset + t_info.nbytes
+            if end_pos > file_size:
+                raise ValueError(
+                    f"Truncated GGUF tensor '{t_info.name}': end offset {end_pos} > file_size {file_size}"
+                )
+
+    return GgufFileIndex(
+        path=gguf_path,
+        version=int(version),
+        alignment=alignment,
+        tensor_count=int(tensor_count),
+        kv_count=int(kv_count),
+        metadata=metadata,
+        tensors=tensors,
+        data_offset=data_offset,
+        file_size=file_size,
+        tokens_value_offset=tokens_value_offset,
+        vocab_size_from_tokens=vocab_size_from_tokens,
+    )
+
+
+def can_load_gguf_pytorch_shard(gguf_path: Path) -> bool:
+    """Return True iff `gguf_path` is a valid GGUF v2/v3 with a supported architecture."""
+    try:
+        index = read_gguf_header_and_tensors(gguf_path)
+    except Exception:
+        return False
+    arch = str(index.metadata.get("general.architecture") or "").strip().lower()
+    return index.tensor_count > 0 and arch in SUPPORTED_GGUF_ARCHITECTURES
+
+
+def _read_gguf_tokens_list(index: GgufFileIndex) -> list[str]:
+    """Read `tokenizer.ggml.tokens` string list on demand when fallback tokenizer is used."""
+    if index.tokens_value_offset is None:
+        return []
+    with index.path.open("rb") as f:
+        f.seek(index.tokens_value_offset)
+        arr_hdr = f.read(12)
+        if len(arr_hdr) < 12:
+            return []
+        elem_type, count = struct.unpack("<IQ", arr_hdr)
+        if elem_type != _GGUF_TYPE_STRING or count > _MAX_GGUF_ARRAY_ELEMENTS:
+            return []
+        return [_read_gguf_string(f) for _ in range(int(count))]
+
+
+# ---------------------------------------------------------------------------
+# Vectorized GGML Dequantization
+# ---------------------------------------------------------------------------
+
+
+def _half_scalar(blocks: torch.Tensor, start: int, dtype: torch.dtype) -> torch.Tensor:
+    """Read little-endian float16 scalar per block as `(nb, 1)` in `dtype`."""
+    return blocks[:, start : start + 2].contiguous().view(torch.float16).to(dtype)
+
+
+def _unpack_k4_scales_mins(scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack 12 bytes of 6-bit scales/mins shared by Q4_K and Q5_K (`get_scale_min_k4`)."""
+    s0 = scales[:, 0:4] & 0x3F
+    s1 = (scales[:, 8:12] & 0x0F) | ((scales[:, 0:4] >> 6) << 4)
+    m0 = scales[:, 4:8] & 0x3F
+    m1 = (scales[:, 8:12] >> 4) | ((scales[:, 4:8] >> 6) << 4)
+    scale = torch.cat([s0, s1], dim=1).to(torch.float32)
+    minimum = torch.cat([m0, m1], dim=1).to(torch.float32)
+    return scale, minimum
+
+
+def _extract_shifted_fields(
+    data: torch.Tensor, shifts: tuple[int, ...], width: int
+) -> torch.Tensor:
+    """Extract bit fields at `shifts` across chunks of `width` bytes -> `(nb, -1, width)`."""
+    shift = torch.tensor(shifts, device=data.device, dtype=torch.uint8).reshape(1, 1, -1, 1)
+    return (data.reshape(data.shape[0], -1, 1, width) >> shift).reshape(data.shape[0], -1, width)
+
+
+def _dequantize_blocks_u8(
+    raw_u8: torch.Tensor,
+    ggml_type: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Vectorized dequantization of a flat 1D `torch.uint8` tensor into 1D `dtype` values."""
+    if ggml_type == GGML_TYPE_F32:
+        return raw_u8.contiguous().view(torch.float32).to(dtype)
+    if ggml_type == GGML_TYPE_F16:
+        return raw_u8.contiguous().view(torch.float16).to(dtype)
+    if ggml_type == GGML_TYPE_BF16:
+        return raw_u8.contiguous().view(torch.bfloat16).to(dtype)
+
+    if ggml_type not in GGML_TYPE_INFO:
+        raise ValueError(f"Unsupported GGML quantization type ID: {ggml_type}")
+
+    block_elems, block_bytes = GGML_TYPE_INFO[ggml_type]
+    if raw_u8.numel() % block_bytes != 0:
+        raise ValueError(
+            f"Raw byte count {raw_u8.numel()} is not divisible by block_bytes={block_bytes} "
+            f"for ggml_type={ggml_type}"
+        )
+    blocks = raw_u8.reshape(-1, block_bytes)
+    nb = int(blocks.shape[0])
+
+    if ggml_type == GGML_TYPE_Q4_0:
+        d = _half_scalar(blocks, 0, dtype)
+        qs = blocks[:, 2:18]
+        nibbles = torch.cat([qs & 0x0F, qs >> 4], dim=1)
+        out = d * (nibbles.to(torch.int8) - 8).to(dtype)
+    elif ggml_type == GGML_TYPE_Q4_1:
+        d = _half_scalar(blocks, 0, dtype)
+        m = _half_scalar(blocks, 2, dtype)
+        qs = blocks[:, 4:20]
+        nibbles = torch.cat([qs & 0x0F, qs >> 4], dim=1)
+        out = d * nibbles.to(dtype) + m
+    elif ggml_type == GGML_TYPE_Q5_0:
+        d = _half_scalar(blocks, 0, dtype)
+        qh = blocks[:, 2:6].contiguous().view(torch.int32)
+        qs = blocks[:, 6:22]
+        bit_pos = torch.arange(32, device=blocks.device, dtype=torch.int32).reshape(1, 32)
+        high_bits = (qh >> bit_pos) & 1
+        nibbles = torch.cat([qs & 0x0F, qs >> 4], dim=1).to(torch.int32)
+        quants = (nibbles | (high_bits << 4)) - 16
+        out = d * quants.to(dtype)
+    elif ggml_type == GGML_TYPE_Q5_1:
+        d = _half_scalar(blocks, 0, dtype)
+        m = _half_scalar(blocks, 2, dtype)
+        qh = blocks[:, 4:8].contiguous().view(torch.int32)
+        qs = blocks[:, 8:24]
+        bit_pos = torch.arange(32, device=blocks.device, dtype=torch.int32).reshape(1, 32)
+        high_bits = (qh >> bit_pos) & 1
+        nibbles = torch.cat([qs & 0x0F, qs >> 4], dim=1).to(torch.int32)
+        quants = nibbles | (high_bits << 4)
+        out = d * quants.to(dtype) + m
+    elif ggml_type == GGML_TYPE_Q8_0:
+        d = _half_scalar(blocks, 0, dtype)
+        qs = blocks[:, 2:34].view(torch.int8).to(dtype)
+        out = d * qs
+    elif ggml_type == GGML_TYPE_Q2_K:
+        scales = blocks[:, 0:16]
+        qs = blocks[:, 16:80]
+        d = _half_scalar(blocks, 80, torch.float32)
+        dmin = _half_scalar(blocks, 82, torch.float32)
+        dl = (d * (scales & 0x0F).to(torch.float32)).reshape(nb, 16, 1)
+        ml = (dmin * (scales >> 4).to(torch.float32)).reshape(nb, 16, 1)
+        q = (_extract_shifted_fields(qs, (0, 2, 4, 6), 32) & 0x03).reshape(nb, 16, 16)
+        out = (dl * q.to(torch.float32) - ml).to(dtype).reshape(nb, block_elems)
+    elif ggml_type == GGML_TYPE_Q3_K:
+        hmask = blocks[:, 0:32]
+        qs = blocks[:, 32:96]
+        scales = blocks[:, 96:108]
+        d = _half_scalar(blocks, 108, torch.float32)
+        low = _extract_shifted_fields(scales[:, :8], (0, 4), 8).reshape(nb, 16)
+        high = _extract_shifted_fields(scales[:, 8:12], (0, 2, 4, 6), 4).reshape(nb, 16)
+        scale = ((low & 0x0F) | ((high & 0x03) << 4)).to(torch.int8).to(torch.float32) - 32.0
+        ql = (_extract_shifted_fields(qs, (0, 2, 4, 6), 32) & 0x03).reshape(nb, 16, 16)
+        qh = (_extract_shifted_fields(hmask, tuple(range(8)), 32).reshape(nb, 16, 16) & 1) ^ 1
+        q = ql.to(torch.int8) - (qh << 2).to(torch.int8)
+        out = ((d * scale)[..., None] * q.to(torch.float32)).to(dtype).reshape(nb, block_elems)
+    elif ggml_type == GGML_TYPE_Q4_K:
+        d = _half_scalar(blocks, 0, torch.float32)
+        dmin = _half_scalar(blocks, 2, torch.float32)
+        scale, minimum = _unpack_k4_scales_mins(blocks[:, 4:16])
+        q = _extract_shifted_fields(blocks[:, 16:144], (0, 4), 32) & 0x0F
+        out = (
+            (d * scale)[..., None] * q.to(torch.float32) - (dmin * minimum)[..., None]
+        ).to(dtype).reshape(nb, block_elems)
+    elif ggml_type == GGML_TYPE_Q5_K:
+        d = _half_scalar(blocks, 0, torch.float32)
+        dmin = _half_scalar(blocks, 2, torch.float32)
+        scale, minimum = _unpack_k4_scales_mins(blocks[:, 4:16])
+        high = _extract_shifted_fields(blocks[:, 16:48], tuple(range(8)), 32) & 1
+        low = _extract_shifted_fields(blocks[:, 48:176], (0, 4), 32) & 0x0F
+        q = low | (high << 4)
+        out = (
+            (d * scale)[..., None] * q.to(torch.float32) - (dmin * minimum)[..., None]
+        ).to(dtype).reshape(nb, block_elems)
+    elif ggml_type == GGML_TYPE_Q6_K:
+        ql = blocks[:, 0:128]
+        qh = blocks[:, 128:192]
+        scales = blocks[:, 192:208].view(torch.int8).to(torch.float32)
+        d = _half_scalar(blocks, 208, torch.float32)
+        scale = (d * scales).reshape(nb, 16, 1)
+        low = (_extract_shifted_fields(ql, (0, 4), 64) & 0x0F).reshape(nb, 8, 32)
+        high = (_extract_shifted_fields(qh, (0, 2, 4, 6), 32) & 0x03).reshape(nb, 8, 32)
+        quants = (low | (high << 4)).to(torch.int8) - 32
+        out = (scale * quants.reshape(nb, 16, 16).to(torch.float32)).to(dtype).reshape(
+            nb, block_elems
+        )
+    else:
+        raise ValueError(f"Unsupported GGML quantization type ID: {ggml_type}")
+
+    return out.reshape(-1)
+
+
+def dequantize_ggml_bytes(
+    raw: bytes | memoryview,
+    shape_pt: tuple[int, ...],
+    ggml_type: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize raw GGML tensor bytes into a PyTorch tensor of `shape_pt` and `dtype`."""
+    expected_elems = math.prod(shape_pt)
+    raw_bytes = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+    arr = np.frombuffer(raw_bytes, dtype=np.uint8).copy()
+    raw_u8 = torch.from_numpy(arr)
+    flat = _dequantize_blocks_u8(raw_u8, ggml_type=ggml_type, dtype=dtype)
+    if int(flat.numel()) != expected_elems:
+        raise ValueError(
+            f"Dequantized element count {flat.numel()} != expected {expected_elems} "
+            f"for shape {shape_pt} (ggml_type={ggml_type})"
+        )
+    return flat.reshape(shape_pt)
+
+
+def _reverse_permute_rope_rows(tensor: torch.Tensor, n_head: int) -> torch.Tensor:
+    """Undo llama.cpp's interleaved RoPE head permutation along axis 0 (`llama`/`mistral`)."""
+    out_rows = int(tensor.shape[0])
+    if n_head <= 0 or out_rows % (2 * n_head) != 0:
+        return tensor
+    head_half = out_rows // n_head // 2
+    rest = tensor.shape[1:]
+    return tensor.reshape(n_head, head_half, 2, *rest).swapaxes(2, 1).reshape(tensor.shape)
+
+
+# ---------------------------------------------------------------------------
+# Memory-Safe Quantized PyTorch Layers
+# ---------------------------------------------------------------------------
+
+
+class GgufQuantizedLinear(nn.Module):
+    """Linear layer storing packed quantized `uint8` weights and dequantizing per forward."""
+
+    def __init__(
+        self,
+        raw_weight: torch.Tensor,
+        out_features: int,
+        in_features: int,
+        ggml_type: int,
+        bias: torch.Tensor | None = None,
+        unpermute_heads: int | None = None,
+        chunk_out_rows: int | None = None,
+    ) -> None:
+        super().__init__()
+        if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 1:
+            raise ValueError("GgufQuantizedLinear expects a 1D torch.uint8 buffer")
+        block_elems, block_bytes = GGML_TYPE_INFO[ggml_type]
+        if in_features % block_elems != 0:
+            raise ValueError(
+                f"in_features={in_features} must be divisible by block_elems={block_elems}"
+            )
+        self.out_features: int = out_features
+        self.in_features: int = in_features
+        self.ggml_type: int = ggml_type
+        self.unpermute_heads: int | None = unpermute_heads
+        self.chunk_out_rows: int | None = chunk_out_rows
+        self._row_bytes: int = (in_features // block_elems) * block_bytes
+        if int(raw_weight.numel()) != self.out_features * self._row_bytes:
+            raise ValueError(
+                f"raw_weight byte length {raw_weight.numel()} != expected "
+                f"{self.out_features * self._row_bytes}"
+            )
+
+        self.register_buffer("raw_weight", raw_weight.detach().contiguous(), persistent=True)
+        if bias is not None:
+            self.register_parameter(
+                "bias", nn.Parameter(bias.detach().contiguous(), requires_grad=False)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Dequantize weight on the fly inside `torch.inference_mode()` and apply `F.linear`."""
+        with torch.inference_mode():
+            target_dtype = x.dtype
+            bias_t = self.bias.to(dtype=target_dtype) if self.bias is not None else None
+            rows_2d = self.raw_weight.view(self.out_features, self._row_bytes)
+
+            if (
+                self.chunk_out_rows is not None
+                and self.chunk_out_rows > 0
+                and self.out_features > self.chunk_out_rows
+                and self.unpermute_heads is None
+            ):
+                out_shape = (*x.shape[:-1], self.out_features)
+                output = torch.empty(out_shape, dtype=target_dtype, device=x.device)
+                for r0 in range(0, self.out_features, self.chunk_out_rows):
+                    r1 = min(self.out_features, r0 + self.chunk_out_rows)
+                    chunk_u8 = rows_2d[r0:r1].reshape(-1)
+                    w_chunk = _dequantize_blocks_u8(
+                        chunk_u8, ggml_type=self.ggml_type, dtype=target_dtype
+                    ).reshape(r1 - r0, self.in_features)
+                    b_chunk = bias_t[r0:r1] if bias_t is not None else None
+                    output[..., r0:r1] = F.linear(x, w_chunk, b_chunk)
+                    del w_chunk
+                return output
+
+            w = _dequantize_blocks_u8(
+                self.raw_weight, ggml_type=self.ggml_type, dtype=target_dtype
+            ).reshape(self.out_features, self.in_features)
+            if self.unpermute_heads is not None:
+                w = _reverse_permute_rope_rows(w, self.unpermute_heads)
+            out = F.linear(x, w, bias_t)
+            del w
+            return out
+
+
+class GgufQuantizedEmbedding(nn.Module):
+    """Embedding layer storing packed `uint8` rows and dequantizing only gathered token IDs."""
+
+    def __init__(
+        self,
+        raw_weight: torch.Tensor,
+        vocab_size: int,
+        embedding_dim: int,
+        ggml_type: int,
+        embed_scale: float = 1.0,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        if raw_weight.dtype != torch.uint8:
+            raise ValueError("GgufQuantizedEmbedding expects torch.uint8 raw_weight")
+        block_elems, block_bytes = GGML_TYPE_INFO[ggml_type]
+        row_bytes = (embedding_dim // block_elems) * block_bytes
+        if raw_weight.ndim == 1:
+            raw_weight = raw_weight.view(vocab_size, row_bytes)
+        if tuple(raw_weight.shape) != (vocab_size, row_bytes):
+            raise ValueError(
+                f"raw_weight shape {tuple(raw_weight.shape)} != expected {(vocab_size, row_bytes)}"
+            )
+        self.vocab_size: int = vocab_size
+        self.embedding_dim: int = embedding_dim
+        self.ggml_type: int = ggml_type
+        self.embed_scale: float = float(embed_scale)
+        self.output_dtype: torch.dtype = output_dtype
+        self._row_bytes: int = row_bytes
+        self.register_buffer("raw_weight", raw_weight.detach().contiguous(), persistent=True)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Gather only `input_ids` rows and dequantize those rows on the fly."""
+        with torch.inference_mode():
+            flat_ids = input_ids.reshape(-1).to(torch.long)
+            selected_u8 = self.raw_weight.index_select(0, flat_ids).reshape(-1)
+            deq = _dequantize_blocks_u8(
+                selected_u8, ggml_type=self.ggml_type, dtype=self.output_dtype
+            ).reshape(*input_ids.shape, self.embedding_dim)
+            if self.embed_scale != 1.0:
+                deq = deq * self.embed_scale
+            return deq
+
+
+# ---------------------------------------------------------------------------
+# Hugging Face Config Reconstruction & Selective Layer Loading
+# ---------------------------------------------------------------------------
+
+
+def _build_hf_config_from_gguf(index: GgufFileIndex) -> Any:
+    """Reconstruct a `transformers` config object from GGUF header metadata."""
+    from transformers import (  # type: ignore[import-not-found]
+        Gemma2Config,
+        Gemma3TextConfig,
+        LlamaConfig,
+        MistralConfig,
+        Phi3Config,
+        Qwen2Config,
+        Qwen3Config,
+    )
+
+    arch = str(index.metadata.get("general.architecture") or "").strip().lower()
+    if arch not in SUPPORTED_GGUF_ARCHITECTURES:
+        raise ValueError(f"Unsupported GGUF architecture: '{arch}'")
+
+    def _meta(suffix: str, default: Any = None) -> Any:
+        return index.metadata.get(f"{arch}.{suffix}", default)
+
+    num_hidden_layers = int(_meta("block_count"))
+    hidden_size = int(_meta("embedding_length"))
+    intermediate_size = int(_meta("feed_forward_length"))
+    max_position_embeddings = int(_meta("context_length", 2048))
+    num_attention_heads = int(_meta("attention.head_count"))
+    num_key_value_heads = int(_meta("attention.head_count_kv", num_attention_heads))
+    head_dim_raw = _meta("attention.key_length")
+    head_dim = int(head_dim_raw) if head_dim_raw is not None else (hidden_size // num_attention_heads)
+    rms_norm_eps = float(_meta("attention.layer_norm_rms_epsilon", 1e-6))
+    rope_theta = float(_meta("rope.freq_base", 10000.0))
+    rope_dim_raw = _meta("rope.dimension_count")
+    sliding_window = _meta("attention.sliding_window")
+    final_logit_softcapping = _meta("final_logit_softcapping")
+    attn_logit_softcapping = _meta("attn_logit_softcapping")
+
+    if "token_embd.weight" in index.tensors:
+        vocab_size = int(index.tensors["token_embd.weight"].shape_pt[0])
+    elif index.vocab_size_from_tokens is not None:
+        vocab_size = int(index.vocab_size_from_tokens)
+    elif "output.weight" in index.tensors:
+        vocab_size = int(index.tensors["output.weight"].shape_pt[0])
+    else:
+        raise ValueError("Unable to determine vocab_size from GGUF tensors or metadata")
+
+    tie_word_embeddings = "output.weight" not in index.tensors
+    has_attn_bias = "blk.0.attn_q.bias" in index.tensors
+    bos_token_id = index.metadata.get("tokenizer.ggml.bos_token_id")
+    eos_token_id = index.metadata.get("tokenizer.ggml.eos_token_id")
+    pad_token_id = index.metadata.get("tokenizer.ggml.padding_token_id")
+
+    rope_params: dict[str, Any] = {"rope_theta": rope_theta, "rope_type": "default"}
+    if rope_dim_raw is not None and head_dim > 0 and int(rope_dim_raw) != head_dim:
+        rope_params["partial_rotary_factor"] = float(int(rope_dim_raw)) / float(head_dim)
+
+    common_kwargs: dict[str, Any] = {
+        "vocab_size": vocab_size,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "num_hidden_layers": num_hidden_layers,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "max_position_embeddings": max_position_embeddings,
+        "rms_norm_eps": rms_norm_eps,
+        "tie_word_embeddings": tie_word_embeddings,
+        "rope_parameters": rope_params,
+        "use_cache": True,
+    }
+    if bos_token_id is not None:
+        common_kwargs["bos_token_id"] = int(bos_token_id)
+    if eos_token_id is not None:
+        common_kwargs["eos_token_id"] = int(eos_token_id)
+    if pad_token_id is not None and int(pad_token_id) < vocab_size:
+        common_kwargs["pad_token_id"] = int(pad_token_id)
+
+    if arch == "llama":
+        common_kwargs["attention_bias"] = has_attn_bias
+        return LlamaConfig(**common_kwargs)
+    if arch == "mistral":
+        if sliding_window is not None:
+            common_kwargs["sliding_window"] = int(sliding_window)
+        return MistralConfig(**common_kwargs)
+    if arch == "qwen2":
+        if sliding_window is not None:
+            common_kwargs["sliding_window"] = int(sliding_window)
+        return Qwen2Config(**common_kwargs)
+    if arch == "qwen3":
+        common_kwargs["attention_bias"] = has_attn_bias
+        if sliding_window is not None:
+            common_kwargs["sliding_window"] = int(sliding_window)
+        return Qwen3Config(**common_kwargs)
+    if arch == "gemma2":
+        common_kwargs["attention_bias"] = has_attn_bias
+        if sliding_window is not None:
+            common_kwargs["sliding_window"] = int(sliding_window)
+        if final_logit_softcapping is not None:
+            common_kwargs["final_logit_softcapping"] = float(final_logit_softcapping)
+        if attn_logit_softcapping is not None:
+            common_kwargs["attn_logit_softcapping"] = float(attn_logit_softcapping)
+        return Gemma2Config(**common_kwargs)
+    if arch == "gemma3":
+        common_kwargs["attention_bias"] = has_attn_bias
+        if sliding_window is not None:
+            common_kwargs["sliding_window"] = int(sliding_window)
+        if final_logit_softcapping is not None:
+            common_kwargs["final_logit_softcapping"] = float(final_logit_softcapping)
+        if attn_logit_softcapping is not None:
+            common_kwargs["attn_logit_softcapping"] = float(attn_logit_softcapping)
+        return Gemma3TextConfig(**common_kwargs)
+    if arch == "phi3":
+        if sliding_window is not None:
+            common_kwargs["sliding_window"] = int(sliding_window)
+        # Phi3Config validates pad/eos token IDs against vocab_size
+        common_kwargs.setdefault("pad_token_id", 0)
+        common_kwargs.setdefault("eos_token_id", min(1, vocab_size - 1))
+        return Phi3Config(**common_kwargs)
+    raise ValueError(f"Unsupported GGUF architecture: '{arch}'")
+
+
+def _read_tensor_raw_u8(f: BinaryIO, index: GgufFileIndex, t_info: GgufTensorInfo) -> torch.Tensor:
+    """Seek-read raw tensor bytes as a 1D `torch.uint8` tensor without loading other tensors."""
+    f.seek(index.data_offset + t_info.rel_offset)
+    raw_bytes = f.read(t_info.nbytes)
+    if len(raw_bytes) < t_info.nbytes:
+        raise EOFError(f"Unexpected EOF reading tensor '{t_info.name}'")
+    arr = np.frombuffer(raw_bytes, dtype=np.uint8).copy()
+    return torch.from_numpy(arr)
+
+
+def _read_tensor_dense(
+    f: BinaryIO,
+    index: GgufFileIndex,
+    t_info: GgufTensorInfo,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Seek-read and dequantize one tensor (used for small 1D norms & biases)."""
+    raw_u8 = _read_tensor_raw_u8(f, index, t_info)
+    return _dequantize_blocks_u8(raw_u8, ggml_type=t_info.ggml_type, dtype=dtype).reshape(
+        t_info.shape_pt
+    )
+
+
+def _make_linear_from_gguf(
+    f: BinaryIO,
+    index: GgufFileIndex,
+    weight_name: str,
+    bias_name: str | None = None,
+    *,
+    unpermute_heads: int | None = None,
+    chunk_out_rows: int | None = None,
+) -> GgufQuantizedLinear:
+    """Construct a `GgufQuantizedLinear` by seek-reading only its packed bytes."""
+    w_info = index.tensors[weight_name]
+    if len(w_info.shape_pt) != 2:
+        raise ValueError(f"Expected 2D weight for '{weight_name}', got {w_info.shape_pt}")
+    out_features, in_features = w_info.shape_pt
+    raw_u8 = _read_tensor_raw_u8(f, index, w_info)
+    bias_tensor: torch.Tensor | None = None
+    if bias_name is not None and bias_name in index.tensors:
+        b_info = index.tensors[bias_name]
+        bias_tensor = _read_tensor_dense(f, index, b_info, dtype=torch.float32)
+        if unpermute_heads is not None:
+            bias_tensor = _reverse_permute_rope_rows(bias_tensor, unpermute_heads)
+    return GgufQuantizedLinear(
+        raw_weight=raw_u8,
+        out_features=out_features,
+        in_features=in_features,
+        ggml_type=w_info.ggml_type,
+        bias=bias_tensor,
+        unpermute_heads=unpermute_heads,
+        chunk_out_rows=chunk_out_rows,
+    )
+
+
+def _set_norm_weight(
+    norm_module: nn.Module,
+    f: BinaryIO,
+    index: GgufFileIndex,
+    tensor_name: str,
+    *,
+    gemma_offset: bool,
+) -> None:
+    """Load 1D RMSNorm weights (subtracting 1.0 for Gemma2/Gemma3 zero-centered norm)."""
+    if tensor_name not in index.tensors:
+        return
+    w = _read_tensor_dense(f, index, index.tensors[tensor_name], dtype=torch.float32)
+    if gemma_offset:
+        w = w - 1.0
+    norm_module.register_parameter("weight", nn.Parameter(w, requires_grad=False))
+
+
+def _apply_layer_weights(
+    layer: nn.Module,
+    layer_idx: int,
+    arch: str,
+    hf_config: Any,
+    f: BinaryIO,
+    index: GgufFileIndex,
+) -> None:
+    """Selectively seek-read and attach quantized projections & norms for one layer."""
+    gemma_offset = arch in ("gemma2", "gemma3")
+    is_llama_rope_perm = arch in ("llama", "mistral")
+    n_heads = int(getattr(hf_config, "num_attention_heads"))
+    n_kv_heads = int(getattr(hf_config, "num_key_value_heads", n_heads))
+
+    prefix = f"blk.{layer_idx}"
+    attn = layer.self_attn
+    mlp = layer.mlp
+
+    # Norms
+    _set_norm_weight(
+        layer.input_layernorm, f, index, f"{prefix}.attn_norm.weight", gemma_offset=gemma_offset
+    )
+    if gemma_offset:
+        _set_norm_weight(
+            layer.post_attention_layernorm,
+            f,
+            index,
+            f"{prefix}.post_attention_norm.weight",
+            gemma_offset=True,
+        )
+        _set_norm_weight(
+            layer.pre_feedforward_layernorm,
+            f,
+            index,
+            f"{prefix}.ffn_norm.weight",
+            gemma_offset=True,
+        )
+        _set_norm_weight(
+            layer.post_feedforward_layernorm,
+            f,
+            index,
+            f"{prefix}.post_ffw_norm.weight",
+            gemma_offset=True,
+        )
+    else:
+        _set_norm_weight(
+            layer.post_attention_layernorm,
+            f,
+            index,
+            f"{prefix}.ffn_norm.weight",
+            gemma_offset=False,
+        )
+
+    if hasattr(attn, "q_norm"):
+        _set_norm_weight(
+            attn.q_norm, f, index, f"{prefix}.attn_q_norm.weight", gemma_offset=gemma_offset
+        )
+    if hasattr(attn, "k_norm"):
+        _set_norm_weight(
+            attn.k_norm, f, index, f"{prefix}.attn_k_norm.weight", gemma_offset=gemma_offset
+        )
+
+    # Attention projections
+    if arch == "phi3" and f"{prefix}.attn_qkv.weight" in index.tensors:
+        attn.qkv_proj = _make_linear_from_gguf(
+            f, index, f"{prefix}.attn_qkv.weight", f"{prefix}.attn_qkv.bias"
+        )
+    else:
+        if f"{prefix}.attn_q.weight" in index.tensors:
+            attn.q_proj = _make_linear_from_gguf(
+                f,
+                index,
+                f"{prefix}.attn_q.weight",
+                f"{prefix}.attn_q.bias",
+                unpermute_heads=n_heads if is_llama_rope_perm else None,
+            )
+        if f"{prefix}.attn_k.weight" in index.tensors:
+            attn.k_proj = _make_linear_from_gguf(
+                f,
+                index,
+                f"{prefix}.attn_k.weight",
+                f"{prefix}.attn_k.bias",
+                unpermute_heads=n_kv_heads if is_llama_rope_perm else None,
+            )
+        if f"{prefix}.attn_v.weight" in index.tensors:
+            attn.v_proj = _make_linear_from_gguf(
+                f, index, f"{prefix}.attn_v.weight", f"{prefix}.attn_v.bias"
+            )
+
+    if f"{prefix}.attn_output.weight" in index.tensors:
+        attn.o_proj = _make_linear_from_gguf(
+            f, index, f"{prefix}.attn_output.weight", f"{prefix}.attn_output.bias"
+        )
+
+    # MLP projections
+    if arch == "phi3" and f"{prefix}.ffn_up.weight" in index.tensors and hasattr(mlp, "gate_up_proj"):
+        mlp.gate_up_proj = _make_linear_from_gguf(
+            f, index, f"{prefix}.ffn_up.weight", f"{prefix}.ffn_up.bias"
+        )
+    else:
+        if f"{prefix}.ffn_gate.weight" in index.tensors:
+            mlp.gate_proj = _make_linear_from_gguf(
+                f, index, f"{prefix}.ffn_gate.weight", f"{prefix}.ffn_gate.bias"
+            )
+        if f"{prefix}.ffn_up.weight" in index.tensors:
+            mlp.up_proj = _make_linear_from_gguf(
+                f, index, f"{prefix}.ffn_up.weight", f"{prefix}.ffn_up.bias"
+            )
+    if f"{prefix}.ffn_down.weight" in index.tensors:
+        mlp.down_proj = _make_linear_from_gguf(
+            f, index, f"{prefix}.ffn_down.weight", f"{prefix}.ffn_down.bias"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight GGUF Tokenizer Adapter (Head / Tail Nodes Only)
+# ---------------------------------------------------------------------------
+
+
+class GgufTokenizerAdapter:
+    """Lightweight tokenizer backed by `llama_cpp(vocab_only=True)` or GGUF token fallback."""
+
+    def __init__(self, index: GgufFileIndex) -> None:
+        self.chat_template: str | None = (
+            str(index.metadata["tokenizer.chat_template"])
+            if index.metadata.get("tokenizer.chat_template")
+            else None
+        )
+        self.bos_token_id: int | None = (
+            int(index.metadata["tokenizer.ggml.bos_token_id"])
+            if "tokenizer.ggml.bos_token_id" in index.metadata
+            else None
+        )
+        self.eos_token_id: int | None = (
+            int(index.metadata["tokenizer.ggml.eos_token_id"])
+            if "tokenizer.ggml.eos_token_id" in index.metadata
+            else None
+        )
+        self.pad_token_id: int | None = (
+            int(index.metadata["tokenizer.ggml.padding_token_id"])
+            if "tokenizer.ggml.padding_token_id" in index.metadata
+            else None
+        )
+        self._add_bos_token: bool = bool(index.metadata.get("tokenizer.ggml.add_bos_token", False))
+        self._llama: Any | None = None
+        self._vocab_tokens: list[str] = []
+        self._token_to_id: dict[str, int] = {}
+        self._special_ids: set[int] = set()
+
+        for tid in (self.bos_token_id, self.eos_token_id, self.pad_token_id):
+            if tid is not None and tid >= 0:
+                self._special_ids.add(tid)
+
+        try:
+            from llama_cpp import Llama  # type: ignore[import-not-found]
+
+            self._llama = Llama(
+                model_path=str(index.path),
+                vocab_only=True,
+                use_mmap=True,
+                verbose=False,
+            )
+            if self.bos_token_id is None and hasattr(self._llama, "token_bos"):
+                bos = int(self._llama.token_bos())
+                if bos >= 0:
+                    self.bos_token_id = bos
+                    self._special_ids.add(bos)
+            if self.eos_token_id is None and hasattr(self._llama, "token_eos"):
+                eos = int(self._llama.token_eos())
+                if eos >= 0:
+                    self.eos_token_id = eos
+                    self._special_ids.add(eos)
+            for special_tok in ("<|im_end|>", "<|eot_id|>", "<|im_start|>", "<|endoftext|>", "</s>"):
+                sid = self.convert_tokens_to_ids(special_tok)
+                if sid is not None and sid >= 0:
+                    self._special_ids.add(sid)
+        except Exception as exc:
+            logger.debug(
+                "Falling back to GGUF metadata tokenizer for %s (%s)",
+                index.path.name,
+                exc,
+            )
+            self._llama = None
+            self._vocab_tokens = _read_gguf_tokens_list(index)
+            self._token_to_id = {tok: idx for idx, tok in enumerate(self._vocab_tokens)}
+            for special_tok in ("<|im_end|>", "<|eot_id|>", "<|im_start|>", "<|endoftext|>", "</s>", "<s>"):
+                if special_tok in self._token_to_id:
+                    self._special_ids.add(self._token_to_id[special_tok])
+
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        """Map a single token string (e.g. `<|im_end|>`) to its integer ID."""
+        if self._llama is not None:
+            try:
+                ids = self._llama.tokenize(
+                    token.encode("utf-8"), add_bos=False, special=True
+                )
+                if len(ids) == 1:
+                    return int(ids[0])
+            except Exception:
+                return None
+            return None
+        return self._token_to_id.get(token)
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        """Encode text into integer token IDs."""
+        if self._llama is not None:
+            add_bos = self._add_bos_token if add_special_tokens else False
+            ids = self._llama.tokenize(
+                text.encode("utf-8"), add_bos=add_bos, special=True
+            )
+            return [int(t) for t in ids]
+
+        tokens: list[int] = []
+        if add_special_tokens and self._add_bos_token and self.bos_token_id is not None:
+            tokens.append(self.bos_token_id)
+
+        if not self._token_to_id:
+            return tokens or [self.bos_token_id or 0]
+
+        i = 0
+        max_tok_len = max((len(t) for t in self._token_to_id), default=1)
+        n = len(text)
+        while i < n:
+            matched_id: int | None = None
+            matched_len = 0
+            for span in range(min(max_tok_len, n - i), 0, -1):
+                piece = text[i : i + span]
+                if piece in self._token_to_id:
+                    matched_id = self._token_to_id[piece]
+                    matched_len = span
+                    break
+            if matched_id is not None:
+                tokens.append(matched_id)
+                i += matched_len
+            else:
+                tokens.append(0)
+                i += 1
+        return tokens
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
+        """Decode integer token IDs back to UTF-8 text."""
+        filtered = (
+            [int(t) for t in token_ids if int(t) not in self._special_ids]
+            if skip_special_tokens
+            else [int(t) for t in token_ids]
+        )
+        if not filtered:
+            return ""
+        if self._llama is not None:
+            raw_bytes: bytes = self._llama.detokenize(filtered)
+            return raw_bytes.decode("utf-8", errors="replace")
+
+        parts: list[str] = []
+        for tid in filtered:
+            if 0 <= tid < len(self._vocab_tokens):
+                parts.append(self._vocab_tokens[tid])
+        return "".join(parts)
+
+    def _render_chatml_fallback(
+        self, messages: list[dict[str, str]], add_generation_prompt: bool
+    ) -> str:
+        """Render safe ChatML prompt format when Jinja template is absent or fails."""
+        chunks: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            chunks.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        if add_generation_prompt:
+            chunks.append("<|im_start|>assistant\n")
+        return "".join(chunks)
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = True,
+        add_generation_prompt: bool = True,
+    ) -> list[int] | str:
+        """Render `messages` using the GGUF Jinja chat template (sandboxed) or ChatML fallback."""
+        rendered: str | None = None
+        if self.chat_template:
+            try:
+                from jinja2.sandbox import SandboxedEnvironment  # type: ignore[import-not-found]
+
+                env = SandboxedEnvironment()
+                bos_str = ""
+                eos_str = ""
+                if self.bos_token_id is not None:
+                    bos_str = self.decode([self.bos_token_id], skip_special_tokens=False)
+                if self.eos_token_id is not None:
+                    eos_str = self.decode([self.eos_token_id], skip_special_tokens=False)
+
+                def _raise_exc(msg: str) -> None:
+                    raise ValueError(msg)
+
+                tmpl = env.from_string(self.chat_template)
+                rendered = tmpl.render(
+                    messages=messages,
+                    add_generation_prompt=add_generation_prompt,
+                    bos_token=bos_str,
+                    eos_token=eos_str,
+                    raise_exception=_raise_exc,
+                )
+            except Exception as exc:
+                logger.debug("Chat template Jinja render fallback to ChatML: %s", exc)
+                rendered = None
+
+        if rendered is None:
+            rendered = self._render_chatml_fallback(messages, add_generation_prompt)
+
+        if not tokenize:
+            return rendered
+        return self.encode(rendered, add_special_tokens=True)
+
+    def close(self) -> None:
+        """Release underlying `llama_cpp.Llama` vocab handle if open."""
+        if self._llama is not None:
+            close_fn = getattr(self._llama, "close", None)
+            if callable(close_fn):
+                close_fn()
+            self._llama = None
+
+
+# ---------------------------------------------------------------------------
+# Public Selective Shard Entrypoint
+# ---------------------------------------------------------------------------
+
+
+def load_gguf_pytorch_shard(
+    gguf_path: Path,
+    shard_layer_start: int,
+    shard_layer_end: int,
+    max_ram_mb: int = 4096,
+) -> LoadedGgufShard:
+    """Selectively load ONLY `[shard_layer_start..shard_layer_end]` from a GGUF file into PyTorch."""
+    from transformers import AutoModelForCausalLM  # type: ignore[import-not-found]
+
+    index = read_gguf_header_and_tensors(gguf_path)
+    arch = str(index.metadata.get("general.architecture") or "").strip().lower()
+    if arch not in SUPPORTED_GGUF_ARCHITECTURES:
+        raise ValueError(f"Unsupported GGUF architecture: '{arch}'")
+
+    hf_config = _build_hf_config_from_gguf(index)
+    total_layers = int(getattr(hf_config, "num_hidden_layers"))
+    hidden_dim = int(getattr(hf_config, "hidden_size"))
+    clamped_start = max(0, min(shard_layer_start, total_layers - 1))
+    clamped_end = max(clamped_start, min(shard_layer_end, total_layers - 1))
+    is_head = clamped_start == 0
+    is_tail = clamped_end >= (total_layers - 1)
+
+    with torch.device("meta"):
+        meta_model = AutoModelForCausalLM.from_config(hf_config)
+
+    inner_meta = getattr(meta_model, "model", meta_model)
+    kept_layers: list[Any] = [
+        inner_meta.layers[idx] for idx in range(clamped_start, clamped_end + 1)
+    ]
+
+    container = nn.Module()
+    container.layers = nn.ModuleList(kept_layers)
+
+    rotary_emb: Any | None = None
+    if hasattr(inner_meta, "rotary_emb") and inner_meta.rotary_emb is not None:
+        rotary_cls = type(inner_meta.rotary_emb)
+        rotary_emb = rotary_cls(config=hf_config)
+        container.rotary_emb = rotary_emb
+
+    embed_tokens: Any | None = None
+    norm: Any | None = None
+    lm_head: Any | None = None
+
+    if is_tail and hasattr(inner_meta, "norm"):
+        norm = inner_meta.norm
+        container.norm = norm
+
+    del meta_model
+
+    gemma_offset = arch in ("gemma2", "gemma3")
+    embed_scale = math.sqrt(float(hidden_dim)) if gemma_offset else 1.0
+
+    # Estimate kept tensor weight size to choose float32 vs bfloat16 activation compute dtype
+    kept_bytes = 0
+    for idx in range(clamped_start, clamped_end + 1):
+        prefix = f"blk.{idx}."
+        for name, t_info in index.tensors.items():
+            if name.startswith(prefix):
+                kept_bytes += t_info.nbytes
+    if is_head and "token_embd.weight" in index.tensors:
+        kept_bytes += index.tensors["token_embd.weight"].nbytes
+    if is_tail:
+        if "output.weight" in index.tensors:
+            kept_bytes += index.tensors["output.weight"].nbytes
+        elif "token_embd.weight" in index.tensors:
+            kept_bytes += index.tensors["token_embd.weight"].nbytes
+
+    kept_mb = kept_bytes / (1024.0 * 1024.0)
+    compute_dtype = (
+        torch.float32 if (kept_mb * 1.5) <= (max_ram_mb * 0.85) else torch.bfloat16
+    )
+
+    with gguf_path.open("rb") as f:
+        for idx, layer in zip(range(clamped_start, clamped_end + 1), kept_layers):
+            _apply_layer_weights(layer, idx, arch, hf_config, f, index)
+
+        if is_head and "token_embd.weight" in index.tensors:
+            emb_info = index.tensors["token_embd.weight"]
+            vocab_size, emb_dim = emb_info.shape_pt
+            emb_raw = _read_tensor_raw_u8(f, index, emb_info)
+            embed_tokens = GgufQuantizedEmbedding(
+                raw_weight=emb_raw,
+                vocab_size=vocab_size,
+                embedding_dim=emb_dim,
+                ggml_type=emb_info.ggml_type,
+                embed_scale=embed_scale,
+                output_dtype=compute_dtype,
+            )
+            container.embed_tokens = embed_tokens
+
+        if is_tail:
+            if norm is not None:
+                _set_norm_weight(
+                    norm, f, index, "output_norm.weight", gemma_offset=gemma_offset
+                )
+            lm_tensor_name = (
+                "output.weight"
+                if "output.weight" in index.tensors
+                else ("token_embd.weight" if "token_embd.weight" in index.tensors else None)
+            )
+            if lm_tensor_name is not None:
+                lm_head = _make_linear_from_gguf(
+                    f,
+                    index,
+                    lm_tensor_name,
+                    chunk_out_rows=_DEFAULT_LM_HEAD_CHUNK_ROWS,
+                )
+                container.lm_head = lm_head
+
+    container.to(dtype=compute_dtype, device="cpu")
+    container.eval()
+    for param in container.parameters():
+        param.requires_grad_(False)
+
+    tokenizer: GgufTokenizerAdapter | None = None
+    if is_head or is_tail:
+        tokenizer = GgufTokenizerAdapter(index)
+
+    return LoadedGgufShard(
+        hf_config=hf_config,
+        container=container,
+        layers=kept_layers,
+        rotary_emb=rotary_emb,
+        embed_tokens=embed_tokens,
+        norm=norm,
+        lm_head=lm_head,
+        tokenizer=tokenizer,
+        total_layers=total_layers,
+        hidden_dim=hidden_dim,
+        shard_layer_start=clamped_start,
+        shard_layer_end=clamped_end,
+        compute_dtype=compute_dtype,
+    )
