@@ -15,9 +15,13 @@ from p2p.serializer import (
     MAGIC_HEADER,
     ActivationFrame,
     DecodedTokenFrame,
+    InferenceErrorFrame,
+    InferenceRequestFrame,
     PacketType,
     deserialize_activation_tensor,
     deserialize_decoded_token,
+    deserialize_inference_error,
+    deserialize_inference_request,
 )
 
 logger = logging.getLogger("shardai.p2p.transport")
@@ -134,6 +138,8 @@ async def handle_incoming_p2p_stream(
     on_activation_frame: Callable[[ActivationFrame], Awaitable[None]],
     on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
     timeout_seconds: float = 10.0,
+    on_inference_request: Callable[[InferenceRequestFrame], Awaitable[None]] | None = None,
+    on_inference_error: Callable[[InferenceErrorFrame], Awaitable[None]] | None = None,
 ) -> None:
     """Read, validate, deserialize, and process a binary P2P frame before sending ACK/NACK."""
     try:
@@ -171,6 +177,20 @@ async def handle_incoming_p2p_stream(
                 )
             token_frame = deserialize_decoded_token(frame_bytes)
             await on_token_frame(token_frame)
+        elif pkt_type == int(PacketType.INFERENCE_REQUEST):
+            if on_inference_request is None:
+                raise ValueError(
+                    "Received INFERENCE_REQUEST frame but no on_inference_request handler is registered."
+                )
+            inference_req_frame = deserialize_inference_request(frame_bytes)
+            await on_inference_request(inference_req_frame)
+        elif pkt_type == int(PacketType.INFERENCE_ERROR):
+            if on_inference_error is None:
+                raise ValueError(
+                    "Received INFERENCE_ERROR frame but no on_inference_error handler is registered."
+                )
+            inference_err_frame = deserialize_inference_error(frame_bytes)
+            await on_inference_error(inference_err_frame)
         else:
             raise ValueError(f"Unsupported P2P packet type: {pkt_type}")
 
@@ -198,6 +218,8 @@ async def receive_activations(
     port: int,
     on_activation_frame: Callable[[ActivationFrame], Awaitable[None]],
     on_token_frame: Callable[[DecodedTokenFrame], Awaitable[None]] | None = None,
+    on_inference_request: Callable[[InferenceRequestFrame], Awaitable[None]] | None = None,
+    on_inference_error: Callable[[InferenceErrorFrame], Awaitable[None]] | None = None,
 ) -> asyncio.AbstractServer:
     """Start an async TCP server listening for incoming binary activation streams from peers.
 
@@ -206,6 +228,8 @@ async def receive_activations(
         port: Local TCP port for receiving activation frames.
         on_activation_frame: Async callback invoked with each deserialized `ActivationFrame`.
         on_token_frame: Async callback invoked when a Tail Node returns a `DecodedTokenFrame`.
+        on_inference_request: Async callback invoked when a non-Head peer proxies an inference request.
+        on_inference_error: Async callback invoked when a Head Node returns a terminal inference error.
 
     Returns:
         asyncio.AbstractServer: Running asyncio TCP server instance.
@@ -219,6 +243,8 @@ async def receive_activations(
             writer=writer,
             on_activation_frame=on_activation_frame,
             on_token_frame=on_token_frame,
+            on_inference_request=on_inference_request,
+            on_inference_error=on_inference_error,
         )
 
     server = await asyncio.start_server(_client_connected, host=host, port=port)

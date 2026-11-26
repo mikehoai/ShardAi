@@ -10,6 +10,7 @@ Complies with `.antigravity/rules.md` and `.antigravity/review.md`:
 
 from dataclasses import dataclass
 from enum import IntEnum
+import json
 import math
 import socket
 import struct
@@ -30,6 +31,11 @@ MAGIC_HEADER: bytes = b"SHRD"
 # Safety cap: reject any P2P frame claiming > 64 MB uncompressed tensor size
 MAX_UNCOMPRESSED_TENSOR_BYTES: int = 64 * 1024 * 1024
 
+# Safety caps for proxied inference control frames
+MAX_INFERENCE_REQUEST_PAYLOAD_BYTES: int = 2 * 1024 * 1024
+MAX_INFERENCE_ERROR_BYTES: int = 16 * 1024
+MAX_PROXIED_TOKENS: int = 4096
+
 # Automatically compress hidden states >= 32 KB or whenever socket RTT indicates congestion
 DEFAULT_COMPRESSION_THRESHOLD_BYTES: int = 32 * 1024
 
@@ -39,6 +45,8 @@ class PacketType(IntEnum):
 
     ACTIVATION_TENSOR = 1
     DECODED_TOKEN = 2
+    INFERENCE_REQUEST = 3
+    INFERENCE_ERROR = 4
 
 
 class CompressionCodec(IntEnum):
@@ -81,6 +89,26 @@ ACTIVATION_HEADER_STRUCT = struct.Struct("!4sBB16s4sHHHHHIIIId")
 # - I  : token_id (uint32)
 TOKEN_HEADER_STRUCT = struct.Struct("!4sBB16sHI")
 
+# 42-byte big-endian binary header for INFERENCE_REQUEST frames:
+# - 4s : magic ("SHRD")
+# - B  : packet_type (PacketType.INFERENCE_REQUEST = 3)
+# - B  : flags (bit 0 = compress_activations)
+# - 16s: request_id (16-byte UUID)
+# - 4s : requester_ip (IPv4 packed bytes)
+# - H  : requester_port (uint16)
+# - H  : max_tokens (uint16)
+# - d  : temperature (IEEE-754 float64)
+# - I  : crc32_checksum (uint32 of UTF-8 JSON body)
+INFERENCE_REQUEST_HEADER_STRUCT = struct.Struct("!4sBB16s4sHHdI")
+
+# 24-byte big-endian binary header for INFERENCE_ERROR frames:
+# - 4s : magic ("SHRD")
+# - B  : packet_type (PacketType.INFERENCE_ERROR = 4)
+# - B  : reserved (0)
+# - 16s: request_id (16-byte UUID)
+# - H  : status_code (uint16)
+INFERENCE_ERROR_HEADER_STRUCT = struct.Struct("!4sBB16sH")
+
 
 @dataclass(frozen=True, slots=True)
 class ActivationFrame:
@@ -108,6 +136,29 @@ class DecodedTokenFrame:
     token_id: int
     token_text: str
     is_eos: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceRequestFrame:
+    """Deserialized binary inference request proxied from a non-Head peer to a Head Node."""
+
+    request_id: str
+    requester_ip: str
+    requester_port: int
+    prompt: str
+    messages: list[dict[str, Any]] | None
+    max_tokens: int
+    temperature: float
+    compress_activations: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceErrorFrame:
+    """Deserialized binary inference error packet returned from a Head Node to a requester."""
+
+    request_id: str
+    status_code: int
+    detail: str
 
 
 def extract_contiguous_float32_bytes(
@@ -469,4 +520,184 @@ def deserialize_decoded_token(frame_bytes: bytes) -> DecodedTokenFrame:
         token_id=token_id,
         token_text=utf8_slice.decode("utf-8", errors="replace"),
         is_eos=bool(eos_flag),
+    )
+
+
+def serialize_inference_request(
+    request_id: str,
+    requester_ip: str,
+    requester_port: int,
+    prompt: str,
+    messages: list[dict[str, Any]] | None = None,
+    max_tokens: int = 256,
+    temperature: float = DEFAULT_TEMPERATURE,
+    compress_activations: bool = True,
+) -> bytes:
+    """Pack a proxied inference request into a bounded binary frame for a Head Node peer."""
+    if not (1 <= requester_port <= 65535):
+        raise ValueError(f"Invalid requester_port in inference request: {requester_port}")
+    if not (1 <= max_tokens <= MAX_PROXIED_TOKENS):
+        raise ValueError(
+            f"max_tokens must be between 1 and {MAX_PROXIED_TOKENS}, got {max_tokens}"
+        )
+    validated_temperature: float = _validate_temperature(temperature)
+    req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
+    requester_ip_bytes: bytes = socket.inet_aton(requester_ip)
+
+    body_bytes: bytes = json.dumps(
+        {"prompt": prompt, "messages": messages},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(body_bytes) > MAX_INFERENCE_REQUEST_PAYLOAD_BYTES:
+        raise ValueError(
+            f"Inference request payload ({len(body_bytes)} bytes) exceeds "
+            f"{MAX_INFERENCE_REQUEST_PAYLOAD_BYTES} byte limit."
+        )
+
+    crc: int = zlib.crc32(body_bytes) & 0xFFFFFFFF
+    flags: int = 0x01 if compress_activations else 0x00
+    header: bytes = INFERENCE_REQUEST_HEADER_STRUCT.pack(
+        MAGIC_HEADER,
+        int(PacketType.INFERENCE_REQUEST),
+        flags,
+        req_uuid_bytes,
+        requester_ip_bytes,
+        requester_port,
+        max_tokens,
+        validated_temperature,
+        crc,
+    )
+    return header + body_bytes
+
+
+def deserialize_inference_request(frame_bytes: bytes) -> InferenceRequestFrame:
+    """Unpack and validate a binary INFERENCE_REQUEST frame received from a peer."""
+    if len(frame_bytes) < INFERENCE_REQUEST_HEADER_STRUCT.size:
+        raise ValueError("Truncated inference request frame.")
+
+    header_slice = frame_bytes[: INFERENCE_REQUEST_HEADER_STRUCT.size]
+    payload_slice = frame_bytes[INFERENCE_REQUEST_HEADER_STRUCT.size :]
+
+    (
+        magic,
+        pkt_type,
+        flags,
+        req_uuid_bytes,
+        requester_ip_bytes,
+        requester_port,
+        max_tokens,
+        temperature,
+        expected_crc,
+    ) = INFERENCE_REQUEST_HEADER_STRUCT.unpack(header_slice)
+
+    if magic != MAGIC_HEADER or pkt_type != int(PacketType.INFERENCE_REQUEST):
+        raise ValueError("Invalid header in inference request frame.")
+
+    if len(payload_slice) > MAX_INFERENCE_REQUEST_PAYLOAD_BYTES:
+        raise ValueError(
+            f"Inference request payload ({len(payload_slice)} bytes) exceeds "
+            f"{MAX_INFERENCE_REQUEST_PAYLOAD_BYTES} byte limit."
+        )
+
+    actual_crc: int = zlib.crc32(payload_slice) & 0xFFFFFFFF
+    if actual_crc != expected_crc:
+        raise ValueError(
+            "Corrupted inference request payload: CRC32 mismatch "
+            f"(expected {expected_crc:#x}, got {actual_crc:#x})"
+        )
+
+    if not (1 <= requester_port <= 65535):
+        raise ValueError(f"Invalid requester_port in inference request: {requester_port}")
+    if not (1 <= max_tokens <= MAX_PROXIED_TOKENS):
+        raise ValueError(
+            f"Invalid max_tokens in inference request: {max_tokens} (max {MAX_PROXIED_TOKENS})"
+        )
+    validated_temperature: float = _validate_temperature(temperature)
+
+    try:
+        decoded_body: Any = json.loads(payload_slice.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid JSON payload in inference request frame: {exc}") from exc
+
+    if not isinstance(decoded_body, dict):
+        raise ValueError("Inference request payload must be a JSON object.")
+
+    prompt = decoded_body.get("prompt")
+    if not isinstance(prompt, str):
+        raise ValueError("Inference request JSON payload must include a string 'prompt'.")
+
+    messages = decoded_body.get("messages")
+    if messages is not None:
+        if not isinstance(messages, list) or not all(
+            isinstance(item, dict) for item in messages
+        ):
+            raise ValueError(
+                "Inference request 'messages' must be None or a list of JSON objects."
+            )
+
+    return InferenceRequestFrame(
+        request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
+        requester_ip=socket.inet_ntoa(requester_ip_bytes),
+        requester_port=requester_port,
+        prompt=prompt,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=validated_temperature,
+        compress_activations=bool(flags & 0x01),
+    )
+
+
+def serialize_inference_error(
+    request_id: str,
+    status_code: int,
+    detail: str,
+) -> bytes:
+    """Pack a terminal inference error frame to send back to a proxying peer."""
+    if not (0 <= status_code <= 65535):
+        raise ValueError(f"Invalid status_code in inference error frame: {status_code}")
+
+    req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
+    detail_bytes: bytes = detail.encode("utf-8")
+    if len(detail_bytes) > MAX_INFERENCE_ERROR_BYTES:
+        detail_bytes = (
+            detail_bytes[:MAX_INFERENCE_ERROR_BYTES]
+            .decode("utf-8", errors="ignore")
+            .encode("utf-8")
+        )
+
+    header: bytes = INFERENCE_ERROR_HEADER_STRUCT.pack(
+        MAGIC_HEADER,
+        int(PacketType.INFERENCE_ERROR),
+        0,
+        req_uuid_bytes,
+        status_code,
+    )
+    return header + detail_bytes
+
+
+def deserialize_inference_error(frame_bytes: bytes) -> InferenceErrorFrame:
+    """Unpack a binary INFERENCE_ERROR frame received from a Head Node peer."""
+    if len(frame_bytes) < INFERENCE_ERROR_HEADER_STRUCT.size:
+        raise ValueError("Truncated inference error frame.")
+
+    header_slice = frame_bytes[: INFERENCE_ERROR_HEADER_STRUCT.size]
+    detail_slice = frame_bytes[INFERENCE_ERROR_HEADER_STRUCT.size :]
+
+    magic, pkt_type, _reserved, req_uuid_bytes, status_code = (
+        INFERENCE_ERROR_HEADER_STRUCT.unpack(header_slice)
+    )
+    if magic != MAGIC_HEADER or pkt_type != int(PacketType.INFERENCE_ERROR):
+        raise ValueError("Invalid header in inference error frame.")
+
+    if len(detail_slice) > MAX_INFERENCE_ERROR_BYTES:
+        raise ValueError(
+            f"Inference error detail ({len(detail_slice)} bytes) exceeds "
+            f"{MAX_INFERENCE_ERROR_BYTES} byte limit."
+        )
+
+    return InferenceErrorFrame(
+        request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
+        status_code=status_code,
+        detail=detail_slice.decode("utf-8", errors="replace"),
     )
