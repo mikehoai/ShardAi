@@ -2001,15 +2001,14 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("session-credentials-panel")).toBeTruthy();
-      expect(screen.getByTestId("chat-launcher-section")).toBeTruthy();
-      expect(screen.getByTestId("chat-not-ready-notice")).toBeTruthy();
+      expect(screen.getByTestId("api-readiness-badge")).toBeTruthy();
     });
 
     expect(screen.queryByTestId("open-chat-window-btn")).toBeNull();
-    expect(screen.getByTestId("chat-not-ready-notice").textContent).toContain(
-      "Model not ready"
-    );
-    expect(screen.getByTestId("chat-not-ready-notice").textContent).toContain("50%");
+    expect(screen.queryByTestId("chat-not-ready-notice")).toBeNull();
+    expect(screen.getByTestId("api-readiness-badge").textContent).toContain("50%");
+    const copyInviteBtn = screen.getByTestId("copy-invite-code-btn") as HTMLButtonElement;
+    expect(copyInviteBtn.style.backgroundColor).toBe("");
   });
 
   it("shows Open AI Chat button under Quick Test when 100% RAM ready, streams SSE responses with Bearer token, supports multi-turn, clear, and Escape close", async () => {
@@ -5355,21 +5354,10 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     render(<Dashboard />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("ram-requirement-card")).toBeTruthy();
+      expect(screen.getByTestId("room-ram-target-deepseek-duo-room")).toBeTruthy();
     });
 
-    const card = screen.getByTestId("ram-requirement-card");
-    expect(card.textContent).toContain("Model: ~5.5 GB");
-    expect(card.textContent).toContain("Solo Stable: 7 GB");
-    expect(card.textContent).toContain("2-Node Room: 7.5 GB");
-    expect(screen.getByTestId("ram-readiness-status").textContent).toContain(
-      "Swarm required"
-    );
-
-    // Sliding RAM to 7 GB flips the card to Solo-ready
-    const slider = screen.getByLabelText("Shared RAM Contribution") as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "7" } });
-    expect(screen.getByTestId("ram-readiness-status").textContent).toContain("Solo-ready");
+    expect(screen.queryByTestId("ram-requirement-card")).toBeNull();
 
     // Lobby room cell preserves 6 GB and shows recalculated stable target (7.5 GB for 2 nodes)
     expect(screen.getByTestId("room-ram-cell-deepseek-duo-room").textContent).toContain(
@@ -5379,7 +5367,7 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       "~7.5 GB stable"
     );
 
-    // Create Room modal also displays the RAM readiness hint
+    // Create Room modal still displays the RAM readiness hint
     fireEvent.click(screen.getByTestId("create-room-modal-btn"));
     const modalHint = await screen.findByTestId("modal-ram-requirement-hint");
     expect(modalHint.textContent).toContain("Solo Stable: 7 GB");

@@ -1804,17 +1804,6 @@ export const Dashboard: React.FC = () => {
     return Boolean(matchedCatalog && isVisionModel(matchedCatalog));
   };
 
-  const selectedCatalogModel: CatalogModelItem | undefined =
-    modelTab === "catalog"
-      ? (catalogModels.find((m) => m.id === selectedCatalogId) ?? catalogModels[0])
-      : modelTab === "custom"
-        ? resolveCatalogModelForRoom(modelInput, catalogModels)
-        : undefined;
-  const mainRamAssessment =
-    selectedCatalogModel && selectedCatalogModel.estimated_ram_gb > 0
-      ? assessNodeRamContribution(selectedCatalogModel.estimated_ram_gb, sharedRamGb)
-      : null;
-
   const modalSelectedCatalogModel: CatalogModelItem | undefined =
     modalModelTab === "catalog"
       ? (catalogModels.find((m) => m.id === modalSelectedCatalogId) ?? catalogModels[0])
@@ -1825,9 +1814,6 @@ export const Dashboard: React.FC = () => {
     modalSelectedCatalogModel && modalSelectedCatalogModel.estimated_ram_gb > 0
       ? assessNodeRamContribution(modalSelectedCatalogModel.estimated_ram_gb, sharedRamGb)
       : null;
-
-  const activeCatalogModel: CatalogModelItem | undefined =
-    resolveCatalogModelForRoom(activeModelId, catalogModels);
 
   const generatedInviteString: string = modalRoomKey.trim()
     ? `${modalRoomId.trim() || "room"} | ${modalRoomKey.trim()}`
@@ -2410,91 +2396,6 @@ export const Dashboard: React.FC = () => {
                     )}
                     <span>{maxRamGb} GB</span>
                   </div>
-
-                  {mainRamAssessment !== null && (
-                    <div
-                      data-testid="ram-requirement-card"
-                      style={{
-                        marginTop: "10px",
-                        padding: "9px 10px",
-                        borderRadius: "6px",
-                        backgroundColor:
-                          mainRamAssessment.status === "solo_stable"
-                            ? "var(--success-bg)"
-                            : mainRamAssessment.status === "insufficient"
-                              ? "var(--danger-soft)"
-                              : mainRamAssessment.status === "swarm_needed" && allowSsdOffload
-                                ? "var(--info-bg)"
-                                : "var(--warn-bg)",
-                        border: `1px solid ${
-                          mainRamAssessment.status === "solo_stable"
-                            ? "var(--success-border)"
-                            : mainRamAssessment.status === "insufficient"
-                              ? "var(--danger)"
-                              : mainRamAssessment.status === "swarm_needed" && allowSsdOffload
-                                ? "var(--info-border)"
-                                : "var(--warn-border)"
-                        }`,
-                        color:
-                          mainRamAssessment.status === "solo_stable"
-                            ? "var(--success-fg)"
-                            : mainRamAssessment.status === "insufficient"
-                              ? "var(--danger)"
-                              : mainRamAssessment.status === "swarm_needed" && allowSsdOffload
-                                ? "var(--info-fg)"
-                                : "var(--warn-fg)",
-                        fontSize: "11.5px",
-                        lineHeight: 1.45,
-                      }}
-                    >
-                      <div
-                        title={`Formula: Model (${formatGb(mainRamAssessment.modelSizeGb)}) + 10% KV/safety + ${formatGb(mainRamAssessment.perNodeOverheadGb)}/node overhead + shard rounding slack`}
-                        style={{
-                          display: "flex",
-                          flexWrap: "wrap",
-                          gap: "8px",
-                          fontWeight: 600,
-                          marginBottom: "4px",
-                        }}
-                      >
-                        <span>Model: ~{formatGb(mainRamAssessment.modelSizeGb)}</span>
-                        <span>•</span>
-                        <span>Solo Stable: {formatGb(mainRamAssessment.soloStableGb)}</span>
-                        <span>•</span>
-                        <span>2-Node Room: {formatGb(mainRamAssessment.twoNodeStableGb)}</span>
-                      </div>
-                      <div data-testid="ram-readiness-status">
-                        {mainRamAssessment.status === "solo_stable" && (
-                          <span>
-                            Solo-ready: Your {sharedRamGb} GB covers 100% of layers with stability margin.
-                          </span>
-                        )}
-                        {mainRamAssessment.status === "solo_tight" && (
-                          <span>
-                            Tight solo fit: Covers 100% of layers, but recommend{" "}
-                            {mainRamAssessment.soloSliderGb} GB (or 1 peer) for smooth KV-cache growth.
-                          </span>
-                        )}
-                        {mainRamAssessment.status === "swarm_needed" && (
-                          <span>
-                            Swarm required: Your {sharedRamGb} GB covers ~
-                            {mainRamAssessment.estimatedCoveragePct}% of layers. Needs ~
-                            {formatGb(mainRamAssessment.targetRoomStableGb)} total across{" "}
-                            {mainRamAssessment.targetPeers} peers (+
-                            {formatGb(mainRamAssessment.remainingRamForTargetRoomGb)} more from peers).
-                            {allowSsdOffload ? " SSD offload enabled for slow Solo fallback." : ""}
-                          </span>
-                        )}
-                        {mainRamAssessment.status === "insufficient" && (
-                          <span>
-                            Too low for this model: Per-node runtime/KV overhead uses ~
-                            {formatGb(mainRamAssessment.perNodeOverheadGb)}. Increase shared RAM or
-                            choose a smaller model.
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  )}
 
                   <label
                     htmlFor="ssd-offload-checkbox"
@@ -3440,11 +3341,6 @@ export const Dashboard: React.FC = () => {
                             type="button"
                             data-testid="copy-invite-code-btn"
                             className="native-btn"
-                            style={{
-                              borderColor: "var(--warn-border)",
-                              backgroundColor: "var(--warn-bg)",
-                              color: "var(--warn-fg)",
-                            }}
                             onClick={() =>
                               void handleCopy(
                                 "activeInvite",
@@ -3501,66 +3397,38 @@ export const Dashboard: React.FC = () => {
                     </div>
 
                     {/* Built-in AI Chat Launcher (gated on 100% RAM readiness) */}
-                    <div
-                      data-testid="chat-launcher-section"
-                      className="chat-launcher-section"
-                    >
-                      {isSwarmReady && coveragePercent >= 100 ? (
-                        <>
-                          <span className="chat-launcher-hint">
-                            Chat directly with <strong>{activeModelId}</strong> using your
-                            active session API key.
-                          </span>
-                          <button
-                            type="button"
-                            data-testid="open-chat-window-btn"
-                            className="native-btn native-btn-primary chat-launcher-btn"
-                            onClick={() => setIsChatOpen(true)}
-                          >
-                            <svg
-                              width="14"
-                              height="14"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              aria-hidden="true"
-                            >
-                              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                            </svg>
-                            <span>Open AI Chat</span>
-                          </button>
-                        </>
-                      ) : (
-                        <div
-                          role="status"
-                          data-testid="chat-not-ready-notice"
-                          className="chat-not-ready-notice"
+                    {isSwarmReady && coveragePercent >= 100 && (
+                      <div
+                        data-testid="chat-launcher-section"
+                        className="chat-launcher-section"
+                      >
+                        <span className="chat-launcher-hint">
+                          Chat directly with <strong>{activeModelId}</strong> using your
+                          active session API key.
+                        </span>
+                        <button
+                          type="button"
+                          data-testid="open-chat-window-btn"
+                          className="native-btn native-btn-primary chat-launcher-btn"
+                          onClick={() => setIsChatOpen(true)}
                         >
-                          Model not ready — Waiting for 100% RAM coverage (
-                          {Math.round(coveragePercent)}%) before AI Chat is available.
-                          {activeCatalogModel && activeCatalogModel.estimated_ram_gb > 0 && (() => {
-                            const activeEstimate = calculateRoomRamEstimate(
-                              activeCatalogModel.estimated_ram_gb,
-                              Math.max(2, connectedPeersCount + 2)
-                            );
-                            return (
-                              <span
-                                data-testid="active-room-ram-hint"
-                                style={{ display: "block", marginTop: "4px", fontSize: "11px" }}
-                              >
-                                Recommended stable room RAM for {activeEstimate.nodeCount} peers: ~
-                                {formatGb(activeEstimate.stableRoomRamGb)} (includes ~
-                                {formatGb(activeEstimate.perNodeOverheadGb)}/node KV &amp; runtime
-                                overhead).
-                              </span>
-                            );
-                          })()}
-                        </div>
-                      )}
-                    </div>
+                          <svg
+                            width="14"
+                            height="14"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                          </svg>
+                          <span>Open AI Chat</span>
+                        </button>
+                      </div>
+                    )}
                   </section>
                 ) : (
                   activeSection === "credentials" && (
