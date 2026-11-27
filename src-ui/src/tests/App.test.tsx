@@ -2160,6 +2160,7 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     await waitFor(() => {
       expect(screen.getByTestId("open-chat-window-btn")).toBeTruthy();
     });
+    expect(screen.getByTestId("open-chat-window-btn").textContent).toContain("Open Chat");
     expect(screen.queryByTestId("chat-not-ready-notice")).toBeNull();
 
     // Open AI Chat window
@@ -4357,16 +4358,10 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     ).toBe(true);
   });
 
-  it("supports ChatWindow full-window default layout and Maximize/Restore toggle with Tauri window sync", async () => {
+  it("renders ChatWindow without a Maximize button and closes cleanly without mutating OS window state", async () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     const mockedInvoke = vi.mocked(invoke);
-    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "window_is_maximized") return false;
-      if (cmd === "window_set_maximized") {
-        return Boolean((args as { maximized?: boolean } | undefined)?.maximized);
-      }
-      return true;
-    });
+    mockedInvoke.mockClear();
 
     const onClose = vi.fn();
     const { rerender } = render(
@@ -4381,49 +4376,13 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       />
     );
 
-    const backdrop = screen.getByTestId("ai-chat-backdrop");
-    const dialog = screen.getByTestId("ai-chat-window");
-    const header = dialog.querySelector(".chat-modal-header") as HTMLElement;
-    const maximizeBtn = screen.getByTestId("chat-maximize-btn");
     const closeBtn = screen.getByTestId("chat-close-btn");
-
-    expect(maximizeBtn.textContent).toContain("Maximize");
-    expect(maximizeBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByTestId("chat-maximize-btn")).toBeNull();
     expect(closeBtn.textContent).toContain("Close");
-    expect(dialog.getAttribute("data-maximized")).toBe("false");
-    expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(false);
-    expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(false);
 
-    await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized");
-    });
-
-    // Click Maximize button -> marks dialog & backdrop maximized and calls Tauri window_set_maximized(true)
-    fireEvent.click(maximizeBtn);
-    expect(dialog.getAttribute("data-maximized")).toBe("true");
-    expect(maximizeBtn.textContent).toContain("Restore");
-    expect(maximizeBtn.getAttribute("aria-pressed")).toBe("true");
-    expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(true);
-    expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(true);
-    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: true });
-
-    // Click Restore button -> restores default size and calls window_set_maximized(false)
-    fireEvent.click(maximizeBtn);
-    expect(dialog.getAttribute("data-maximized")).toBe("false");
-    expect(maximizeBtn.textContent).toContain("Maximize");
-    expect(backdrop.classList.contains("chat-modal-backdrop--maximized")).toBe(false);
-    expect(dialog.classList.contains("chat-modal-dialog--maximized")).toBe(false);
-    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
-
-    // Click Close button invokes onClose cleanly
     fireEvent.click(closeBtn);
     expect(onClose).toHaveBeenCalledTimes(1);
 
-    // Double-click header to maximize again, then closing ChatWindow restores unmaximized OS state
-    fireEvent.doubleClick(header);
-    expect(dialog.getAttribute("data-maximized")).toBe("true");
-
-    mockedInvoke.mockClear();
     rerender(
       <ChatWindow
         isOpen={false}
@@ -4435,7 +4394,7 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
         onClose={onClose}
       />
     );
-    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+    expect(mockedInvoke).not.toHaveBeenCalledWith("window_set_maximized", expect.anything());
   });
 
   it("supports drag-and-drop of document, image, and video files in ChatWindow when ready and sends multimodal payload", async () => {
@@ -4766,21 +4725,12 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
     expect(sentContent).toContain("Quarterly roadmap from DOCX");
   });
 
-  it("restores OS window on direct ChatWindow unmount when maximized and preserves pre-maximized OS window", async () => {
+  it("preserves OS window maximize state on direct ChatWindow unmount", async () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     const mockedInvoke = vi.mocked(invoke);
-    let osIsMaximized = false;
-    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "window_is_maximized") return osIsMaximized;
-      if (cmd === "window_set_maximized") {
-        return Boolean((args as { maximized?: boolean } | undefined)?.maximized);
-      }
-      return true;
-    });
+    mockedInvoke.mockClear();
 
-    // Part A: OS window starts unmaximized -> maximize ChatWindow -> unmount directly restores OS window
-    const onCloseA = vi.fn();
-    const viewA = render(
+    const view = render(
       <ChatWindow
         isOpen={true}
         isModelReady={true}
@@ -4788,47 +4738,13 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
         apiBaseUrl="http://127.0.0.1:8000/v1"
         sessionToken="sk-shard-unmount-a"
         modelId="Qwen/Qwen2.5-7B-Instruct"
-        onClose={onCloseA}
+        onClose={vi.fn()}
       />
     );
-    await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized");
-    });
+    expect(screen.queryByTestId("chat-maximize-btn")).toBeNull();
+    view.unmount();
 
-    fireEvent.click(screen.getByTestId("chat-maximize-btn"));
-    expect(screen.getByTestId("ai-chat-window").getAttribute("data-maximized")).toBe("true");
-    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: true });
-
-    mockedInvoke.mockClear();
-    viewA.unmount();
-    expect(mockedInvoke).toHaveBeenCalledWith("window_set_maximized", { maximized: false });
-
-    // Part B: OS window starts ALREADY maximized -> ChatWindow maximize/restore/unmount never clobbers it
-    osIsMaximized = true;
-    mockedInvoke.mockClear();
-    const onCloseB = vi.fn();
-    const viewB = render(
-      <ChatWindow
-        isOpen={true}
-        isModelReady={true}
-        coveragePercent={100}
-        apiBaseUrl="http://127.0.0.1:8000/v1"
-        sessionToken="sk-shard-unmount-b"
-        modelId="Qwen/Qwen2.5-7B-Instruct"
-        onClose={onCloseB}
-      />
-    );
-    await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith("window_is_maximized");
-    });
-
-    const maxBtnB = screen.getByTestId("chat-maximize-btn");
-    fireEvent.click(maxBtnB);
-    fireEvent.click(maxBtnB);
-    fireEvent.click(maxBtnB);
-    viewB.unmount();
-
-    expect(mockedInvoke).not.toHaveBeenCalledWith("window_set_maximized", { maximized: false });
+    expect(mockedInvoke).not.toHaveBeenCalledWith("window_set_maximized", expect.anything());
   });
 
   it("guards private room, create room, and invite-string modal handlers against duplicate concurrent startSharing calls", async () => {

@@ -508,18 +508,28 @@ describe("ChatWindow Markdown Formatting, Copy & Inline Edit", () => {
       />
     );
 
-    // Header telemetry bar shows RAM, room, transport, speed, and initial session tokens
-    expect(screen.getByTestId("chat-header-ram").textContent).toContain("4 / 8 GB");
+    // Single-row header telemetry icons (aligned with Clear and Close; no Maximize button)
+    expect(screen.queryByTestId("chat-maximize-btn")).toBeNull();
+    const headerRight = screen.getByTestId("chat-header-telemetry").parentElement;
+    expect(headerRight?.querySelector("[data-testid='chat-clear-btn']")).toBeTruthy();
+    expect(headerRight?.querySelector("[data-testid='chat-close-btn']")).toBeTruthy();
+
+    expect(screen.getByTestId("chat-header-ram").querySelector("svg")).toBeTruthy();
+    expect(screen.getByTestId("chat-header-ram").textContent).toBe("4 / 8 GB");
+    expect(screen.getByTestId("chat-header-room-status").querySelector("svg")).toBeTruthy();
     expect(screen.getByTestId("chat-header-room-status").textContent).toContain(
       "team-deepseek"
     );
-    expect(screen.getByTestId("chat-header-transport").textContent).toContain(
+    expect(screen.getByTestId("chat-header-transport").querySelector("svg")).toBeTruthy();
+    expect(screen.getByTestId("chat-header-transport").textContent).toBe(
       "QUIC P2P (Direct)"
     );
-    expect(screen.getByTestId("chat-header-net-speed").textContent).toContain(
+    expect(screen.getByTestId("chat-header-net-speed").querySelector("svg")).toBeTruthy();
+    expect(screen.getByTestId("chat-header-net-speed").textContent).toBe(
       "45.2 Mbps • 22 ms"
     );
-    expect(screen.getByTestId("chat-header-session-tokens").textContent).toContain("0 tok");
+    expect(screen.getByTestId("chat-header-session-tokens").querySelector("svg")).toBeTruthy();
+    expect(screen.getByTestId("chat-header-session-tokens").textContent).toBe("0 tok");
 
     fireEvent.change(screen.getByTestId("chat-input"), {
       target: { value: "Explain **quarks** and `gluons`" },

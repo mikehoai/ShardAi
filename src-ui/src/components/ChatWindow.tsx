@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { streamChatCompletion } from "../services/engineApi";
 import { extractDocumentText, MAX_DOC_TEXT_CHARS } from "../utils/documentExtractor";
 import {
@@ -92,13 +91,6 @@ const TEXT_DOCUMENT_EXTENSIONS = new Set([
 ]);
 
 const BINARY_DOCUMENT_EXTENSIONS = new Set([".pdf", ".doc", ".docx"]);
-
-const isTauriEnvironment = (): boolean => {
-  return (
-    typeof window !== "undefined" &&
-    ("__TAURI_INTERNALS__" in window || "__TAURI__" in window)
-  );
-};
 
 function getFileExtension(name: string): string {
   const dotIdx = name.lastIndexOf(".");
@@ -300,7 +292,6 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [inputValue, setInputValue] = useState<string>("");
   const [attachments, setAttachments] = useState<ChatAttachmentItem[]>([]);
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
-  const [isMaximized, setIsMaximized] = useState<boolean>(false);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
@@ -321,62 +312,10 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragCounterRef = useRef<number>(0);
-  const preChatOsMaximizedRef = useRef<boolean | null>(null);
-  const pendingOsMaxQueryRef = useRef<Promise<boolean> | null>(null);
-  const osWindowMutatedByChatRef = useRef<boolean>(false);
-  const desiredChatMaximizedRef = useRef<boolean>(false);
   const prevModelSessionRef = useRef<{ modelId: string; sessionToken: string }>({
     modelId,
     sessionToken,
   });
-
-  const ensureBaselineOsMaximized = useCallback((): Promise<boolean> => {
-    if (preChatOsMaximizedRef.current !== null) {
-      return Promise.resolve(preChatOsMaximizedRef.current);
-    }
-    if (pendingOsMaxQueryRef.current !== null) {
-      return pendingOsMaxQueryRef.current;
-    }
-    if (!isTauriEnvironment()) {
-      preChatOsMaximizedRef.current = false;
-      return Promise.resolve(false);
-    }
-    const query = invoke<boolean>("window_is_maximized")
-      .then((val) => {
-        const normalized = Boolean(val);
-        if (preChatOsMaximizedRef.current === null) {
-          preChatOsMaximizedRef.current = normalized;
-        }
-        return normalized;
-      })
-      .catch(() => {
-        if (preChatOsMaximizedRef.current === null) {
-          preChatOsMaximizedRef.current = false;
-        }
-        return false;
-      })
-      .finally(() => {
-        if (pendingOsMaxQueryRef.current === query) {
-          pendingOsMaxQueryRef.current = null;
-        }
-      });
-    pendingOsMaxQueryRef.current = query;
-    return query;
-  }, []);
-
-  const restoreOsWindowMaximizeState = useCallback((): void => {
-    desiredChatMaximizedRef.current = false;
-    const didMutate = osWindowMutatedByChatRef.current;
-    const baseline = preChatOsMaximizedRef.current;
-    osWindowMutatedByChatRef.current = false;
-    preChatOsMaximizedRef.current = null;
-    pendingOsMaxQueryRef.current = null;
-    if (didMutate && isTauriEnvironment()) {
-      void invoke<boolean>("window_set_maximized", {
-        maximized: Boolean(baseline),
-      }).catch(() => undefined);
-    }
-  }, []);
 
   const clearCopyResetTimer = useCallback((): void => {
     if (copyResetTimerRef.current !== null) {
@@ -391,7 +330,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     setEditingDraft(draft);
   }, []);
 
-  // Track mount lifecycle (StrictMode-safe), abort streams, and restore OS maximize state on unmount
+  // Track mount lifecycle (StrictMode-safe) and abort active streams on unmount
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
@@ -402,9 +341,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
       }
-      restoreOsWindowMaximizeState();
     };
-  }, [restoreOsWindowMaximizeState, clearCopyResetTimer]);
+  }, [clearCopyResetTimer]);
 
   // Keep latest onClose callback without re-triggering open-focus or keydown effects
   useEffect(() => {
@@ -441,13 +379,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     setInputValue("");
   }, [modelId, sessionToken, clearCopyResetTimer, setEditingState]);
 
-  // Capture baseline OS maximize state on open; abort stream & restore OS state when closing
+  // Abort active streams and reset transient UI state when closing
   useEffect(() => {
     if (isOpen) {
-      desiredChatMaximizedRef.current = false;
-      if (isTauriEnvironment()) {
-        void ensureBaselineOsMaximized();
-      }
       return;
     }
     extractionSessionRef.current += 1;
@@ -461,9 +395,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     setIsStreaming(false);
     setIsDragOver(false);
     dragCounterRef.current = 0;
-    setIsMaximized(false);
-    restoreOsWindowMaximizeState();
-  }, [isOpen, ensureBaselineOsMaximized, restoreOsWindowMaximizeState, clearCopyResetTimer, setEditingState]);
+  }, [isOpen, clearCopyResetTimer, setEditingState]);
 
   // Focus composer textarea only when ChatWindow opens
   useEffect(() => {
@@ -504,32 +436,6 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   }
 
   const canAttachFiles = isModelReady && !isStreaming;
-
-  const handleToggleMaximize = (): void => {
-    const nextMax = !isMaximized;
-    setIsMaximized(nextMax);
-    desiredChatMaximizedRef.current = nextMax;
-    if (!isTauriEnvironment()) {
-      return;
-    }
-    if (preChatOsMaximizedRef.current !== null) {
-      if (!preChatOsMaximizedRef.current) {
-        osWindowMutatedByChatRef.current = nextMax;
-        void invoke<boolean>("window_set_maximized", { maximized: nextMax }).catch(
-          () => undefined
-        );
-      }
-      return;
-    }
-    void ensureBaselineOsMaximized().then((wasMax) => {
-      if (!wasMax && isMountedRef.current && desiredChatMaximizedRef.current === nextMax) {
-        osWindowMutatedByChatRef.current = nextMax;
-        void invoke<boolean>("window_set_maximized", { maximized: nextMax }).catch(
-          () => undefined
-        );
-      }
-    });
-  };
 
   const processIncomingFiles = async (fileList: FileList | File[]): Promise<void> => {
     if (!canAttachFiles) {
@@ -1054,7 +960,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   return (
     <div
-      className={`chat-modal-backdrop${isMaximized ? " chat-modal-backdrop--maximized" : ""}`}
+      className="chat-modal-backdrop"
       data-testid="ai-chat-backdrop"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) {
@@ -1067,8 +973,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         aria-modal="true"
         aria-label="AI Chat Window"
         data-testid="ai-chat-window"
-        data-maximized={isMaximized ? "true" : "false"}
-        className={`chat-modal-dialog${isMaximized ? " chat-modal-dialog--maximized" : ""}`}
+        className="chat-modal-dialog"
         onDragEnter={handleDragEnter}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
@@ -1085,48 +990,60 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           </div>
         )}
 
-        <div
-          className="chat-modal-header"
-          onDoubleClick={(e) => {
-            if (!(e.target as HTMLElement).closest("button")) {
-              handleToggleMaximize();
-            }
-          }}
-        >
-          <div className="chat-modal-title-group">
-            <div className="chat-modal-title-row">
-              <h2 className="chat-modal-title">AI Chat</h2>
-              <span
-                data-testid="chat-window-readiness"
-                className={`chat-readiness-pill${isModelReady ? " ready" : " standby"}`}
-              >
-                {isModelReady
-                  ? "100% RAM Ready"
-                  : `Model not ready (${Math.round(coveragePercent)}%)`}
-              </span>
-            </div>
-            <div className="chat-modal-meta">
-              <span data-testid="chat-window-model" title={modelId}>
-                Model: <strong>{modelId}</strong>
-              </span>
-              <span className="chat-meta-sep" aria-hidden="true">
-                •
-              </span>
-              <span data-testid="chat-window-endpoint" title={apiBaseUrl}>
-                API: <code>{apiBaseUrl}</code>
-              </span>
-              <span className="chat-meta-sep" aria-hidden="true">
-                •
-              </span>
-              <span data-testid="chat-window-key-status">API Key: Active</span>
-            </div>
+        <div className="chat-modal-header">
+          <div className="chat-header-left">
+            <span
+              data-testid="chat-window-model"
+              className="chat-header-model"
+              title={modelId}
+            >
+              {modelId}
+            </span>
+            <span className="chat-meta-sep" aria-hidden="true">
+              ·
+            </span>
+            <span
+              data-testid="chat-window-endpoint"
+              className="chat-header-endpoint"
+              title={`API: ${apiBaseUrl} • Key: Active`}
+            >
+              <code>{apiBaseUrl}</code>
+            </span>
+            <span className="chat-meta-sep" aria-hidden="true">
+              ·
+            </span>
+            <span
+              data-testid="chat-window-readiness"
+              className={`chat-readiness-pill${isModelReady ? " ready" : " standby"}`}
+            >
+              {isModelReady ? "Ready" : `${Math.round(coveragePercent)}%`}
+            </span>
+          </div>
+
+          <div className="chat-header-right">
             <div className="chat-header-telemetry" data-testid="chat-header-telemetry">
               <span
                 data-testid="chat-header-ram"
                 className="chat-telemetry-chip"
-                title="Contributed RAM / Total Room RAM"
+                title={`RAM contributed / Total room RAM: ${ramTelemetryLabel}`}
+                aria-label={`RAM ${ramTelemetryLabel}`}
               >
-                RAM: <strong>{ramTelemetryLabel}</strong>
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                  <rect x="9" y="9" width="6" height="6" />
+                  <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3" />
+                </svg>
+                <strong>{ramTelemetryLabel}</strong>
               </span>
               <span
                 data-testid="chat-header-room-status"
@@ -1135,105 +1052,139 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                     ? "chat-telemetry-chip--ready"
                     : "chat-telemetry-chip--warn"
                 }`}
-                title={`Room ${normalizedRoomId}`}
+                title={`Room ${normalizedRoomId} (${roomStatusText}${
+                  connectedPeersCount > 0 ? ` • ${connectedPeersCount} peers` : ""
+                })`}
+                aria-label={`Room ${normalizedRoomId} ${roomStatusText}`}
               >
-                Room: <strong>{normalizedRoomId}</strong> ({roomStatusText}
-                {connectedPeersCount > 0 ? ` • ${connectedPeersCount} peers` : ""})
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                  <circle cx="9" cy="7" r="4" />
+                  <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                  <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                </svg>
+                <strong>{normalizedRoomId}</strong>
+                <span>
+                  {isModelReady && coveragePercent >= 100
+                    ? "Ready"
+                    : `${Math.round(coveragePercent)}%`}
+                  {connectedPeersCount > 0 ? ` · ${connectedPeersCount}p` : ""}
+                </span>
               </span>
               <span
                 data-testid="chat-header-transport"
                 className="chat-telemetry-chip"
-                title="Active P2P connection transport"
+                title={`Connection transport: ${transportLabel}`}
+                aria-label={`Transport ${transportLabel}`}
               >
-                Via: <strong>{transportLabel}</strong>
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                </svg>
+                <strong>{transportLabel}</strong>
               </span>
               <span
                 data-testid="chat-header-net-speed"
                 className="chat-telemetry-chip"
-                title="Measured P2P network throughput / latency and inference speed"
+                title={`Network / inference speed: ${networkSpeedLabel}`}
+                aria-label={`Speed ${networkSpeedLabel}`}
               >
-                Speed: <strong>{networkSpeedLabel}</strong>
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                </svg>
+                <strong>{networkSpeedLabel}</strong>
               </span>
               <span
                 data-testid="chat-header-session-tokens"
                 className="chat-telemetry-chip"
                 title={`Session tokens: ${sessionPromptTokens} prompt + ${sessionCompletionTokens} completion`}
+                aria-label={`Session ${formatTokenCount(sessionTotalTokens)}`}
               >
-                Session: <strong>{formatTokenCount(sessionTotalTokens)}</strong>
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <line x1="4" y1="9" x2="20" y2="9" />
+                  <line x1="4" y1="15" x2="20" y2="15" />
+                  <line x1="10" y1="3" x2="8" y2="21" />
+                  <line x1="16" y1="3" x2="14" y2="21" />
+                </svg>
+                <strong>{formatTokenCount(sessionTotalTokens)}</strong>
               </span>
             </div>
-          </div>
 
-          <div className="chat-modal-actions">
-            <button
-              type="button"
-              data-testid="chat-clear-btn"
-              className="native-btn"
-              onClick={handleClearChat}
-              disabled={messages.length === 0 && attachments.length === 0 && !isStreaming}
-            >
-              Clear
-            </button>
-            <button
-              type="button"
-              data-testid="chat-maximize-btn"
-              className="native-btn chat-window-ctrl-btn"
-              aria-label={isMaximized ? "Restore chat window" : "Maximize chat window"}
-              aria-pressed={isMaximized}
-              title={isMaximized ? "Restore (or double-click header)" : "Maximize (or double-click header)"}
-              onClick={handleToggleMaximize}
-            >
-              {isMaximized ? (
-                <svg
-                  width="11"
-                  height="11"
-                  viewBox="0 0 12 12"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.2"
-                  aria-hidden="true"
-                >
-                  <rect x="2" y="3.5" width="6.5" height="6.5" rx="0.5" />
-                  <path d="M4 3.5V2h6v6H8.5" />
-                </svg>
-              ) : (
-                <svg
-                  width="11"
-                  height="11"
-                  viewBox="0 0 12 12"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.2"
-                  aria-hidden="true"
-                >
-                  <rect x="2" y="2" width="8" height="8" rx="0.5" />
-                </svg>
-              )}
-              <span>{isMaximized ? "Restore" : "Maximize"}</span>
-            </button>
-            <button
-              type="button"
-              data-testid="chat-close-btn"
-              className="native-btn chat-window-ctrl-btn chat-window-close-btn"
-              aria-label="Close chat window"
-              title="Close (Esc)"
-              onClick={onClose}
-            >
-              <svg
-                width="11"
-                height="11"
-                viewBox="0 0 12 12"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.35"
-                strokeLinecap="round"
-                aria-hidden="true"
+            <span className="chat-header-divider" aria-hidden="true" />
+
+            <div className="chat-modal-actions">
+              <button
+                type="button"
+                data-testid="chat-clear-btn"
+                className="native-btn"
+                onClick={handleClearChat}
+                disabled={messages.length === 0 && attachments.length === 0 && !isStreaming}
               >
-                <line x1="2.5" y1="2.5" x2="9.5" y2="9.5" />
-                <line x1="9.5" y1="2.5" x2="2.5" y2="9.5" />
-              </svg>
-              <span>Close</span>
-            </button>
+                Clear
+              </button>
+              <button
+                type="button"
+                data-testid="chat-close-btn"
+                className="native-btn chat-window-ctrl-btn chat-window-close-btn"
+                aria-label="Close chat window"
+                title="Close (Esc)"
+                onClick={onClose}
+              >
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.35"
+                  strokeLinecap="round"
+                  aria-hidden="true"
+                >
+                  <line x1="2.5" y1="2.5" x2="9.5" y2="9.5" />
+                  <line x1="9.5" y1="2.5" x2="2.5" y2="9.5" />
+                </svg>
+                <span>Close</span>
+              </button>
+            </div>
           </div>
         </div>
 

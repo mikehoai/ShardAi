@@ -3045,33 +3045,21 @@ export const Dashboard: React.FC = () => {
                         <div
                           data-testid="modal-ram-requirement-hint"
                           style={{
-                            marginBottom: "12px",
-                            padding: "7px 10px",
-                            borderRadius: "6px",
-                            backgroundColor:
-                              modalRamAssessment.status === "solo_stable"
-                                ? "var(--success-bg)"
-                                : "var(--info-bg)",
-                            border: `1px solid ${
-                              modalRamAssessment.status === "solo_stable"
-                                ? "var(--success-border)"
-                                : "var(--info-border)"
-                            }`,
-                            color:
-                              modalRamAssessment.status === "solo_stable"
-                                ? "var(--success-fg)"
-                                : "var(--info-fg)",
+                            marginBottom: "10px",
                             fontSize: "11.5px",
+                            color: "var(--text-secondary)",
                             lineHeight: 1.4,
                           }}
                         >
-                          <strong>
+                          <strong style={{ color: "var(--text-primary)" }}>
                             Model ~{formatGb(modalRamAssessment.modelSizeGb)} • Solo Stable:{" "}
                             {formatGb(modalRamAssessment.soloStableGb)} • 2-Node Room:{" "}
                             {formatGb(modalRamAssessment.twoNodeStableGb)}
                           </strong>{" "}
                           {modalRamAssessment.status === "solo_stable" ? (
-                            <span>(Your {sharedRamGb} GB is Solo-ready)</span>
+                            <span style={{ color: "var(--success-fg)" }}>
+                              (Your {sharedRamGb} GB is Solo-ready)
+                            </span>
                           ) : (
                             <span>
                               (+{formatGb(modalRamAssessment.remainingRamForTargetRoomGb)} needed
@@ -3188,16 +3176,9 @@ export const Dashboard: React.FC = () => {
                         alignItems: "center",
                         flexWrap: "wrap",
                         gap: "8px",
-                        padding: "9px 12px",
+                        padding: "0 0 10px 0",
                         marginBottom: "12px",
-                        borderRadius: "8px",
-                        backgroundColor:
-                          assignedRole === "primary" ? "var(--info-bg)" : "var(--warn-bg)",
-                        border: `1px solid ${
-                          assignedRole === "primary"
-                            ? "var(--info-border)"
-                            : "var(--warn-border)"
-                        }`,
+                        borderBottom: "1px solid var(--border-hairline)",
                       }}
                     >
                       <span
@@ -3205,8 +3186,7 @@ export const Dashboard: React.FC = () => {
                         style={{
                           fontSize: "12.5px",
                           fontWeight: 700,
-                          color:
-                            assignedRole === "primary" ? "var(--info-fg)" : "var(--warn-fg)",
+                          color: "var(--text-primary)",
                         }}
                       >
                         {assignedRole === "primary"
@@ -3217,8 +3197,10 @@ export const Dashboard: React.FC = () => {
                         style={{
                           display: "flex",
                           alignItems: "center",
-                          gap: "6px",
+                          gap: "10px",
                           flexWrap: "wrap",
+                          fontSize: "11.5px",
+                          color: "var(--text-secondary)",
                         }}
                       >
                         {modelFingerprint && (
@@ -3226,13 +3208,8 @@ export const Dashboard: React.FC = () => {
                             data-testid="model-fingerprint-badge"
                             title={`SHA-256 (10MB + size): ${modelFingerprint}`}
                             style={{
-                              fontSize: "11px",
-                              fontWeight: 600,
-                              padding: "2px 8px",
-                              borderRadius: "999px",
-                              backgroundColor: "var(--bg-surface-subtle)",
-                              color: "var(--text-secondary)",
-                              border: "1px solid var(--border-strong)",
+                              fontWeight: 500,
+                              color: "var(--text-muted)",
                               fontFamily: "monospace",
                             }}
                           >
@@ -3244,16 +3221,11 @@ export const Dashboard: React.FC = () => {
                             data-testid="quic-p2p-badge"
                             title="Direct NAT-traversing QUIC P2P transport active"
                             style={{
-                              fontSize: "11px",
                               fontWeight: 600,
-                              padding: "2px 8px",
-                              borderRadius: "999px",
-                              backgroundColor: "var(--success-bg)",
                               color: "var(--success-fg)",
-                              border: "1px solid var(--success-border)",
                             }}
                           >
-                            ⚡ QUIC P2P
+                            QUIC P2P
                             {p2pDirectPeersCount > 0 ? ` (${p2pDirectPeersCount} direct)` : ""}
                           </span>
                         )}
@@ -3261,26 +3233,16 @@ export const Dashboard: React.FC = () => {
                           <span
                             data-testid="ssd-offload-active-badge"
                             style={{
-                              fontSize: "11px",
                               fontWeight: 600,
-                              padding: "2px 8px",
-                              borderRadius: "999px",
-                              backgroundColor: "var(--info-bg)",
                               color: "var(--info-fg)",
-                              border: "1px solid var(--info-border)",
                             }}
                           >
-                            💾 SSD Offload (mmap)
+                            SSD Offload (mmap)
                           </span>
                         )}
                         <span
                           style={{
-                            fontSize: "11px",
                             fontWeight: 700,
-                            padding: "2px 8px",
-                            borderRadius: "999px",
-                            backgroundColor:
-                              assignedRole === "primary" ? "var(--info-bg)" : "var(--warn-bg)",
                             color:
                               assignedRole === "primary" ? "var(--info-fg)" : "var(--warn-fg)",
                           }}
@@ -3295,28 +3257,17 @@ export const Dashboard: React.FC = () => {
                       <span
                         data-testid="api-readiness-badge"
                         style={{
-                          fontSize: "11px",
+                          fontSize: "11.5px",
                           fontWeight: 600,
-                          padding: "2px 8px",
-                          borderRadius: "999px",
-                          backgroundColor:
-                            isSwarmReady && coveragePercent >= 100
-                              ? "var(--success-bg)"
-                              : "var(--warn-bg)",
                           color:
                             isSwarmReady && coveragePercent >= 100
                               ? "var(--success-fg)"
                               : "var(--warn-fg)",
-                          border: `1px solid ${
-                            isSwarmReady && coveragePercent >= 100
-                              ? "var(--success-border)"
-                              : "var(--warn-border)"
-                          }`,
                         }}
                       >
                         {isSwarmReady && coveragePercent >= 100
-                          ? "🟢 API Ready (Swarm is ready to accept requests)"
-                          : `🟡 API Standby (Waiting for sufficient RAM: ${Math.round(coveragePercent)}% - Model not ready)`}
+                          ? "● API Ready (Swarm is ready to accept requests)"
+                          : `● API Standby (Waiting for sufficient RAM: ${Math.round(coveragePercent)}% - Model not ready)`}
                       </span>
                     </div>
 
@@ -3452,7 +3403,7 @@ export const Dashboard: React.FC = () => {
                           >
                             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                           </svg>
-                          <span>Open AI Chat</span>
+                          <span>Open Chat</span>
                         </button>
                       </div>
                     )}
