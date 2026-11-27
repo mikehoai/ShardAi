@@ -7,6 +7,7 @@ between ShardAi nodes with `TCP_NODELAY`, explicit timeouts, and congestion dete
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+import ipaddress
 import logging
 import socket
 import struct
@@ -71,11 +72,66 @@ congestion_monitor = BandwidthCongestionMonitor()
 
 
 def _parse_host_port(peer_endpoint: str, default_port: int = DEFAULT_P2P_PORT) -> tuple[str, int]:
-    """Parse either `'192.0.2.10'` or `'192.0.2.10:49153'` into `(host, port)`."""
-    if ":" in peer_endpoint:
-        host_part, port_part = peer_endpoint.rsplit(":", 1)
-        return host_part.strip(), int(port_part)
-    return peer_endpoint.strip(), default_port
+    """Parse IPv4, IPv6 (bare or bracketed), or hostname endpoints into `(host, port)`."""
+    cleaned = peer_endpoint.strip()
+    if not cleaned:
+        raise ValueError("Peer endpoint must not be empty")
+
+    if cleaned.startswith("["):
+        close_idx = cleaned.find("]")
+        if close_idx == -1:
+            raise ValueError(f"Malformed bracketed IPv6 endpoint: {peer_endpoint!r}")
+        host_part = cleaned[1:close_idx].strip()
+        if not host_part:
+            raise ValueError(f"Empty host in bracketed endpoint: {peer_endpoint!r}")
+        ip_base = host_part.split("%", 1)[0]
+        addr = ipaddress.ip_address(ip_base)
+        if addr.version != 6:
+            raise ValueError(f"Bracketed host must be an IPv6 address: {peer_endpoint!r}")
+        rest = cleaned[close_idx + 1 :].strip()
+        if not rest:
+            return host_part, default_port
+        if not rest.startswith(":"):
+            raise ValueError(f"Unexpected trailing characters in endpoint: {peer_endpoint!r}")
+        port_part = rest[1:].strip()
+        if not port_part:
+            raise ValueError(f"Missing port in bracketed endpoint: {peer_endpoint!r}")
+        port = int(port_part)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port out of range (1..65535): {port}")
+        return host_part, port
+
+    if "%" in cleaned:
+        ip_base, zone_part = cleaned.split("%", 1)
+        if zone_part and ":" in ip_base:
+            try:
+                addr = ipaddress.ip_address(ip_base)
+                if addr.version == 6:
+                    return cleaned, default_port
+            except ValueError:
+                pass
+    else:
+        try:
+            ipaddress.ip_address(cleaned)
+            return cleaned, default_port
+        except ValueError:
+            pass
+
+    colon_count = cleaned.count(":")
+    if colon_count == 0:
+        return cleaned, default_port
+    if colon_count == 1:
+        host_part, port_part = cleaned.split(":", 1)
+        host_part = host_part.strip()
+        port_part = port_part.strip()
+        if not host_part or not port_part:
+            raise ValueError(f"Malformed host:port endpoint: {peer_endpoint!r}")
+        port = int(port_part)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port out of range (1..65535): {port}")
+        return host_part, port
+
+    raise ValueError(f"Malformed multi-colon peer endpoint: {peer_endpoint!r}")
 
 
 async def send_activations(
@@ -98,18 +154,20 @@ async def send_activations(
     Returns:
         float: Measured socket transmission Round-Trip Time (RTT) in milliseconds.
     """
-    host, resolved_port = _parse_host_port(peer_ip, peer_port)
     ack_wait_timeout: float = (
         timeout_seconds if ack_timeout_seconds is None else ack_timeout_seconds
     )
     start_ns: int = time.perf_counter_ns()
+    host = peer_ip
+    resolved_port = peer_port
 
     try:
+        host, resolved_port = _parse_host_port(peer_ip, peer_port)
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, resolved_port),
             timeout=timeout_seconds,
         )
-    except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+    except (OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
         raise PeerUnreachableError(
             f"Unable to connect to peer {host}:{resolved_port}: {exc}"
         ) from exc

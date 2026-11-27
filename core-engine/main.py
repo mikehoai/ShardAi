@@ -265,16 +265,19 @@ def _resolve_advertise_ip(
     effective_public_ip = public_ip if public_ip is not None else runtime.public_ip
     if effective_public_ip:
         try:
+            pub_addr = ipaddress.ip_address(
+                effective_public_ip.strip().split("%", 1)[0]
+            )
             target_addr = ipaddress.ip_address(target_peer_ip.strip().split("%", 1)[0])
-            if target_addr.is_global:
-                return effective_public_ip
+            if pub_addr.version == 4 and target_addr.is_global:
+                return str(pub_addr)
         except ValueError:
             pass
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect((target_peer_ip, target_peer_port))
         return str(sock.getsockname()[0])
-    except OSError:
+    except (OSError, ValueError, OverflowError):
         return "127.0.0.1"
     finally:
         sock.close()
@@ -834,7 +837,6 @@ class LocalNodeRuntime:
         """Send a binary frame across Iroh QUIC (hole-punched UDP + E2EE relay), TCP, or WS relay."""
         ack_wait = timeout_seconds if ack_timeout_seconds is None else ack_timeout_seconds
         can_quic = bool(self.quic_transport.is_running and peer.p2p_ticket)
-        can_relay = bool(self.relay_client.is_connected)
         cached_route = self._get_cached_peer_route(peer.peer_id)
 
         if cached_route == "quic" and can_quic:
@@ -850,12 +852,17 @@ class LocalNodeRuntime:
             except PeerUnreachableError:
                 self._peer_routes.pop(peer.peer_id, None)
 
-        if cached_route == "relay" and can_relay:
-            rtt_ms = await self.relay_client.send_frame(
-                peer.peer_id, frame, ack_timeout=ack_wait
-            )
-            self._set_cached_peer_route(peer.peer_id, "relay")
-            return rtt_ms
+        if cached_route == "relay":
+            if self.relay_client.is_started and not self.relay_client.is_connected:
+                await self.relay_client.wait_until_connected(
+                    timeout=min(5.0, timeout_seconds)
+                )
+            if self.relay_client.is_connected:
+                rtt_ms = await self.relay_client.send_frame(
+                    peer.peer_id, frame, ack_timeout=ack_wait
+                )
+                self._set_cached_peer_route(peer.peer_id, "relay")
+                return rtt_ms
 
         prefer_quic = bool(
             can_quic
@@ -880,7 +887,9 @@ class LocalNodeRuntime:
                 )
 
         direct_connect_timeout = (
-            min(2.0, timeout_seconds) if (can_quic or can_relay) else timeout_seconds
+            min(2.0, timeout_seconds)
+            if (can_quic or self.relay_client.is_connected or self.relay_client.is_started)
+            else timeout_seconds
         )
         send_kwargs: dict[str, Any] = {
             "peer_ip": peer.ip_address,
@@ -907,7 +916,17 @@ class LocalNodeRuntime:
                     return rtt_ms
                 except PeerUnreachableError:
                     pass
-            if not can_relay:
+            if (
+                not self.relay_client.is_started
+                and self.state == NodeState.RUNNING
+                and self.network_status == NetworkStatus.ONLINE
+            ):
+                await self._send_tracker_heartbeat(force=True)
+            if self.relay_client.is_started and not self.relay_client.is_connected:
+                await self.relay_client.wait_until_connected(
+                    timeout=min(5.0, max(2.0, timeout_seconds))
+                )
+            if not self.relay_client.is_connected:
                 raise
             rtt_ms = await self.relay_client.send_frame(
                 peer.peer_id, frame, ack_timeout=ack_wait
@@ -939,13 +958,18 @@ class LocalNodeRuntime:
         frame: bytes,
         timeout_seconds: float = 15.0,
         ack_timeout_seconds: float | None = None,
+        target_peer_id: str | None = None,
     ) -> float:
         """Send a return frame to a peer via QUIC/relay-aware routing when a matching peer exists."""
-        auth_src = current_quic_peer_id.get() or current_relay_source.get()
+        preferred_peer_id = (
+            target_peer_id
+            if target_peer_id is not None
+            else (current_quic_peer_id.get() or current_relay_source.get())
+        )
         peer: PeerNodeInfo | None = None
-        if auth_src is not None:
+        if preferred_peer_id is not None:
             for candidate in self.peers:
-                if candidate.peer_id == auth_src:
+                if candidate.peer_id == preferred_peer_id:
                     peer = candidate
                     break
         if peer is None:
@@ -1011,6 +1035,10 @@ class LocalNodeRuntime:
         finally:
             current_quic_peer_id.reset(token)
 
+    async def _handle_relay_auth_failure(self) -> None:
+        """Refresh tracker registration and relay credentials after a 401/403 relay rejection."""
+        await self._send_tracker_heartbeat(force=True)
+
     async def _apply_tracker_assignment_network_info(
         self,
         assignment: AnnounceAssignment,
@@ -1036,6 +1064,7 @@ class LocalNodeRuntime:
                     node_id=node_id,
                     on_frame=self._handle_relay_frame,
                     allowed_host=allowed_host,
+                    on_auth_failure=self._handle_relay_auth_failure,
                 )
         except Exception as exc:
             logger.warning(
@@ -1230,10 +1259,17 @@ class LocalNodeRuntime:
                 token_text=token_text,
                 is_eos=is_eos,
             )
+            origin_peer = self._peer_for_endpoint(frame.origin_ip, frame.origin_port)
+            origin_peer_id: str | None = origin_peer.peer_id if origin_peer is not None else None
+            if origin_peer_id is None:
+                head_peers = self.find_head_node_peers()
+                if head_peers:
+                    origin_peer_id = head_peers[0].peer_id
             await self._send_to_endpoint(
                 ip=frame.origin_ip,
                 port=frame.origin_port,
                 frame=token_packet,
+                target_peer_id=origin_peer_id,
             )
         elif next_peer is not None:
             next_candidates = self.find_candidate_peers_for_next_layer(completed_layer)
@@ -1398,6 +1434,7 @@ class LocalNodeRuntime:
                 "Head Node reached maximum concurrent proxied inference capacity."
             )
 
+        requester_peer_id: str | None = self._get_authenticated_peer_id()
         try:
             self.validate_pipeline_preflight(
                 has_image_attachments=messages_contain_image(frame.messages)
@@ -1413,17 +1450,20 @@ class LocalNodeRuntime:
                 port=frame.requester_port,
                 frame=err_packet,
                 timeout_seconds=15.0,
+                target_peer_id=requester_peer_id,
             )
             return
 
         task: asyncio.Task[None] = asyncio.create_task(
-            self._run_proxied_inference_task(frame)
+            self._run_proxied_inference_task(frame, requester_peer_id=requester_peer_id)
         )
         self._proxied_inference_tasks.add(task)
         task.add_done_callback(self._proxied_inference_tasks.discard)
 
     async def _run_proxied_inference_task(
-        self, frame: InferenceRequestFrame
+        self,
+        frame: InferenceRequestFrame,
+        requester_peer_id: str | None = None,
     ) -> None:
         """Run a proxied inference request on the Head Node and stream tokens back to the requester."""
         proxy_stop_event = threading.Event()
@@ -1451,6 +1491,7 @@ class LocalNodeRuntime:
                             port=frame.requester_port,
                             frame=hb_packet,
                             timeout_seconds=15.0,
+                            target_peer_id=requester_peer_id,
                         )
                     except Exception:
                         break
@@ -1473,6 +1514,7 @@ class LocalNodeRuntime:
                     port=frame.requester_port,
                     frame=err_packet,
                     timeout_seconds=15.0,
+                    target_peer_id=requester_peer_id,
                 )
             except Exception as err_send_exc:
                 logger.warning(
@@ -1511,6 +1553,7 @@ class LocalNodeRuntime:
                             port=frame.requester_port,
                             frame=token_packet,
                             timeout_seconds=15.0,
+                            target_peer_id=requester_peer_id,
                         )
                     except Exception as send_exc:
                         send_failed = True
@@ -1540,6 +1583,7 @@ class LocalNodeRuntime:
                         port=frame.requester_port,
                         frame=eos_packet,
                         timeout_seconds=15.0,
+                        target_peer_id=requester_peer_id,
                     )
                 except Exception as eos_send_exc:
                     send_failed = True
@@ -4043,7 +4087,15 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
         runtime._last_heartbeat_at = last_announce_monotonic if cloud_online else 0.0
         runtime.state = NodeState.RUNNING
 
-        if latest_assignment is not None:
+        if cloud_online and (time.monotonic() - last_announce_monotonic) >= 15.0:
+            sent_hb, hb_peers = await runtime._send_tracker_heartbeat(force=True)
+            if sent_hb and hb_peers is not None:
+                runtime.peers = hb_peers
+            elif latest_assignment is not None:
+                await runtime._apply_tracker_assignment_network_info(
+                    latest_assignment, request.node_id
+                )
+        elif latest_assignment is not None:
             await runtime._apply_tracker_assignment_network_info(
                 latest_assignment, request.node_id
             )

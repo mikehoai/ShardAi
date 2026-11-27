@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import uuid
 
 import websockets.asyncio.client as ws_client
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.protocol import State
 
 from p2p.relay_envelope import (
@@ -83,6 +83,10 @@ def validate_relay_url(url: str, allowed_host: str | None = None) -> str:
     return cleaned
 
 
+class _RelayNoRouteError(RuntimeError):
+    """Raised when the relay server reports the destination peer is not currently connected."""
+
+
 @dataclass(slots=True)
 class _PartialMessageBuffer:
     """Tracks chunks for a single multi-chunk `(src, msg_id)` relay transfer."""
@@ -102,11 +106,13 @@ class RelayClient:
         self._node_id: str | None = None
         self._allowed_host: str | None = None
         self._on_frame: Callable[[bytes, str], Awaitable[None]] | None = None
+        self._on_auth_failure: Callable[[], Awaitable[None]] | None = None
 
         self._ws: ws_client.ClientConnection | None = None
         self._runner_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._initial_connect_event: asyncio.Event | None = None
+        self._connected_event: asyncio.Event | None = None
         self._send_lock: asyncio.Lock | None = None
         self._running: bool = False
 
@@ -128,6 +134,36 @@ class RelayClient:
             and self._ws.state == State.OPEN
         )
 
+    async def wait_until_connected(self, timeout: float = 5.0) -> bool:
+        """Wait up to `timeout` seconds for the relay WebSocket connection to open."""
+        if self.is_connected:
+            return True
+        if not self._running or self._connected_event is None:
+            return False
+        stop_event = self._stop_event
+        connected_event = self._connected_event
+        if stop_event is None:
+            try:
+                await asyncio.wait_for(connected_event.wait(), timeout=max(0.0, timeout))
+            except asyncio.TimeoutError:
+                return self.is_connected
+            return self.is_connected
+
+        wait_conn = asyncio.create_task(connected_event.wait())
+        wait_stop = asyncio.create_task(stop_event.wait())
+        try:
+            await asyncio.wait(
+                {wait_conn, wait_stop},
+                timeout=max(0.0, timeout),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (wait_conn, wait_stop):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(wait_conn, wait_stop, return_exceptions=True)
+        return self.is_connected
+
     async def start(
         self,
         url: str,
@@ -135,6 +171,7 @@ class RelayClient:
         node_id: str,
         on_frame: Callable[[bytes, str], Awaitable[None]],
         allowed_host: str | None = None,
+        on_auth_failure: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Start the relay client and wait briefly for the initial WebSocket handshake."""
         validated_url = validate_relay_url(url, allowed_host=allowed_host)
@@ -152,6 +189,8 @@ class RelayClient:
             )
             if same_identity:
                 self._on_frame = on_frame
+                if on_auth_failure is not None:
+                    self._on_auth_failure = on_auth_failure
                 self.update_credentials(validated_url, cleaned_token)
                 return
             await self.stop()
@@ -161,8 +200,10 @@ class RelayClient:
         self._node_id = cleaned_node_id
         self._allowed_host = allowed_host.strip().lower() if allowed_host else None
         self._on_frame = on_frame
+        self._on_auth_failure = on_auth_failure
         self._stop_event = asyncio.Event()
         self._initial_connect_event = asyncio.Event()
+        self._connected_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._running = True
         self._runner_task = asyncio.create_task(self._connection_loop())
@@ -203,6 +244,8 @@ class RelayClient:
             self._stop_event.set()
         if self._initial_connect_event is not None:
             self._initial_connect_event.set()
+        if self._connected_event is not None:
+            self._connected_event.clear()
 
         await self._close_active_ws()
 
@@ -230,7 +273,9 @@ class RelayClient:
         self._ws = None
         self._stop_event = None
         self._initial_connect_event = None
+        self._connected_event = None
         self._send_lock = None
+        self._on_auth_failure = None
 
     def _fail_pending_acks(self, exc: Exception) -> None:
         """Reject all outstanding ACK futures with `exc`."""
@@ -261,34 +306,54 @@ class RelayClient:
         ack_timeout: float = 60.0,
     ) -> float:
         """Send a binary P2P frame through the relay to `dst_node_id` and await ACK."""
-        if not self.is_connected or self._node_id is None:
-            raise PeerUnreachableError("Relay client is not connected")
-
         chunks = split_into_chunks(frame, chunk_size=DEFAULT_RELAY_SEND_CHUNK_BYTES)
-        msg_id = uuid.uuid4().bytes
-        loop = asyncio.get_running_loop()
-        ack_future: asyncio.Future[None] = loop.create_future()
-        self._pending_acks[msg_id] = ack_future
-
+        chunk_count = len(chunks)
+        retry_delays: tuple[float, ...] = (0.35, 0.75)
         start_ns = time.perf_counter_ns()
-        try:
-            chunk_count = len(chunks)
-            for idx, chunk in enumerate(chunks):
-                envelope_bytes = encode_envelope(
-                    kind=RelayPacketKind.DATA,
-                    msg_id=msg_id,
-                    src=self._node_id,
-                    dst=dst_node_id,
-                    payload=chunk,
-                    chunk_index=idx,
-                    chunk_count=chunk_count,
-                )
-                await self._send_raw_ws(envelope_bytes)
+        deadline = time.monotonic() + max(0.05, ack_timeout)
+        loop = asyncio.get_running_loop()
 
-            await asyncio.wait_for(ack_future, timeout=ack_timeout)
-            return (time.perf_counter_ns() - start_ns) / 1_000_000.0
-        finally:
-            self._pending_acks.pop(msg_id, None)
+        for attempt in range(len(retry_delays) + 1):
+            if not self.is_connected or self._node_id is None:
+                raise PeerUnreachableError("Relay client is not connected")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise asyncio.TimeoutError()
+
+            msg_id = uuid.uuid4().bytes
+            ack_future: asyncio.Future[None] = loop.create_future()
+            self._pending_acks[msg_id] = ack_future
+
+            try:
+                for idx, chunk in enumerate(chunks):
+                    envelope_bytes = encode_envelope(
+                        kind=RelayPacketKind.DATA,
+                        msg_id=msg_id,
+                        src=self._node_id,
+                        dst=dst_node_id,
+                        payload=chunk,
+                        chunk_index=idx,
+                        chunk_count=chunk_count,
+                    )
+                    await self._send_raw_ws(envelope_bytes)
+
+                await asyncio.wait_for(
+                    ack_future,
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
+                return (time.perf_counter_ns() - start_ns) / 1_000_000.0
+            except _RelayNoRouteError:
+                if attempt >= len(retry_delays):
+                    raise
+                delay = retry_delays[attempt]
+                if (deadline - time.monotonic()) <= delay:
+                    raise
+                await asyncio.sleep(delay)
+            finally:
+                self._pending_acks.pop(msg_id, None)
+
+        raise PeerUnreachableError("Relay send exhausted retries")
 
     async def _send_control_envelope(
         self,
@@ -439,7 +504,7 @@ class RelayClient:
             fut = self._pending_acks.pop(env.msg_id, None)
             if fut is not None and not fut.done():
                 fut.set_exception(
-                    RuntimeError(f"Relay reported NO_ROUTE for peer {env.src}")
+                    _RelayNoRouteError(f"Relay reported NO_ROUTE for peer {env.src}")
                 )
             return
 
@@ -495,6 +560,7 @@ class RelayClient:
                 break
 
             connected_at: float | None = None
+            token_refreshed = False
             try:
                 async with ws_client.connect(
                     url,
@@ -508,6 +574,8 @@ class RelayClient:
                     backoff = RELAY_RECONNECT_INITIAL_SECONDS
                     if self._initial_connect_event is not None:
                         self._initial_connect_event.set()
+                    if self._connected_event is not None:
+                        self._connected_event.set()
                     logger.info("Connected to Signaling Tracker relay (%s)", urlparse(url).hostname)
 
                     async for raw_message in ws:
@@ -527,6 +595,21 @@ class RelayClient:
             except Exception as exc:
                 if self._initial_connect_event is not None:
                     self._initial_connect_event.set()
+                if (
+                    isinstance(exc, InvalidStatus)
+                    and getattr(exc.response, "status_code", None) in (401, 403)
+                    and self._running
+                    and self._on_auth_failure is not None
+                ):
+                    try:
+                        await self._on_auth_failure()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as auth_exc:
+                        logger.warning("Relay auth failure refresh callback failed: %s", auth_exc)
+                    backoff = RELAY_RECONNECT_INITIAL_SECONDS
+                    if self._token != token:
+                        token_refreshed = True
                 if self._running:
                     logger.warning(
                         "Relay WebSocket disconnected (%s); reconnecting in %.1fs...",
@@ -535,11 +618,16 @@ class RelayClient:
                     )
             finally:
                 self._ws = None
+                if self._connected_event is not None:
+                    self._connected_event.clear()
                 self._fail_pending_acks(PeerUnreachableError("Relay connection closed"))
                 self._partials.clear()
 
             if not self._running or stop_event.is_set():
                 break
+
+            if token_refreshed:
+                continue
 
             if connected_at is not None and (time.monotonic() - connected_at) >= 5.0:
                 backoff = RELAY_RECONNECT_INITIAL_SECONDS
