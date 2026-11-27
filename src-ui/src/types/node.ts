@@ -38,6 +38,14 @@ export interface ModelCatalogResponse {
 /** Auto-fallback connectivity tier: Cloud -> LAN -> Solo (matches `NetworkStatus` in schemas.py). */
 export type NetworkStatus = "online" | "lan_only" | "offline_solo";
 
+export type P2PTransportKind =
+  | "solo"
+  | "lan_direct"
+  | "quic_direct"
+  | "quic_relay"
+  | "ws_relay"
+  | "tcp_direct";
+
 export interface NetworkStatusResponse {
   network_status: NetworkStatus;
   tracker_reachable: boolean;
@@ -130,9 +138,14 @@ export interface NodeStatusResponse {
   allocated_ram_mb: number;
   allocated_vram_mb: number;
   p2p_listen_port: number | null;
+  relay_connected?: boolean;
   p2p_quic_enabled?: boolean;
   p2p_endpoint_id?: string | null;
   p2p_direct_peers_count?: number;
+  room_total_shared_ram_gb?: number;
+  p2p_rtt_ms?: number | null;
+  p2p_throughput_mbps?: number | null;
+  active_p2p_transport?: P2PTransportKind | null;
   connected_peers_count: number;
   peers: PeerNodeInfo[];
   session_token?: string | null;
@@ -172,10 +185,19 @@ export interface ChatAttachmentItem {
   previewUrl?: string;
 }
 
+export interface ChatTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export interface ChatMessageItem {
   id: string;
   role: Exclude<ChatRole, "system">;
   content: string;
   attachments?: ChatAttachmentItem[];
+  tokenCount?: number;
+  thinkingTokenCount?: number;
+  tokensPerSec?: number;
   createdAt: number;
 }

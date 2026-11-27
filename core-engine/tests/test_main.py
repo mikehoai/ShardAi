@@ -238,7 +238,14 @@ def test_openai_gateway_lifecycle_auth_and_streaming(
     assert sse_res.status_code == 200
     assert "text/event-stream" in sse_res.headers["content-type"]
     assert '"delta": {"content":' in sse_res.text
+    assert '"usage": {"prompt_tokens":' in sse_res.text
     assert "data: [DONE]" in sse_res.text
+
+    status_res = client.get("/status")
+    assert status_res.status_code == 200
+    status_body = status_res.json()
+    assert status_body["room_total_shared_ram_gb"] >= 0.0
+    assert status_body["active_p2p_transport"] == "solo"
 
     # 6. POST /v1/chat/completions (stream=false) returns OpenAI chat completion JSON
     json_res = client.post(

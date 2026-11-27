@@ -8,6 +8,7 @@ import type {
   NetworkMode,
   NetworkStatus,
   NodeStatusResponse,
+  P2PTransportKind,
   PeerRole,
   RoomLobbyItem,
   StartNodeRequest,
@@ -424,6 +425,13 @@ export const Dashboard: React.FC = () => {
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
   const [p2pQuicEnabled, setP2pQuicEnabled] = useState<boolean>(false);
   const [p2pDirectPeersCount, setP2pDirectPeersCount] = useState<number>(0);
+  const [relayConnected, setRelayConnected] = useState<boolean>(false);
+  const [roomTotalSharedRamGb, setRoomTotalSharedRamGb] = useState<number>(0);
+  const [p2pRttMs, setP2pRttMs] = useState<number | null>(null);
+  const [p2pThroughputMbps, setP2pThroughputMbps] = useState<number | null>(null);
+  const [activeP2pTransport, setActiveP2pTransport] = useState<P2PTransportKind | null>(
+    null
+  );
   const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
   const handleCloseChat = useCallback((): void => {
     setIsChatOpen(false);
@@ -828,6 +836,20 @@ export const Dashboard: React.FC = () => {
     setConnectedPeersCount(statusData.connected_peers_count ?? 0);
     setP2pQuicEnabled(Boolean(statusData.p2p_quic_enabled));
     setP2pDirectPeersCount(statusData.p2p_direct_peers_count ?? 0);
+    setRelayConnected(Boolean(statusData.relay_connected));
+    if (
+      typeof statusData.room_total_shared_ram_gb === "number" &&
+      statusData.room_total_shared_ram_gb > 0
+    ) {
+      setRoomTotalSharedRamGb(statusData.room_total_shared_ram_gb);
+    }
+    setP2pRttMs(typeof statusData.p2p_rtt_ms === "number" ? statusData.p2p_rtt_ms : null);
+    setP2pThroughputMbps(
+      typeof statusData.p2p_throughput_mbps === "number"
+        ? statusData.p2p_throughput_mbps
+        : null
+    );
+    setActiveP2pTransport(statusData.active_p2p_transport ?? null);
   };
 
   const resetSharingState = useCallback((): void => {
@@ -842,6 +864,11 @@ export const Dashboard: React.FC = () => {
     setConnectedPeersCount(0);
     setP2pQuicEnabled(false);
     setP2pDirectPeersCount(0);
+    setRelayConnected(false);
+    setRoomTotalSharedRamGb(0);
+    setP2pRttMs(null);
+    setP2pThroughputMbps(null);
+    setActiveP2pTransport(null);
     setDownloadProgress(null);
     setDownloadStatusMsg("");
   }, []);
@@ -3521,17 +3548,41 @@ export const Dashboard: React.FC = () => {
         )}
       </div>
 
-      {isSharing && sessionToken && (
-        <ChatWindow
-          isOpen={isChatOpen}
-          isModelReady={isSwarmReady && coveragePercent >= 100}
-          coveragePercent={coveragePercent}
-          apiBaseUrl={apiBaseUrl}
-          sessionToken={sessionToken}
-          modelId={activeModelId}
-          onClose={handleCloseChat}
-        />
-      )}
+      {isSharing && sessionToken && (() => {
+        const matchedLobbyRoom = availableRooms.find(
+          (r) => r.room_id === (roomId.trim() || "public")
+        );
+        const resolvedRoomTotalRam =
+          roomTotalSharedRamGb > 0
+            ? roomTotalSharedRamGb
+            : matchedLobbyRoom && matchedLobbyRoom.total_shared_ram_gb > 0
+              ? Math.max(sharedRamGb, matchedLobbyRoom.total_shared_ram_gb)
+              : sharedRamGb;
+        return (
+          <ChatWindow
+            isOpen={isChatOpen}
+            isModelReady={isSwarmReady && coveragePercent >= 100}
+            coveragePercent={coveragePercent}
+            apiBaseUrl={apiBaseUrl}
+            sessionToken={sessionToken}
+            modelId={activeModelId}
+            roomId={roomId.trim() || "public"}
+            sharedRamGb={sharedRamGb}
+            roomTotalRamGb={resolvedRoomTotalRam}
+            connectedPeersCount={connectedPeersCount}
+            networkMode={networkMode}
+            networkStatus={networkStatus}
+            isSoloMode={networkStatus === "offline_solo"}
+            p2pQuicEnabled={p2pQuicEnabled}
+            p2pDirectPeersCount={p2pDirectPeersCount}
+            relayConnected={relayConnected}
+            activeP2pTransport={activeP2pTransport}
+            p2pRttMs={p2pRttMs}
+            p2pThroughputMbps={p2pThroughputMbps}
+            onClose={handleCloseChat}
+          />
+        );
+      })()}
 
       {/* =================================================================== */}
       {/* Bottom Native OS Statusbar                                          */}

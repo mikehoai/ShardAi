@@ -1,4 +1,5 @@
 import type {
+  ChatTokenUsage,
   CheckRoomJoinRequest,
   CheckRoomJoinResponse,
   NetworkStatusResponse,
@@ -187,9 +188,38 @@ export interface StreamChatCompletionOptions {
   model: string;
   messages: OpenAIChatMessagePayload[];
   onToken: (token: string) => void;
+  onUsage?: (usage: ChatTokenUsage) => void;
   signal?: AbortSignal;
   temperature?: number;
   maxTokens?: number;
+}
+
+function extractUsageInfo(parsed: unknown): ChatTokenUsage | null {
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.usage !== "object" || record.usage === null) {
+    return null;
+  }
+  const usageRec = record.usage as Record<string, unknown>;
+  const promptTokens =
+    typeof usageRec.prompt_tokens === "number" && Number.isFinite(usageRec.prompt_tokens)
+      ? Math.max(0, Math.round(usageRec.prompt_tokens))
+      : 0;
+  const completionTokens =
+    typeof usageRec.completion_tokens === "number" &&
+    Number.isFinite(usageRec.completion_tokens)
+      ? Math.max(0, Math.round(usageRec.completion_tokens))
+      : 0;
+  const totalTokens =
+    typeof usageRec.total_tokens === "number" && Number.isFinite(usageRec.total_tokens)
+      ? Math.max(0, Math.round(usageRec.total_tokens))
+      : promptTokens + completionTokens;
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0) {
+    return null;
+  }
+  return { promptTokens, completionTokens, totalTokens };
 }
 
 function extractDeltaContent(parsed: unknown): {
@@ -275,6 +305,10 @@ export async function streamChatCompletion(
     if (errorMessage) {
       throw new Error(errorMessage);
     }
+    const usage = extractUsageInfo(data);
+    if (usage) {
+      options.onUsage?.(usage);
+    }
     if (token) {
       options.onToken(token);
       return token;
@@ -310,6 +344,10 @@ export async function streamChatCompletion(
       const { token, errorMessage } = extractDeltaContent(parsed);
       if (errorMessage) {
         throw new Error(errorMessage);
+      }
+      const usage = extractUsageInfo(parsed);
+      if (usage) {
+        options.onUsage?.(usage);
       }
       if (token) {
         fullContent += token;

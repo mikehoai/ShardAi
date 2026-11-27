@@ -477,6 +477,9 @@ class LocalNodeRuntime:
         self.upnp_mapper: UpnpPortMapper = UpnpPortMapper()
         self.upnp_mapped_port: int | None = None
         self._peer_routes: dict[str, tuple[str, float]] = {}
+        self.last_p2p_rtt_ms: float | None = None
+        self.p2p_throughput_mbps: float | None = None
+        self.room_total_shared_ram_gb: float = 0.0
         self.native_stream_queue_maxsize: int = NATIVE_STREAM_QUEUE_MAXSIZE
         self.native_cancel_wait_timeout_seconds: float = (
             NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS
@@ -827,6 +830,73 @@ class LocalNodeRuntime:
         self._peer_routes[peer_id] = (route, now + _PEER_ROUTE_TTL_SECONDS)
         self._prune_peer_routes(now=now)
 
+    def _record_p2p_transfer_metrics(self, frame_bytes: int, rtt_ms: float) -> None:
+        """Update smoothed P2P RTT (ms) and transfer throughput (Mbps) from recent sends."""
+        safe_rtt = max(0.1, float(rtt_ms))
+        if self.last_p2p_rtt_ms is None:
+            self.last_p2p_rtt_ms = round(safe_rtt, 1)
+        else:
+            self.last_p2p_rtt_ms = round((0.7 * self.last_p2p_rtt_ms) + (0.3 * safe_rtt), 1)
+        if frame_bytes > 0:
+            mbps = (float(frame_bytes) * 8.0) / (safe_rtt / 1000.0) / 1_000_000.0
+            if self.p2p_throughput_mbps is None:
+                self.p2p_throughput_mbps = round(mbps, 2)
+            else:
+                self.p2p_throughput_mbps = round(
+                    (0.7 * self.p2p_throughput_mbps) + (0.3 * mbps), 2
+                )
+
+    def _resolve_active_p2p_transport(
+        self,
+    ) -> (
+        Literal[
+            "solo",
+            "lan_direct",
+            "quic_direct",
+            "quic_relay",
+            "ws_relay",
+            "tcp_direct",
+        ]
+        | None
+    ):
+        """Infer the active P2P transport mode for status telemetry."""
+        if self.state != NodeState.RUNNING:
+            return None
+        if not self.peers:
+            return "solo"
+
+        now = time.monotonic()
+        self._prune_peer_routes(now=now)
+        active_routes = {route for route, exp in self._peer_routes.values() if exp > now}
+        if "quic" in active_routes:
+            return (
+                "quic_direct"
+                if self.quic_transport.get_direct_peers_count() > 0
+                else "quic_relay"
+            )
+        if "relay" in active_routes:
+            return "ws_relay"
+        if "direct" in active_routes:
+            if self.network_status == NetworkStatus.LAN_ONLY or all(
+                _is_lan_or_loopback_ip(p.ip_address) for p in self.peers
+            ):
+                return "lan_direct"
+            return "tcp_direct"
+
+        if self.quic_transport.is_running and any(p.p2p_ticket for p in self.peers):
+            return (
+                "quic_direct"
+                if self.quic_transport.get_direct_peers_count() > 0
+                else "quic_relay"
+            )
+        if self.relay_client.is_connected and self.network_mode == NetworkMode.INTERNET:
+            return "ws_relay"
+        if self.network_status == NetworkStatus.LAN_ONLY or all(
+            _is_lan_or_loopback_ip(p.ip_address) for p in self.peers
+        ):
+            return "lan_direct"
+        return "tcp_direct"
+
     async def send_frame_to_peer(
         self,
         peer: PeerNodeInfo,
@@ -838,6 +908,7 @@ class LocalNodeRuntime:
         ack_wait = timeout_seconds if ack_timeout_seconds is None else ack_timeout_seconds
         can_quic = bool(self.quic_transport.is_running and peer.p2p_ticket)
         cached_route = self._get_cached_peer_route(peer.peer_id)
+        frame_len = len(frame)
 
         if cached_route == "quic" and can_quic:
             try:
@@ -848,6 +919,7 @@ class LocalNodeRuntime:
                     ack_timeout=ack_wait,
                 )
                 self._set_cached_peer_route(peer.peer_id, "quic")
+                self._record_p2p_transfer_metrics(frame_len, rtt_ms)
                 return rtt_ms
             except PeerUnreachableError:
                 self._peer_routes.pop(peer.peer_id, None)
@@ -862,6 +934,7 @@ class LocalNodeRuntime:
                     peer.peer_id, frame, ack_timeout=ack_wait
                 )
                 self._set_cached_peer_route(peer.peer_id, "relay")
+                self._record_p2p_transfer_metrics(frame_len, rtt_ms)
                 return rtt_ms
 
         prefer_quic = bool(
@@ -878,6 +951,7 @@ class LocalNodeRuntime:
                     ack_timeout=ack_wait,
                 )
                 self._set_cached_peer_route(peer.peer_id, "quic")
+                self._record_p2p_transfer_metrics(frame_len, rtt_ms)
                 return rtt_ms
             except PeerUnreachableError as quic_exc:
                 logger.warning(
@@ -902,6 +976,7 @@ class LocalNodeRuntime:
         try:
             rtt_ms = await send_activations(**send_kwargs)
             self._set_cached_peer_route(peer.peer_id, "direct")
+            self._record_p2p_transfer_metrics(frame_len, rtt_ms)
             return rtt_ms
         except PeerUnreachableError:
             if can_quic and not prefer_quic:
@@ -913,6 +988,7 @@ class LocalNodeRuntime:
                         ack_timeout=ack_wait,
                     )
                     self._set_cached_peer_route(peer.peer_id, "quic")
+                    self._record_p2p_transfer_metrics(frame_len, rtt_ms)
                     return rtt_ms
                 except PeerUnreachableError:
                     pass
@@ -932,6 +1008,7 @@ class LocalNodeRuntime:
                 peer.peer_id, frame, ack_timeout=ack_wait
             )
             self._set_cached_peer_route(peer.peer_id, "relay")
+            self._record_p2p_transfer_metrics(frame_len, rtt_ms)
             return rtt_ms
 
     def _peer_for_endpoint(self, ip: str, port: int) -> PeerNodeInfo | None:
@@ -2561,6 +2638,7 @@ class LocalNodeRuntime:
         )
         is_online_effective: bool = False
         cloud_coverage: float | None = None
+        cloud_room_total_ram_gb: float | None = None
         cloud_peers: list[PeerNodeInfo] | None = None
         if wants_cloud_tracker:
             if self.network_status == NetworkStatus.ONLINE:
@@ -2578,6 +2656,7 @@ class LocalNodeRuntime:
                 for room in rooms:
                     if room.room_id == self.room_id:
                         cloud_coverage = room.coverage_percent
+                        cloud_room_total_ram_gb = room.total_shared_ram_gb
                         break
                 if self.network_status != NetworkStatus.ONLINE:
                     prev_status = self.network_status
@@ -2693,6 +2772,20 @@ class LocalNodeRuntime:
         if self.state != NodeState.RUNNING:
             return
         local_pct = self.recompute_local_coverage()
+        self_ram_gb = (
+            float(self._active_start_request.shared_ram_gb)
+            if self._active_start_request is not None
+            else 0.0
+        )
+        if cloud_room_total_ram_gb is not None and cloud_room_total_ram_gb > 0.0:
+            self.room_total_shared_ram_gb = round(
+                max(self_ram_gb, float(cloud_room_total_ram_gb)), 2
+            )
+        else:
+            peer_ram_gb = sum(
+                max(0.0, float(p.available_vram_mb) / 1024.0) for p in self.peers
+            )
+            self.room_total_shared_ram_gb = round(self_ram_gb + peer_ram_gb, 2)
         if cloud_coverage is not None:
             self.coverage_percent = round(min(100.0, max(0.0, cloud_coverage)), 1)
             self.is_swarm_ready = self.coverage_percent >= 100.0
@@ -2779,6 +2872,18 @@ class LocalNodeRuntime:
             p2p_direct_peers_count=(
                 self.quic_transport.get_direct_peers_count() if is_running else 0
             ),
+            room_total_shared_ram_gb=(
+                self.room_total_shared_ram_gb
+                if (is_running and self.room_total_shared_ram_gb > 0.0)
+                else (
+                    float(self._active_start_request.shared_ram_gb)
+                    if (is_running and self._active_start_request is not None)
+                    else 0.0
+                )
+            ),
+            p2p_rtt_ms=self.last_p2p_rtt_ms if is_running else None,
+            p2p_throughput_mbps=self.p2p_throughput_mbps if is_running else None,
+            active_p2p_transport=self._resolve_active_p2p_transport(),
             message=message,
         )
 
@@ -2882,6 +2987,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         runtime._queued_pipeline_requests = 0
         runtime.public_ip = None
         runtime.upnp_mapped_port = None
+        runtime.last_p2p_rtt_ms = None
+        runtime.p2p_throughput_mbps = None
+        runtime.room_total_shared_ram_gb = 0.0
         runtime.state = NodeState.STOPPED
 
 
@@ -4337,6 +4445,7 @@ async def openai_chat_completions(
         stream_stop_event: threading.Event = threading.Event()
 
         async def _openai_sse_stream() -> AsyncIterator[str]:
+            streamed_completion_tokens = 0
             # Emit initial assistant role delta chunk per OpenAI streaming spec
             role_chunk = json.dumps(
                 {
@@ -4390,6 +4499,7 @@ async def openai_chat_completions(
                                 break
                             if not token_text:
                                 continue
+                            streamed_completion_tokens += 1
                             content_chunk = json.dumps(
                                 {
                                     "id": completion_id,
@@ -4470,6 +4580,7 @@ async def openai_chat_completions(
             finally:
                 stream_stop_event.set()
 
+            prompt_token_count: int = max(1, len(prompt_text.split()))
             stop_chunk = json.dumps(
                 {
                     "id": completion_id,
@@ -4483,6 +4594,11 @@ async def openai_chat_completions(
                             "finish_reason": "stop",
                         }
                     ],
+                    "usage": {
+                        "prompt_tokens": prompt_token_count,
+                        "completion_tokens": streamed_completion_tokens,
+                        "total_tokens": prompt_token_count + streamed_completion_tokens,
+                    },
                 }
             )
             yield f"data: {stop_chunk}\n\n"

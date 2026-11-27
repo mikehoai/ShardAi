@@ -2,13 +2,23 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { streamChatCompletion } from "../services/engineApi";
 import { extractDocumentText, MAX_DOC_TEXT_CHARS } from "../utils/documentExtractor";
+import {
+  estimateTokenCount,
+  formatNetworkSpeedSummary,
+  formatTokenCount,
+  parseThinkingContent,
+  resolveConnectionTransportLabel,
+} from "../utils/chatFormatting";
 import MarkdownMessage, { copyTextToClipboard } from "./MarkdownMessage";
 import type {
   ChatAttachmentItem,
   ChatAttachmentKind,
   ChatMessageItem,
+  NetworkMode,
+  NetworkStatus,
   OpenAIChatContentPart,
   OpenAIChatMessagePayload,
+  P2PTransportKind,
 } from "../types/node";
 
 export interface ChatWindowProps {
@@ -18,6 +28,19 @@ export interface ChatWindowProps {
   apiBaseUrl: string;
   sessionToken: string;
   modelId: string;
+  roomId?: string;
+  sharedRamGb?: number;
+  roomTotalRamGb?: number;
+  connectedPeersCount?: number;
+  networkMode?: NetworkMode | null;
+  networkStatus?: NetworkStatus | null;
+  isSoloMode?: boolean;
+  p2pQuicEnabled?: boolean;
+  p2pDirectPeersCount?: number;
+  relayConnected?: boolean;
+  activeP2pTransport?: P2PTransportKind | null;
+  p2pRttMs?: number | null;
+  p2pThroughputMbps?: number | null;
   onClose: () => void;
 }
 
@@ -258,6 +281,19 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   apiBaseUrl,
   sessionToken,
   modelId,
+  roomId = "public",
+  sharedRamGb,
+  roomTotalRamGb,
+  connectedPeersCount = 0,
+  networkMode = null,
+  networkStatus = null,
+  isSoloMode = false,
+  p2pQuicEnabled = false,
+  p2pDirectPeersCount = 0,
+  relayConnected = false,
+  activeP2pTransport = null,
+  p2pRttMs = null,
+  p2pThroughputMbps = null,
   onClose,
 }) => {
   const [messages, setMessages] = useState<ChatMessageItem[]>([]);
@@ -270,6 +306,10 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingDraft, setEditingDraft] = useState<string>("");
+  const [expandedThinkingIds, setExpandedThinkingIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [latestTokensPerSec, setLatestTokensPerSec] = useState<number | null>(null);
 
   const isMountedRef = useRef<boolean>(true);
   const extractionSessionRef = useRef<number>(0);
@@ -390,6 +430,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     clearCopyResetTimer();
     setCopiedMessageId(null);
     setEditingState(null, "");
+    setExpandedThinkingIds(new Set());
+    setLatestTokensPerSec(null);
     setIsStreaming(false);
     setMessages([]);
     setAttachments([]);
@@ -650,10 +692,24 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     clearCopyResetTimer();
     setCopiedMessageId(null);
     setEditingState(null, "");
+    setExpandedThinkingIds(new Set());
+    setLatestTokensPerSec(null);
     handleStopGeneration();
     setMessages([]);
     setAttachments([]);
     setChatError(null);
+  };
+
+  const handleToggleThinking = (messageId: string): void => {
+    setExpandedThinkingIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(messageId)) {
+        next.delete(messageId);
+      } else {
+        next.add(messageId);
+      }
+      return next;
+    });
   };
 
   const handleCopyMessage = async (messageId: string, content: string): Promise<void> => {
@@ -695,6 +751,10 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     const controller = new AbortController();
     abortControllerRef.current = controller;
     let receivedAnyToken = false;
+    let streamedChunkCount = 0;
+    let reportedCompletionTokens: number | null = null;
+    const streamStartedAt =
+      typeof performance !== "undefined" ? performance.now() : Date.now();
 
     try {
       await streamChatCompletion({
@@ -703,20 +763,94 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         model: modelId,
         messages: requestHistory,
         signal: controller.signal,
+        onUsage: (usage) => {
+          if (!isMountedRef.current || abortControllerRef.current !== controller) {
+            return;
+          }
+          if (usage.completionTokens > 0) {
+            reportedCompletionTokens = usage.completionTokens;
+          }
+          setMessages((prev) =>
+            prev.map((item) =>
+              item.id === assistantMsgId && usage.completionTokens > 0
+                ? { ...item, tokenCount: usage.completionTokens }
+                : item
+            )
+          );
+        },
         onToken: (token) => {
           if (!isMountedRef.current || abortControllerRef.current !== controller) {
             return;
           }
           receivedAnyToken = true;
+          streamedChunkCount += 1;
+          const elapsedSec = Math.max(
+            0.05,
+            ((typeof performance !== "undefined" ? performance.now() : Date.now()) -
+              streamStartedAt) /
+              1000
+          );
+          const instantTps = Math.round((streamedChunkCount / elapsedSec) * 10) / 10;
+          setLatestTokensPerSec(instantTps);
           setMessages((prev) =>
-            prev.map((item) =>
-              item.id === assistantMsgId
-                ? { ...item, content: `${item.content}${token}` }
-                : item
-            )
+            prev.map((item) => {
+              if (item.id !== assistantMsgId) {
+                return item;
+              }
+              const nextContent = `${item.content}${token}`;
+              const parsed = parseThinkingContent(nextContent, true);
+              const nextTokens =
+                reportedCompletionTokens ??
+                Math.max(streamedChunkCount, estimateTokenCount(nextContent));
+              return {
+                ...item,
+                content: nextContent,
+                tokenCount: nextTokens,
+                ...(parsed.hasThinking
+                  ? { thinkingTokenCount: estimateTokenCount(parsed.thinking) }
+                  : {}),
+                tokensPerSec: instantTps,
+              };
+            })
           );
         },
       });
+      if (isMountedRef.current && abortControllerRef.current === controller) {
+        const finalElapsedSec = Math.max(
+          0.05,
+          ((typeof performance !== "undefined" ? performance.now() : Date.now()) -
+            streamStartedAt) /
+            1000
+        );
+        setMessages((prev) =>
+          prev.map((item) => {
+            if (item.id !== assistantMsgId) {
+              return item;
+            }
+            const parsed = parseThinkingContent(item.content, false);
+            const finalCompletionTokens =
+              reportedCompletionTokens ??
+              (streamedChunkCount > 1
+                ? streamedChunkCount
+                : estimateTokenCount(item.content));
+            const finalTps =
+              streamedChunkCount > 0
+                ? Math.round((finalCompletionTokens / finalElapsedSec) * 10) / 10
+                : item.tokensPerSec;
+            if (finalTps) {
+              setLatestTokensPerSec(finalTps);
+            }
+            return {
+              ...item,
+              tokenCount: finalCompletionTokens,
+              ...(parsed.hasThinking
+                ? { thinkingTokenCount: estimateTokenCount(parsed.thinking) }
+                : {}),
+              ...(finalTps ? { tokensPerSec: finalTps } : {}),
+            };
+          })
+        );
+      }
     } catch (err) {
       if (!isMountedRef.current || abortControllerRef.current !== controller) {
         return;
@@ -786,6 +920,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       id: createMessageId("user"),
       role: "user",
       content: trimmed,
+      tokenCount: estimateTokenCount(trimmed),
       ...(pendingAttachments.length > 0 ? { attachments: pendingAttachments } : {}),
       createdAt: Date.now(),
     };
@@ -815,6 +950,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     const updatedUserMsg: ChatMessageItem = {
       ...msg,
       content: trimmed,
+      tokenCount: estimateTokenCount(trimmed),
     };
 
     setChatError(null);
@@ -823,6 +959,86 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       preserveUserOnPreTokenError: true,
     });
   };
+
+  const handleRetryAssistantMessage = async (assistantIdx: number): Promise<void> => {
+    if (isStreaming || !isModelReady) {
+      return;
+    }
+    let userIdx = -1;
+    for (let i = assistantIdx - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "user") {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx < 0) {
+      return;
+    }
+    const targetUserMsg = messages[userIdx];
+    const priorMessages = messages.slice(0, userIdx);
+    setChatError(null);
+    setEditingState(null, "");
+    await streamAssistantReply(priorMessages, targetUserMsg, {
+      preserveUserOnPreTokenError: true,
+    });
+  };
+
+  const sessionPromptTokens = messages.reduce(
+    (sum, item) =>
+      item.role === "user"
+        ? sum + (item.tokenCount ?? estimateTokenCount(item.content))
+        : sum,
+    0
+  );
+  const sessionCompletionTokens = messages.reduce(
+    (sum, item) =>
+      item.role === "assistant"
+        ? sum + (item.tokenCount ?? estimateTokenCount(item.content))
+        : sum,
+    0
+  );
+  const sessionTotalTokens = sessionPromptTokens + sessionCompletionTokens;
+
+  const normalizedRoomId = roomId.trim() || "public";
+  const effectiveSharedRam =
+    typeof sharedRamGb === "number" && Number.isFinite(sharedRamGb) && sharedRamGb > 0
+      ? sharedRamGb
+      : null;
+  const effectiveRoomTotalRam =
+    typeof roomTotalRamGb === "number" &&
+    Number.isFinite(roomTotalRamGb) &&
+    roomTotalRamGb > 0
+      ? Math.max(effectiveSharedRam ?? 0, roomTotalRamGb)
+      : effectiveSharedRam;
+  const ramTelemetryLabel =
+    effectiveSharedRam !== null && effectiveRoomTotalRam !== null
+      ? `${effectiveSharedRam} / ${effectiveRoomTotalRam} GB`
+      : effectiveSharedRam !== null
+        ? `${effectiveSharedRam} GB`
+        : "—";
+
+  const roomStatusText =
+    isModelReady && coveragePercent >= 100
+      ? "Ready (100%)"
+      : `Pooling (${Math.round(coveragePercent)}%)`;
+
+  const transportLabel = resolveConnectionTransportLabel({
+    activeTransport: activeP2pTransport,
+    networkStatus,
+    networkMode,
+    isSoloMode,
+    connectedPeersCount,
+    p2pQuicEnabled,
+    p2pDirectPeersCount,
+    relayConnected,
+  });
+
+  const networkSpeedLabel = formatNetworkSpeedSummary({
+    throughputMbps: p2pThroughputMbps,
+    rttMs: p2pRttMs,
+    tokensPerSec: latestTokensPerSec,
+    isSolo: transportLabel === "Local (Solo)",
+  });
 
   const handleSubmitForm = (event: React.FormEvent): void => {
     event.preventDefault();
@@ -903,6 +1119,48 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 •
               </span>
               <span data-testid="chat-window-key-status">API Key: Active</span>
+            </div>
+            <div className="chat-header-telemetry" data-testid="chat-header-telemetry">
+              <span
+                data-testid="chat-header-ram"
+                className="chat-telemetry-chip"
+                title="Contributed RAM / Total Room RAM"
+              >
+                RAM: <strong>{ramTelemetryLabel}</strong>
+              </span>
+              <span
+                data-testid="chat-header-room-status"
+                className={`chat-telemetry-chip ${
+                  isModelReady && coveragePercent >= 100
+                    ? "chat-telemetry-chip--ready"
+                    : "chat-telemetry-chip--warn"
+                }`}
+                title={`Room ${normalizedRoomId}`}
+              >
+                Room: <strong>{normalizedRoomId}</strong> ({roomStatusText}
+                {connectedPeersCount > 0 ? ` • ${connectedPeersCount} peers` : ""})
+              </span>
+              <span
+                data-testid="chat-header-transport"
+                className="chat-telemetry-chip"
+                title="Active P2P connection transport"
+              >
+                Via: <strong>{transportLabel}</strong>
+              </span>
+              <span
+                data-testid="chat-header-net-speed"
+                className="chat-telemetry-chip"
+                title="Measured P2P network throughput / latency and inference speed"
+              >
+                Speed: <strong>{networkSpeedLabel}</strong>
+              </span>
+              <span
+                data-testid="chat-header-session-tokens"
+                className="chat-telemetry-chip"
+                title={`Session tokens: ${sessionPromptTokens} prompt + ${sessionCompletionTokens} completion`}
+              >
+                Session: <strong>{formatTokenCount(sessionTotalTokens)}</strong>
+              </span>
             </div>
           </div>
 
@@ -1016,6 +1274,17 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               const canSaveEdit =
                 !isStreaming && isModelReady && (editingDraft.trim().length > 0 || hasAttachments);
               const isCopied = copiedMessageId === msg.id;
+              const parsedAssistant =
+                msg.role === "assistant"
+                  ? parseThinkingContent(msg.content, isLastStreamingAssistant)
+                  : null;
+              const isThinkingExpanded = expandedThinkingIds.has(msg.id);
+              const copyPayload =
+                parsedAssistant && parsedAssistant.hasThinking
+                  ? parsedAssistant.answer || msg.content
+                  : msg.content;
+              const msgTokenCount =
+                msg.tokenCount ?? estimateTokenCount(msg.content);
 
               return (
                 <div
@@ -1097,6 +1366,59 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                         </div>
                       ) : msg.role === "assistant" ? (
                         <div className="chat-bubble-content chat-bubble-content--markdown">
+                          {parsedAssistant?.hasThinking && (
+                            <div className="chat-thinking-block" data-testid="chat-thinking-block">
+                              <button
+                                type="button"
+                                data-testid="chat-thinking-toggle"
+                                className="chat-thinking-toggle"
+                                aria-expanded={isThinkingExpanded}
+                                onClick={() => handleToggleThinking(msg.id)}
+                              >
+                                <span className="chat-thinking-toggle-left">
+                                  <svg
+                                    width="12"
+                                    height="12"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2.2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    aria-hidden="true"
+                                    className={`chat-thinking-chevron${
+                                      isThinkingExpanded ? " expanded" : ""
+                                    }`}
+                                  >
+                                    <polyline points="9 18 15 12 9 6" />
+                                  </svg>
+                                  <span>
+                                    {parsedAssistant.isThinkingInProgress
+                                      ? "Thinking..."
+                                      : "Thought process"}
+                                  </span>
+                                </span>
+                                <span className="chat-thinking-meta">
+                                  {formatTokenCount(
+                                    msg.thinkingTokenCount ??
+                                      estimateTokenCount(parsedAssistant.thinking)
+                                  )}
+                                </span>
+                              </button>
+                              {isThinkingExpanded && (
+                                <div
+                                  className="chat-thinking-body"
+                                  data-testid="chat-thinking-content"
+                                >
+                                  <MarkdownMessage
+                                    content={parsedAssistant.thinking || "..."}
+                                    isStreaming={parsedAssistant.isThinkingInProgress}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          )}
+
                           {isLastStreamingAssistant && !msg.content ? (
                             <span
                               className="chat-thinking-indicator"
@@ -1107,6 +1429,26 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                               <span className="chat-thinking-dot" />
                               <span className="chat-thinking-dot" />
                             </span>
+                          ) : parsedAssistant?.hasThinking ? (
+                            parsedAssistant.answer ? (
+                              <MarkdownMessage
+                                content={parsedAssistant.answer}
+                                isStreaming={
+                                  isLastStreamingAssistant &&
+                                  !parsedAssistant.isThinkingInProgress
+                                }
+                              />
+                            ) : isLastStreamingAssistant ? (
+                              <span
+                                className="chat-thinking-indicator"
+                                data-testid="chat-thinking-indicator"
+                                aria-label="AI is thinking"
+                              >
+                                <span className="chat-thinking-dot" />
+                                <span className="chat-thinking-dot" />
+                                <span className="chat-thinking-dot" />
+                              </span>
+                            ) : null
                           ) : (
                             <MarkdownMessage
                               content={msg.content}
@@ -1115,7 +1457,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                           )}
                         </div>
                       ) : (
-                        <div className="chat-bubble-content">{msg.content}</div>
+                        <div className="chat-bubble-content chat-bubble-content--markdown">
+                          <MarkdownMessage content={msg.content} />
+                        </div>
                       )}
                     </div>
 
@@ -1124,24 +1468,103 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                         <button
                           type="button"
                           data-testid="chat-copy-msg-btn"
-                          className={`chat-msg-action-btn${isCopied ? " copied" : ""}`}
+                          data-copied={isCopied ? "true" : "false"}
+                          className={`chat-msg-action-btn chat-msg-action-btn--icon${
+                            isCopied ? " copied" : ""
+                          }`}
                           aria-label={isCopied ? "Copied message" : "Copy message"}
-                          onClick={() => void handleCopyMessage(msg.id, msg.content)}
+                          title={isCopied ? "Copied" : "Copy"}
+                          onClick={() => void handleCopyMessage(msg.id, copyPayload)}
                         >
-                          {isCopied ? "Copied" : "Copy"}
+                          {isCopied ? (
+                            <svg
+                              width="13"
+                              height="13"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2.2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                          ) : (
+                            <svg
+                              width="13"
+                              height="13"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                            </svg>
+                          )}
                         </button>
                         {msg.role === "user" && (
                           <button
                             type="button"
                             data-testid="chat-edit-msg-btn"
-                            className="chat-msg-action-btn"
+                            className="chat-msg-action-btn chat-msg-action-btn--icon"
                             aria-label="Edit message"
+                            title="Edit"
                             disabled={isStreaming || !isModelReady}
                             onClick={() => handleStartEdit(msg)}
                           >
-                            Edit
+                            <svg
+                              width="13"
+                              height="13"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <path d="M12 20h9" />
+                              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                            </svg>
                           </button>
                         )}
+                        {msg.role === "assistant" && (
+                          <button
+                            type="button"
+                            data-testid="chat-retry-msg-btn"
+                            className="chat-msg-action-btn chat-msg-action-btn--icon"
+                            aria-label="Retry response"
+                            title="Retry"
+                            disabled={isStreaming || !isModelReady}
+                            onClick={() => void handleRetryAssistantMessage(idx)}
+                          >
+                            <svg
+                              width="13"
+                              height="13"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              aria-hidden="true"
+                            >
+                              <polyline points="1 4 1 10 7 10" />
+                              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+                            </svg>
+                          </button>
+                        )}
+                        <span data-testid="chat-msg-tokens" className="chat-msg-tokens">
+                          {formatTokenCount(msgTokenCount)}
+                          {msg.role === "assistant" && msg.tokensPerSec
+                            ? ` • ${msg.tokensPerSec.toFixed(1)} tok/s`
+                            : ""}
+                        </span>
                       </div>
                     )}
                   </div>

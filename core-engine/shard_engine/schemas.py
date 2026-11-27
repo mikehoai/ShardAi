@@ -424,6 +424,17 @@ class NodeStatusResponse(BaseModel):
     p2p_quic_enabled: bool = False
     p2p_endpoint_id: str | None = None
     p2p_direct_peers_count: int = 0
+    room_total_shared_ram_gb: float = 0.0
+    p2p_rtt_ms: float | None = None
+    p2p_throughput_mbps: float | None = None
+    active_p2p_transport: Literal[
+        "solo",
+        "lan_direct",
+        "quic_direct",
+        "quic_relay",
+        "ws_relay",
+        "tcp_direct",
+    ] | None = None
     message: str = ""
 
 

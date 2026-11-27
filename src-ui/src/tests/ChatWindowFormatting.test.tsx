@@ -11,7 +11,10 @@ interface ChatRequestBody {
   }>;
 }
 
-function createSseResponse(chunks: string[]): Response {
+function createSseResponse(
+  chunks: string[],
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
+): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -20,6 +23,16 @@ function createSseResponse(chunks: string[]): Response {
           encoder.encode(
             `data: ${JSON.stringify({
               choices: [{ delta: { content: chunk } }],
+            })}\n\n`
+          )
+        );
+      }
+      if (usage) {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              choices: [{ delta: {}, finish_reason: "stop" }],
+              usage,
             })}\n\n`
           )
         );
@@ -190,7 +203,11 @@ describe("ChatWindow Markdown Formatting, Copy & Inline Edit", () => {
 
   it("renders Copy action below both user and assistant messages and resets feedback after 1800ms", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      createSseResponse(["Assistant **markdown** reply"])
+      createSseResponse(["Assistant **markdown** reply"], {
+        prompt_tokens: 6,
+        completion_tokens: 14,
+        total_tokens: 20,
+      })
     );
 
     render(
@@ -223,8 +240,9 @@ describe("ChatWindow Markdown Formatting, Copy & Inline Edit", () => {
       await Promise.resolve();
     });
     expect(writeTextMock).toHaveBeenCalledWith("Hello user prompt");
-    expect(copyButtons[0].textContent).toBe("Copied");
-    expect(copyButtons[1].textContent).toBe("Copy");
+    expect(copyButtons[0].getAttribute("data-copied")).toBe("true");
+    expect(copyButtons[0].getAttribute("aria-label")).toBe("Copied message");
+    expect(copyButtons[1].getAttribute("data-copied")).toBe("false");
 
     // Copy assistant message (raw markdown content)
     await act(async () => {
@@ -232,13 +250,14 @@ describe("ChatWindow Markdown Formatting, Copy & Inline Edit", () => {
       await Promise.resolve();
     });
     expect(writeTextMock).toHaveBeenCalledWith("Assistant **markdown** reply");
-    expect(copyButtons[1].textContent).toBe("Copied");
-    expect(copyButtons[0].textContent).toBe("Copy");
+    expect(copyButtons[1].getAttribute("data-copied")).toBe("true");
+    expect(copyButtons[0].getAttribute("data-copied")).toBe("false");
 
     act(() => {
       vi.advanceTimersByTime(1800);
     });
-    expect(copyButtons[1].textContent).toBe("Copy");
+    expect(copyButtons[1].getAttribute("data-copied")).toBe("false");
+    expect(copyButtons[1].getAttribute("aria-label")).toBe("Copy message");
   });
 
   it("opens inline edit textarea and cancels edit on Escape without closing ChatWindow", async () => {
@@ -448,5 +467,104 @@ describe("ChatWindow Markdown Formatting, Copy & Inline Edit", () => {
     );
 
     expect((screen.getByTestId("chat-edit-msg-btn") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("renders user Markdown, collapsible DeepSeek thinking header, Retry icon, token counts, and header telemetry", async () => {
+    let callCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return createSseResponse(
+          [
+            "<think>\nCheck **constraints** carefully.\n</think>\n\n",
+            "Final **answer** is ready.",
+          ],
+          { prompt_tokens: 10, completion_tokens: 18, total_tokens: 28 }
+        );
+      }
+      return createSseResponse(["Regenerated **clean** response."], {
+        prompt_tokens: 10,
+        completion_tokens: 9,
+        total_tokens: 19,
+      });
+    });
+
+    render(
+      <ChatWindow
+        isOpen={true}
+        isModelReady={true}
+        coveragePercent={100}
+        apiBaseUrl="http://127.0.0.1:8000/v1"
+        sessionToken="sk-think-test"
+        modelId="bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF"
+        roomId="team-deepseek"
+        sharedRamGb={4}
+        roomTotalRamGb={8}
+        connectedPeersCount={1}
+        activeP2pTransport="quic_direct"
+        p2pRttMs={22}
+        p2pThroughputMbps={45.2}
+        onClose={vi.fn()}
+      />
+    );
+
+    // Header telemetry bar shows RAM, room, transport, speed, and initial session tokens
+    expect(screen.getByTestId("chat-header-ram").textContent).toContain("4 / 8 GB");
+    expect(screen.getByTestId("chat-header-room-status").textContent).toContain(
+      "team-deepseek"
+    );
+    expect(screen.getByTestId("chat-header-transport").textContent).toContain(
+      "QUIC P2P (Direct)"
+    );
+    expect(screen.getByTestId("chat-header-net-speed").textContent).toContain(
+      "45.2 Mbps • 22 ms"
+    );
+    expect(screen.getByTestId("chat-header-session-tokens").textContent).toContain("0 tok");
+
+    fireEvent.change(screen.getByTestId("chat-input"), {
+      target: { value: "Explain **quarks** and `gluons`" },
+    });
+    fireEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-thinking-toggle")).toBeTruthy();
+    });
+
+    // User message rendered as Markdown (<strong> and <code>)
+    const userBubble = screen.getByTestId("chat-message-user");
+    expect(userBubble.querySelector("strong")?.textContent).toBe("quarks");
+    expect(userBubble.querySelector("code.chat-md-inline-code")?.textContent).toBe("gluons");
+
+    // Thinking block is collapsed by default; answer renders directly
+    const assistantBubble = screen.getByTestId("chat-message-assistant");
+    expect(assistantBubble.textContent).toContain("Final answer is ready.");
+    expect(screen.queryByTestId("chat-thinking-content")).toBeNull();
+    expect(screen.getByTestId("chat-thinking-toggle").getAttribute("aria-expanded")).toBe(
+      "false"
+    );
+
+    // Clicking the thinking toggle expands the reasoning block
+    fireEvent.click(screen.getByTestId("chat-thinking-toggle"));
+    expect(screen.getByTestId("chat-thinking-toggle").getAttribute("aria-expanded")).toBe(
+      "true"
+    );
+    expect(screen.getByTestId("chat-thinking-content").textContent).toContain(
+      "Check constraints carefully."
+    );
+
+    // Per-message token badges & session token counter updated from SSE usage (8 + 18 = 26)
+    const tokenBadges = screen.getAllByTestId("chat-msg-tokens");
+    expect(tokenBadges).toHaveLength(2);
+    expect(tokenBadges[1].textContent).toContain("18 tok");
+    expect(screen.getByTestId("chat-header-session-tokens").textContent).toContain("26 tok");
+
+    // Retry icon button regenerates assistant reply cleanly
+    fireEvent.click(screen.getByTestId("chat-retry-msg-btn"));
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-message-assistant").textContent).toContain(
+        "Regenerated clean response."
+      );
+    });
+    expect(screen.getAllByTestId("chat-msg-tokens")[1].textContent).toContain("9 tok");
   });
 });
