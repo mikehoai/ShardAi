@@ -30,6 +30,12 @@ import {
   type ModelTab,
 } from "./ModelSelector";
 import { ChatWindow } from "./ChatWindow";
+import {
+  assessNodeRamContribution,
+  calculateRoomRamEstimate,
+  formatGb,
+  resolveCatalogModelForRoom,
+} from "../utils/ramRequirements";
 
 const LOCAL_ENGINE_ROOT = "http://127.0.0.1:8000";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000/v1";
@@ -416,6 +422,8 @@ export const Dashboard: React.FC = () => {
   const [coveragePercent, setCoveragePercent] = useState<number>(0);
   const [isSwarmReady, setIsSwarmReady] = useState<boolean>(false);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
+  const [p2pQuicEnabled, setP2pQuicEnabled] = useState<boolean>(false);
+  const [p2pDirectPeersCount, setP2pDirectPeersCount] = useState<number>(0);
   const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
   const handleCloseChat = useCallback((): void => {
     setIsChatOpen(false);
@@ -818,6 +826,8 @@ export const Dashboard: React.FC = () => {
     setSsdOffloadActive(Boolean(statusData.ssd_offload_active));
     setModelFingerprint(statusData.model_fingerprint ?? null);
     setConnectedPeersCount(statusData.connected_peers_count ?? 0);
+    setP2pQuicEnabled(Boolean(statusData.p2p_quic_enabled));
+    setP2pDirectPeersCount(statusData.p2p_direct_peers_count ?? 0);
   };
 
   const resetSharingState = useCallback((): void => {
@@ -830,6 +840,8 @@ export const Dashboard: React.FC = () => {
     setSsdOffloadActive(false);
     setModelFingerprint(null);
     setConnectedPeersCount(0);
+    setP2pQuicEnabled(false);
+    setP2pDirectPeersCount(0);
     setDownloadProgress(null);
     setDownloadStatusMsg("");
   }, []);
@@ -1792,6 +1804,31 @@ export const Dashboard: React.FC = () => {
     return Boolean(matchedCatalog && isVisionModel(matchedCatalog));
   };
 
+  const selectedCatalogModel: CatalogModelItem | undefined =
+    modelTab === "catalog"
+      ? (catalogModels.find((m) => m.id === selectedCatalogId) ?? catalogModels[0])
+      : modelTab === "custom"
+        ? resolveCatalogModelForRoom(modelInput, catalogModels)
+        : undefined;
+  const mainRamAssessment =
+    selectedCatalogModel && selectedCatalogModel.estimated_ram_gb > 0
+      ? assessNodeRamContribution(selectedCatalogModel.estimated_ram_gb, sharedRamGb)
+      : null;
+
+  const modalSelectedCatalogModel: CatalogModelItem | undefined =
+    modalModelTab === "catalog"
+      ? (catalogModels.find((m) => m.id === modalSelectedCatalogId) ?? catalogModels[0])
+      : modalModelTab === "custom"
+        ? resolveCatalogModelForRoom(modalModel, catalogModels)
+        : undefined;
+  const modalRamAssessment =
+    modalSelectedCatalogModel && modalSelectedCatalogModel.estimated_ram_gb > 0
+      ? assessNodeRamContribution(modalSelectedCatalogModel.estimated_ram_gb, sharedRamGb)
+      : null;
+
+  const activeCatalogModel: CatalogModelItem | undefined =
+    resolveCatalogModelForRoom(activeModelId, catalogModels);
+
   const generatedInviteString: string = modalRoomKey.trim()
     ? `${modalRoomId.trim() || "room"} | ${modalRoomKey.trim()}`
     : modalRoomId.trim() || "public";
@@ -2374,6 +2411,91 @@ export const Dashboard: React.FC = () => {
                     <span>{maxRamGb} GB</span>
                   </div>
 
+                  {mainRamAssessment !== null && (
+                    <div
+                      data-testid="ram-requirement-card"
+                      style={{
+                        marginTop: "10px",
+                        padding: "9px 10px",
+                        borderRadius: "6px",
+                        backgroundColor:
+                          mainRamAssessment.status === "solo_stable"
+                            ? "var(--success-bg)"
+                            : mainRamAssessment.status === "insufficient"
+                              ? "var(--danger-soft)"
+                              : mainRamAssessment.status === "swarm_needed" && allowSsdOffload
+                                ? "var(--info-bg)"
+                                : "var(--warn-bg)",
+                        border: `1px solid ${
+                          mainRamAssessment.status === "solo_stable"
+                            ? "var(--success-border)"
+                            : mainRamAssessment.status === "insufficient"
+                              ? "var(--danger)"
+                              : mainRamAssessment.status === "swarm_needed" && allowSsdOffload
+                                ? "var(--info-border)"
+                                : "var(--warn-border)"
+                        }`,
+                        color:
+                          mainRamAssessment.status === "solo_stable"
+                            ? "var(--success-fg)"
+                            : mainRamAssessment.status === "insufficient"
+                              ? "var(--danger)"
+                              : mainRamAssessment.status === "swarm_needed" && allowSsdOffload
+                                ? "var(--info-fg)"
+                                : "var(--warn-fg)",
+                        fontSize: "11.5px",
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      <div
+                        title={`Formula: Model (${formatGb(mainRamAssessment.modelSizeGb)}) + 10% KV/safety + ${formatGb(mainRamAssessment.perNodeOverheadGb)}/node overhead + shard rounding slack`}
+                        style={{
+                          display: "flex",
+                          flexWrap: "wrap",
+                          gap: "8px",
+                          fontWeight: 600,
+                          marginBottom: "4px",
+                        }}
+                      >
+                        <span>Model: ~{formatGb(mainRamAssessment.modelSizeGb)}</span>
+                        <span>•</span>
+                        <span>Solo Stable: {formatGb(mainRamAssessment.soloStableGb)}</span>
+                        <span>•</span>
+                        <span>2-Node Room: {formatGb(mainRamAssessment.twoNodeStableGb)}</span>
+                      </div>
+                      <div data-testid="ram-readiness-status">
+                        {mainRamAssessment.status === "solo_stable" && (
+                          <span>
+                            Solo-ready: Your {sharedRamGb} GB covers 100% of layers with stability margin.
+                          </span>
+                        )}
+                        {mainRamAssessment.status === "solo_tight" && (
+                          <span>
+                            Tight solo fit: Covers 100% of layers, but recommend{" "}
+                            {mainRamAssessment.soloSliderGb} GB (or 1 peer) for smooth KV-cache growth.
+                          </span>
+                        )}
+                        {mainRamAssessment.status === "swarm_needed" && (
+                          <span>
+                            Swarm required: Your {sharedRamGb} GB covers ~
+                            {mainRamAssessment.estimatedCoveragePct}% of layers. Needs ~
+                            {formatGb(mainRamAssessment.targetRoomStableGb)} total across{" "}
+                            {mainRamAssessment.targetPeers} peers (+
+                            {formatGb(mainRamAssessment.remainingRamForTargetRoomGb)} more from peers).
+                            {allowSsdOffload ? " SSD offload enabled for slow Solo fallback." : ""}
+                          </span>
+                        )}
+                        {mainRamAssessment.status === "insufficient" && (
+                          <span>
+                            Too low for this model: Per-node runtime/KV overhead uses ~
+                            {formatGb(mainRamAssessment.perNodeOverheadGb)}. Increase shared RAM or
+                            choose a smaller model.
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   <label
                     htmlFor="ssd-offload-checkbox"
                     style={{
@@ -2726,6 +2848,20 @@ export const Dashboard: React.FC = () => {
                                 const coverage = room.coverage_percent ?? 100;
                                 const redundancy = room.redundancy_factor ?? 1;
                                 const isReady = coverage >= 100;
+                                const roomCatalogModel = resolveCatalogModelForRoom(
+                                  room.model,
+                                  catalogModels
+                                );
+                                const roomRamEstimate =
+                                  roomCatalogModel && roomCatalogModel.estimated_ram_gb > 0
+                                    ? calculateRoomRamEstimate(
+                                        roomCatalogModel.estimated_ram_gb,
+                                        Math.max(1, room.nodes_online)
+                                      )
+                                    : null;
+                                const roomRamMeetsStable =
+                                  roomRamEstimate !== null &&
+                                  room.total_shared_ram_gb >= roomRamEstimate.stableRoomRamGb;
                                 return (
                                   <tr key={room.room_id}>
                                     <td
@@ -2752,7 +2888,24 @@ export const Dashboard: React.FC = () => {
                                       )}
                                     </td>
                                     <td>{room.nodes_online}</td>
-                                    <td>{room.total_shared_ram_gb} GB</td>
+                                    <td data-testid={`room-ram-cell-${room.room_id}`}>
+                                      <div>{room.total_shared_ram_gb} GB</div>
+                                      {roomRamEstimate !== null && (
+                                        <div
+                                          data-testid={`room-ram-target-${room.room_id}`}
+                                          title={`Estimated stable RAM for ${roomRamEstimate.nodeCount} node(s): ~${formatGb(roomRamEstimate.stableRoomRamGb)} (includes ~${formatGb(roomRamEstimate.perNodeOverheadGb)}/node KV & runtime overhead)`}
+                                          style={{
+                                            fontSize: "10.5px",
+                                            fontWeight: 600,
+                                            color: roomRamMeetsStable
+                                              ? "var(--success-fg)"
+                                              : "var(--warn-fg)",
+                                          }}
+                                        >
+                                          / ~{formatGb(roomRamEstimate.stableRoomRamGb)} stable
+                                        </div>
+                                      )}
+                                    </td>
                                     <td>
                                       <span
                                         data-testid={`room-coverage-${room.room_id}`}
@@ -2960,6 +3113,46 @@ export const Dashboard: React.FC = () => {
                         }
                       />
 
+                      {modalRamAssessment !== null && (
+                        <div
+                          data-testid="modal-ram-requirement-hint"
+                          style={{
+                            marginBottom: "12px",
+                            padding: "7px 10px",
+                            borderRadius: "6px",
+                            backgroundColor:
+                              modalRamAssessment.status === "solo_stable"
+                                ? "var(--success-bg)"
+                                : "var(--info-bg)",
+                            border: `1px solid ${
+                              modalRamAssessment.status === "solo_stable"
+                                ? "var(--success-border)"
+                                : "var(--info-border)"
+                            }`,
+                            color:
+                              modalRamAssessment.status === "solo_stable"
+                                ? "var(--success-fg)"
+                                : "var(--info-fg)",
+                            fontSize: "11.5px",
+                            lineHeight: 1.4,
+                          }}
+                        >
+                          <strong>
+                            Model ~{formatGb(modalRamAssessment.modelSizeGb)} • Solo Stable:{" "}
+                            {formatGb(modalRamAssessment.soloStableGb)} • 2-Node Room:{" "}
+                            {formatGb(modalRamAssessment.twoNodeStableGb)}
+                          </strong>{" "}
+                          {modalRamAssessment.status === "solo_stable" ? (
+                            <span>(Your {sharedRamGb} GB is Solo-ready)</span>
+                          ) : (
+                            <span>
+                              (+{formatGb(modalRamAssessment.remainingRamForTargetRoomGb)} needed
+                              from peers across {modalRamAssessment.targetPeers} nodes)
+                            </span>
+                          )}
+                        </div>
+                      )}
+
                       <label
                         style={{
                           display: "flex",
@@ -3116,6 +3309,24 @@ export const Dashboard: React.FC = () => {
                             }}
                           >
                             FP: {modelFingerprint.slice(0, 10)}
+                          </span>
+                        )}
+                        {p2pQuicEnabled && (
+                          <span
+                            data-testid="quic-p2p-badge"
+                            title="Direct NAT-traversing QUIC P2P transport active"
+                            style={{
+                              fontSize: "11px",
+                              fontWeight: 600,
+                              padding: "2px 8px",
+                              borderRadius: "999px",
+                              backgroundColor: "var(--success-bg)",
+                              color: "var(--success-fg)",
+                              border: "1px solid var(--success-border)",
+                            }}
+                          >
+                            ⚡ QUIC P2P
+                            {p2pDirectPeersCount > 0 ? ` (${p2pDirectPeersCount} direct)` : ""}
                           </span>
                         )}
                         {ssdOffloadActive && (
@@ -3330,6 +3541,23 @@ export const Dashboard: React.FC = () => {
                         >
                           Model not ready — Waiting for 100% RAM coverage (
                           {Math.round(coveragePercent)}%) before AI Chat is available.
+                          {activeCatalogModel && activeCatalogModel.estimated_ram_gb > 0 && (() => {
+                            const activeEstimate = calculateRoomRamEstimate(
+                              activeCatalogModel.estimated_ram_gb,
+                              Math.max(2, connectedPeersCount + 2)
+                            );
+                            return (
+                              <span
+                                data-testid="active-room-ram-hint"
+                                style={{ display: "block", marginTop: "4px", fontSize: "11px" }}
+                              >
+                                Recommended stable room RAM for {activeEstimate.nodeCount} peers: ~
+                                {formatGb(activeEstimate.stableRoomRamGb)} (includes ~
+                                {formatGb(activeEstimate.perNodeOverheadGb)}/node KV &amp; runtime
+                                overhead).
+                              </span>
+                            );
+                          })()}
                         </div>
                       )}
                     </div>

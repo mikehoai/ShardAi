@@ -30,6 +30,12 @@ import torch  # type: ignore[import-not-found]
 import torch.nn as nn  # type: ignore[import-not-found]
 import torch.nn.functional as F  # type: ignore[import-not-found]
 
+from models.ggml_native import (
+    NATIVE_QUANTIZED_GGML_TYPES,
+    GgmlNativeEngine,
+    GgmlWeightHandle,
+    is_ggml_native_enabled,
+)
 from models.gguf_reader import (
     _GGUF_MAGIC,
     _GGUF_TYPE_ARRAY,
@@ -76,7 +82,20 @@ GGML_TYPE_Q3_K = 11
 GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q5_K = 13
 GGML_TYPE_Q6_K = 14
+GGML_TYPE_IQ2_XXS = 16
+GGML_TYPE_IQ2_XS = 17
+GGML_TYPE_IQ3_XXS = 18
+GGML_TYPE_IQ1_S = 19
+GGML_TYPE_IQ4_NL = 20
+GGML_TYPE_IQ3_S = 21
+GGML_TYPE_IQ2_S = 22
+GGML_TYPE_IQ4_XS = 23
+GGML_TYPE_IQ1_M = 29
 GGML_TYPE_BF16 = 30
+
+_DENSE_GGML_TYPES: frozenset[int] = frozenset(
+    {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}
+)
 
 # ggml_type -> (block_elements, block_bytes)
 GGML_TYPE_INFO: dict[int, tuple[int, int]] = {
@@ -92,6 +111,15 @@ GGML_TYPE_INFO: dict[int, tuple[int, int]] = {
     GGML_TYPE_Q4_K: (256, 144),
     GGML_TYPE_Q5_K: (256, 176),
     GGML_TYPE_Q6_K: (256, 210),
+    GGML_TYPE_IQ2_XXS: (256, 66),
+    GGML_TYPE_IQ2_XS: (256, 74),
+    GGML_TYPE_IQ3_XXS: (256, 98),
+    GGML_TYPE_IQ1_S: (256, 50),
+    GGML_TYPE_IQ4_NL: (32, 18),
+    GGML_TYPE_IQ3_S: (256, 110),
+    GGML_TYPE_IQ2_S: (256, 82),
+    GGML_TYPE_IQ4_XS: (256, 136),
+    GGML_TYPE_IQ1_M: (256, 56),
     GGML_TYPE_BF16: (1, 2),
 }
 
@@ -167,6 +195,21 @@ class LoadedGgufShard:
     compute_dtype: torch.dtype
     device: torch.device = torch.device("cpu")
     materialized_tensors: int = 0
+    ggml_engine: Any | None = None
+    native_ggml_tensors: int = 0
+
+    def close(self) -> None:
+        """Release native GGML engine handles and tokenizer resources."""
+        if self.ggml_engine is not None:
+            close_engine = getattr(self.ggml_engine, "close", None)
+            if callable(close_engine):
+                close_engine()
+            self.ggml_engine = None
+        if self.tokenizer is not None:
+            close_tok = getattr(self.tokenizer, "close", None)
+            if callable(close_tok):
+                close_tok()
+            self.tokenizer = None
 
 
 _AUTO_ACCELERATOR_MIN_BYTES: int = 8 * 1024 * 1024
@@ -580,7 +623,10 @@ def _dequantize_blocks_u8(
             nb, block_elems
         )
     else:
-        raise ValueError(f"Unsupported GGML quantization type ID: {ggml_type}")
+        raise ValueError(
+            f"Unsupported GGML quantization type ID in PyTorch fallback: {ggml_type} "
+            "(enable native libggml backend for IQ quantization types)"
+        )
 
     return out.reshape(-1)
 
@@ -613,6 +659,20 @@ def _reverse_permute_rope_rows(tensor: torch.Tensor, n_head: int) -> torch.Tenso
     head_half = out_rows // n_head // 2
     rest = tensor.shape[1:]
     return tensor.reshape(n_head, head_half, 2, *rest).swapaxes(2, 1).reshape(tensor.shape)
+
+
+def _reverse_permute_rope_last_dim(tensor: torch.Tensor, n_head: int) -> torch.Tensor:
+    """Undo llama.cpp's interleaved RoPE head permutation along the last output dimension."""
+    out_dim = int(tensor.shape[-1])
+    if n_head <= 0 or out_dim % (2 * n_head) != 0:
+        return tensor
+    head_half = out_dim // n_head // 2
+    lead = tensor.shape[:-1]
+    return (
+        tensor.reshape(*lead, n_head, head_half, 2)
+        .swapaxes(-2, -1)
+        .reshape(tensor.shape)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -661,9 +721,30 @@ class GgufQuantizedLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
         self._cached_weight: torch.Tensor | None = None
+        self._ggml_engine: GgmlNativeEngine | None = None
+        self._ggml_handle: GgmlWeightHandle | None = None
+
+    def attach_ggml_engine(self, engine: GgmlNativeEngine) -> bool:
+        """Bind raw packed weights directly to a native `GgmlNativeEngine` without RAM expansion."""
+        if (
+            self._cached_weight is not None
+            or self.raw_weight.numel() == 0
+            or self.ggml_type not in NATIVE_QUANTIZED_GGML_TYPES
+        ):
+            return False
+        self._ggml_handle = engine.register_weight(
+            self.raw_weight,
+            self.out_features,
+            self.in_features,
+            self.ggml_type,
+        )
+        self._ggml_engine = engine
+        return True
 
     def materialize(self, dtype: torch.dtype, device: torch.device) -> int:
         """Pre-dequantize `raw_weight` onto `(device, dtype)` once and return net RAM byte delta."""
+        if self._ggml_handle is not None:
+            return 0
         if self._cached_weight is not None:
             if self._cached_weight.device == device and self._cached_weight.dtype == dtype:
                 return 0
@@ -697,10 +778,30 @@ class GgufQuantizedLinear(nn.Module):
         return new_bytes - old_raw_bytes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run linear projection from materialized weights or fall back to on-the-fly CPU dequantization."""
+        """Run linear projection via native libggml, materialized weights, or PyTorch dequant."""
         with torch.inference_mode():
             orig_device = x.device
             orig_dtype = x.dtype
+
+            if (
+                self._ggml_engine is not None
+                and self._ggml_handle is not None
+                and not self._ggml_engine.is_closed
+            ):
+                x_2d = (
+                    x.reshape(-1, self.in_features)
+                    .to(device="cpu", dtype=torch.float32)
+                    .contiguous()
+                )
+                out_np = self._ggml_engine.matmul(self._ggml_handle, x_2d.numpy())
+                out = torch.from_numpy(out_np).reshape(*x.shape[:-1], self.out_features)
+                if self.unpermute_heads is not None:
+                    out = _reverse_permute_rope_last_dim(out, self.unpermute_heads)
+                if self.bias is not None:
+                    out = out + self.bias.to(device="cpu", dtype=torch.float32)
+                if out.device != orig_device or out.dtype != orig_dtype:
+                    out = out.to(device=orig_device, dtype=orig_dtype)
+                return out
 
             if self._cached_weight is not None:
                 w = self._cached_weight
@@ -853,18 +954,22 @@ class GgufModelConfig:
     pad_token_id: int | None
 
 
+_KV_INITIAL_CAP: int = 256
+_KV_GROW_STEP: int = 256
+
+
 class GgufSimpleKVCache:
-    """Minimal layer-indexed KV-cache supporting partial shards (`shard_layer_start > 0`)."""
+    """Preallocated layer-indexed KV-cache supporting partial shards (`shard_layer_start > 0`)."""
 
     def __init__(self) -> None:
-        self._cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._cache: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Return cached sequence length for `layer_idx` (or 0 if unpopulated)."""
         entry = self._cache.get(layer_idx)
         if entry is None:
             return 0
-        return int(entry[0].shape[-2])
+        return int(entry[2])
 
     def update(
         self,
@@ -872,17 +977,58 @@ class GgufSimpleKVCache:
         value_states: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Append new key/value states for `layer_idx` and return concatenated `(k, v)`."""
+        """Append new key/value states for `layer_idx` into a growing buffer without O(N^2) copies."""
+        bsz, n_kv_heads, seq_len, head_dim = key_states.shape
         entry = self._cache.get(layer_idx)
         if entry is None:
-            k_out = key_states
-            v_out = value_states
-        else:
-            prev_k, prev_v = entry
-            k_out = torch.cat([prev_k, key_states], dim=-2)
-            v_out = torch.cat([prev_v, value_states], dim=-2)
-        self._cache[layer_idx] = (k_out, v_out)
-        return k_out, v_out
+            cap = max(_KV_INITIAL_CAP, seq_len + _KV_GROW_STEP)
+            k_buf = torch.empty(
+                (bsz, n_kv_heads, cap, head_dim),
+                dtype=key_states.dtype,
+                device=key_states.device,
+            )
+            v_buf = torch.empty(
+                (bsz, n_kv_heads, cap, head_dim),
+                dtype=value_states.dtype,
+                device=value_states.device,
+            )
+            k_buf[:, :, :seq_len, :] = key_states
+            v_buf[:, :, :seq_len, :] = value_states
+            self._cache[layer_idx] = (k_buf, v_buf, seq_len)
+            return k_buf[:, :, :seq_len, :], v_buf[:, :, :seq_len, :]
+
+        k_buf, v_buf, prev_len = entry
+        new_len = prev_len + seq_len
+        cap = int(k_buf.shape[-2])
+        if (
+            new_len > cap
+            or k_buf.device != key_states.device
+            or k_buf.dtype != key_states.dtype
+        ):
+            new_cap = max(new_len + _KV_GROW_STEP, cap * 2)
+            new_k = torch.empty(
+                (bsz, n_kv_heads, new_cap, head_dim),
+                dtype=key_states.dtype,
+                device=key_states.device,
+            )
+            new_v = torch.empty(
+                (bsz, n_kv_heads, new_cap, head_dim),
+                dtype=value_states.dtype,
+                device=value_states.device,
+            )
+            if prev_len > 0:
+                new_k[:, :, :prev_len, :] = k_buf[:, :, :prev_len, :].to(
+                    device=key_states.device, dtype=key_states.dtype
+                )
+                new_v[:, :, :prev_len, :] = v_buf[:, :, :prev_len, :].to(
+                    device=value_states.device, dtype=value_states.dtype
+                )
+            k_buf, v_buf = new_k, new_v
+
+        k_buf[:, :, prev_len:new_len, :] = key_states
+        v_buf[:, :, prev_len:new_len, :] = value_states
+        self._cache[layer_idx] = (k_buf, v_buf, new_len)
+        return k_buf[:, :, :new_len, :], v_buf[:, :, :new_len, :]
 
     def clear(self) -> None:
         """Release all cached key/value tensors."""
@@ -1851,11 +1997,48 @@ def load_gguf_pytorch_shard(
     for layer in kept_layers:
         decoder_linears.extend(_iter_layer_linears(layer))
 
-    decoder_elems = sum(lin.out_features * lin.in_features for lin in decoder_linears)
-    decoder_raw_bytes = sum(int(lin.raw_weight.numel()) for lin in decoder_linears)
+    all_quantized_linears: list[GgufQuantizedLinear] = [
+        lin for lin in [*decoder_linears, *([lm_head] if lm_head is not None else [])]
+        if lin.ggml_type in NATIVE_QUANTIZED_GGML_TYPES
+    ]
+
+    ggml_engine: GgmlNativeEngine | None = None
+    native_ggml_count = 0
+    if all_quantized_linears and is_ggml_native_enabled():
+        try:
+            ggml_engine = GgmlNativeEngine()
+        except Exception as exc:
+            logger.warning(
+                "Could not initialize native libggml engine (%s); falling back to PyTorch.",
+                exc,
+            )
+            ggml_engine = None
+
+    if ggml_engine is not None and ggml_engine.is_cpu and device is None:
+        # Keep activations on CPU in float32 to eliminate per-op GPU transfer overhead
+        target_device = torch.device("cpu")
+        compute_dtype = torch.float32
+        mat_dtype = torch.float32
+
+    if ggml_engine is not None:
+        for lin in all_quantized_linears:
+            if lin.attach_ggml_engine(ggml_engine):
+                native_ggml_count += 1
+        if native_ggml_count == 0:
+            ggml_engine.close()
+            ggml_engine = None
+
+    dense_linears = [
+        lin for lin in decoder_linears if lin._ggml_handle is None
+    ]
+    decoder_elems = sum(lin.out_features * lin.in_features for lin in dense_linears)
+    decoder_raw_bytes = sum(int(lin.raw_weight.numel()) for lin in dense_linears)
     non_decoder_bytes = kept_bytes
 
-    if target_device.type == "cuda":
+    if ggml_engine is not None and ggml_engine.is_cpu and device is None:
+        compute_dtype = torch.float32
+        mat_dtype = torch.float32
+    elif target_device.type == "cuda":
         bf16_supported = bool(
             hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
         )
@@ -1890,7 +2073,7 @@ def load_gguf_pytorch_shard(
     used_bytes = non_decoder_bytes
     elem_bytes = 4 if mat_dtype == torch.float32 else 2
     materialized_count = 0
-    for lin in decoder_linears:
+    for lin in dense_linears:
         projected_delta = (lin.out_features * lin.in_features * elem_bytes) - int(
             lin.raw_weight.numel()
         )
@@ -1911,6 +2094,7 @@ def load_gguf_pytorch_shard(
 
     if (
         lm_head is not None
+        and lm_head._ggml_handle is None
         and target_device.type != "mps"
         and lm_head.out_features <= _DEFAULT_LM_HEAD_CHUNK_ROWS
     ):
@@ -1929,11 +2113,13 @@ def load_gguf_pytorch_shard(
         param.requires_grad_(False)
 
     logger.info(
-        "GGUF shard %d..%d prepared on %s (dtype=%s, materialized=%d/%d linears, est_ram=%.1f MB)",
+        "GGUF shard %d..%d prepared on %s (dtype=%s, ggml_native=%s [%d linears], materialized=%d/%d, est_ram=%.1f MB)",
         clamped_start,
         clamped_end,
         target_device,
         compute_dtype,
+        ggml_engine.backend_kind if ggml_engine is not None else "off",
+        native_ggml_count,
         materialized_count,
         len(decoder_linears),
         used_bytes / (1024.0 * 1024.0),
@@ -1959,4 +2145,6 @@ def load_gguf_pytorch_shard(
         compute_dtype=compute_dtype,
         device=target_device,
         materialized_tensors=materialized_count,
+        ggml_engine=ggml_engine,
+        native_ggml_tensors=native_ggml_count,
     )

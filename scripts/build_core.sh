@@ -155,7 +155,9 @@ esac
     --hidden-import zeroconf._utils.ipaddress \
     --hidden-import zeroconf._handlers.answers \
     --hidden-import llama_cpp \
+    --hidden-import iroh \
     --collect-all llama_cpp \
+    --collect-all iroh \
     --collect-submodules zeroconf \
     --collect-submodules shard_engine \
     --collect-submodules models \

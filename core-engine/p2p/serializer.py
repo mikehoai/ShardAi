@@ -41,9 +41,11 @@ MAX_PROXIED_TOKENS: int = 4096
 # Automatically compress hidden states >= 32 KB or whenever socket RTT indicates congestion
 DEFAULT_COMPRESSION_THRESHOLD_BYTES: int = 32 * 1024
 
-# Codec flag bit encoding bfloat16 wire tensor truncation (50% wire bandwidth reduction)
+# Codec flag bits for wire tensor compression (50% BF16 / 75% INT8 wire bandwidth reduction)
 TENSOR_DTYPE_BFLOAT16_FLAG: int = 0x40
+TENSOR_DTYPE_INT8_FLAG: int = 0x80
 AUTO_BF16_WIRE_MIN_BYTES: int = 16 * 1024
+AUTO_INT8_WIRE_MIN_BYTES: int = 16 * 1024
 
 
 class PacketType(IntEnum):
@@ -141,6 +143,7 @@ class ActivationFrame:
     compression_used: CompressionCodec
     temperature: float = DEFAULT_TEMPERATURE
     wire_bfloat16: bool = False
+    wire_int8: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +217,46 @@ def bfloat16_bytes_to_float32_bytes(raw_bf16: bytes) -> bytes:
     bf16_u16 = np.frombuffer(raw_bf16, dtype="<u2")
     words_f32 = bf16_u16.astype("<u4") << np.uint32(16)
     return words_f32.tobytes()
+
+
+def float32_bytes_to_int8_wire(raw_f32: bytes, shape: tuple[int, int]) -> bytes:
+    """Quantize contiguous float32 hidden states to per-row symmetric INT8 (`scales || q_i8`)."""
+    rows, cols = int(shape[0]), int(shape[1])
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"Invalid tensor shape for INT8 wire quantization: {shape}")
+    expected_bytes = rows * cols * 4
+    if len(raw_f32) != expected_bytes:
+        raise ValueError(
+            f"Float32 buffer length ({len(raw_f32)} bytes) does not match shape {shape} "
+            f"({expected_bytes} bytes)."
+        )
+    mat = np.nan_to_num(
+        np.frombuffer(raw_f32, dtype="<f4").reshape(rows, cols),
+        nan=0.0,
+        posinf=65504.0,
+        neginf=-65504.0,
+    )
+    max_abs = np.max(np.abs(mat), axis=1, keepdims=True)
+    scales = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype("<f4")
+    quantized = np.clip(np.rint(mat / scales), -127.0, 127.0).astype(np.int8)
+    return scales.reshape(-1).tobytes() + quantized.tobytes()
+
+
+def int8_wire_to_float32_bytes(raw_int8: bytes, shape: tuple[int, int]) -> bytes:
+    """Dequantize per-row symmetric INT8 wire payload (`scales || q_i8`) back to float32."""
+    rows, cols = int(shape[0]), int(shape[1])
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"Invalid tensor shape for INT8 wire dequantization: {shape}")
+    scale_bytes = rows * 4
+    expected_bytes = scale_bytes + (rows * cols)
+    if len(raw_int8) != expected_bytes:
+        raise ValueError(
+            f"INT8 wire buffer length ({len(raw_int8)} bytes) does not match shape {shape} "
+            f"(expected {expected_bytes} bytes)."
+        )
+    scales = np.frombuffer(raw_int8[:scale_bytes], dtype="<f4").reshape(rows, 1)
+    quantized = np.frombuffer(raw_int8[scale_bytes:], dtype=np.int8).reshape(rows, cols)
+    return (quantized.astype(np.float32) * scales).astype("<f4").tobytes()
 
 
 def extract_contiguous_float32_bytes(
@@ -368,12 +411,13 @@ def serialize_activation_tensor(
     force_compression: bool = True,
     temperature: float = DEFAULT_TEMPERATURE,
     use_bfloat16_wire: bool = False,
+    use_int8_wire: bool = False,
 ) -> bytes:
     """Pack a hidden-state tensor and routing metadata into a compact binary byte stream.
 
     Automatically engages LZ4 or Zlib compression when `force_compression` is True,
-    `network_congested` is True, or the raw tensor size >= 32 KB. When `use_bfloat16_wire`
-    is True, float32 activations are converted to bfloat16 on the wire (50% bandwidth savings).
+    `network_congested` is True, or the raw tensor size >= 32 KB. Supports `use_int8_wire`
+    (75% wire reduction via per-row symmetric INT8) and `use_bfloat16_wire` (50% reduction).
     """
     validated_temperature: float = _validate_temperature(temperature)
     raw_bytes: bytes = extract_contiguous_float32_bytes(tensor_data)
@@ -382,12 +426,24 @@ def serialize_activation_tensor(
             f"Raw tensor buffer ({len(raw_bytes)} bytes) exceeds 64 MB maximum limit."
         )
 
+    wire_int8_active: bool = bool(
+        use_int8_wire
+        and shape[0] > 0
+        and shape[1] > 0
+        and len(raw_bytes) == (int(shape[0]) * int(shape[1]) * 4)
+    )
     wire_bf16_active: bool = bool(
-        use_bfloat16_wire and len(raw_bytes) >= 4 and (len(raw_bytes) % 4) == 0
+        not wire_int8_active
+        and use_bfloat16_wire
+        and len(raw_bytes) >= 4
+        and (len(raw_bytes) % 4) == 0
     )
-    tensor_bytes: bytes = (
-        float32_bytes_to_bfloat16_bytes(raw_bytes) if wire_bf16_active else raw_bytes
-    )
+    if wire_int8_active:
+        tensor_bytes: bytes = float32_bytes_to_int8_wire(raw_bytes, shape)
+    elif wire_bf16_active:
+        tensor_bytes = float32_bytes_to_bfloat16_bytes(raw_bytes)
+    else:
+        tensor_bytes = raw_bytes
     uncompressed_len: int = len(tensor_bytes)
 
     should_compress: bool = (
@@ -406,7 +462,12 @@ def serialize_activation_tensor(
         wire_payload = tensor_bytes
         codec = CompressionCodec.NONE
 
-    codec_flags: int = int(codec) | (TENSOR_DTYPE_BFLOAT16_FLAG if wire_bf16_active else 0)
+    dtype_flag = (
+        TENSOR_DTYPE_INT8_FLAG
+        if wire_int8_active
+        else (TENSOR_DTYPE_BFLOAT16_FLAG if wire_bf16_active else 0)
+    )
+    codec_flags: int = int(codec) | dtype_flag
     crc: int = zlib.crc32(wire_payload) & 0xFFFFFFFF
     req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
     origin_ip_bytes: bytes = socket.inet_aton(origin_ip)
@@ -432,15 +493,25 @@ def serialize_activation_tensor(
 
 
 def _decode_wire_tensor(
-    payload_slice: bytes, codec_val: int, uncompressed_len: int
-) -> tuple[bytes, CompressionCodec, bool]:
-    """Extract dtype/codec flags, bounded-decompress payload, and expand bfloat16 to float32."""
+    payload_slice: bytes,
+    codec_val: int,
+    uncompressed_len: int,
+    shape: tuple[int, int],
+) -> tuple[bytes, CompressionCodec, bool, bool]:
+    """Extract dtype/codec flags, bounded-decompress payload, and expand INT8/BF16 to float32."""
     is_bf16 = bool(codec_val & TENSOR_DTYPE_BFLOAT16_FLAG)
-    codec = CompressionCodec(codec_val & ~TENSOR_DTYPE_BFLOAT16_FLAG)
+    is_int8 = bool(codec_val & TENSOR_DTYPE_INT8_FLAG)
+    if is_bf16 and is_int8:
+        raise ValueError("Invalid P2P wire tensor flags: both BF16 and INT8 bits set.")
+    codec = CompressionCodec(
+        codec_val & ~(TENSOR_DTYPE_BFLOAT16_FLAG | TENSOR_DTYPE_INT8_FLAG)
+    )
     raw_wire = _decompress_buffer(payload_slice, codec, uncompressed_len)
+    if is_int8:
+        return int8_wire_to_float32_bytes(raw_wire, shape), codec, False, True
     if is_bf16:
-        return bfloat16_bytes_to_float32_bytes(raw_wire), codec, True
-    return raw_wire, codec, False
+        return bfloat16_bytes_to_float32_bytes(raw_wire), codec, True, False
+    return raw_wire, codec, False, False
 
 
 def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
@@ -489,8 +560,8 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         actual_crc: int = zlib.crc32(payload_slice) & 0xFFFFFFFF
         if actual_crc == expected_crc:
             validated_temperature: float = _validate_temperature(temperature)
-            raw_tensor, codec, wire_bfloat16 = _decode_wire_tensor(
-                payload_slice, codec_val, uncompressed_len
+            raw_tensor, codec, wire_bfloat16, wire_int8 = _decode_wire_tensor(
+                payload_slice, codec_val, uncompressed_len, (dim0, dim1)
             )
             return ActivationFrame(
                 request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
@@ -505,6 +576,7 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
                 compression_used=codec,
                 temperature=validated_temperature,
                 wire_bfloat16=wire_bfloat16,
+                wire_int8=wire_int8,
             )
         v2_crc_mismatch = (expected_crc, actual_crc)
 
@@ -540,8 +612,8 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
             f"(expected {reported_expected:#x}, got {reported_actual:#x})"
         )
 
-    raw_tensor, codec, wire_bfloat16 = _decode_wire_tensor(
-        legacy_payload_slice, codec_val, uncompressed_len
+    raw_tensor, codec, wire_bfloat16, wire_int8 = _decode_wire_tensor(
+        legacy_payload_slice, codec_val, uncompressed_len, (dim0, dim1)
     )
 
     return ActivationFrame(
@@ -557,6 +629,7 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         compression_used=codec,
         temperature=DEFAULT_TEMPERATURE,
         wire_bfloat16=wire_bfloat16,
+        wire_int8=wire_int8,
     )
 
 

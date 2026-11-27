@@ -55,9 +55,15 @@ from models.downloader import (
 from models.shard_runner import ShardModelRunner, messages_contain_image
 from p2p.discovery import ZEROCONF_AVAILABLE, is_zeroconf_enabled, zeroconf_discovery
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
+from p2p.quic_transport import (
+    QUIC_CONNECT_TIMEOUT_SECONDS,
+    IrohP2PTransport,
+    is_quic_p2p_enabled,
+)
 from p2p.relay_client import RelayClient
 from p2p.serializer import (
     AUTO_BF16_WIRE_MIN_BYTES,
+    AUTO_INT8_WIRE_MIN_BYTES,
     MAX_PROXIED_TOKENS,
     ActivationFrame,
     DecodedTokenFrame,
@@ -73,6 +79,7 @@ from p2p.serializer import (
 from p2p.transport import (
     PeerUnreachableError,
     congestion_monitor,
+    current_quic_peer_id,
     current_relay_source,
     dispatch_p2p_frame,
     receive_activations,
@@ -373,8 +380,22 @@ def _heartbeat_interval_seconds() -> float:
 
 _MAX_FAILOVER_TRACKED_PEERS: int = 256
 _MAX_CONCURRENT_PROXIED_TASKS: int = 16
-_PEER_ROUTE_TTL_SECONDS: float = 60.0
+_PEER_ROUTE_TTL_SECONDS: float = 300.0
 _MAX_PEER_ROUTES: int = 256
+
+
+def _is_lan_or_loopback_ip(ip: str) -> bool:
+    """Return True if `ip` is a loopback, private RFC1918/ULA, or link-local address."""
+    cleaned = ip.strip().split("%", 1)[0]
+    if not cleaned:
+        return True
+    if cleaned.lower() == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(cleaned)
+        return bool(addr.is_loopback or addr.is_private or addr.is_link_local)
+    except ValueError:
+        return False
 
 
 class LocalNodeRuntime:
@@ -449,6 +470,7 @@ class LocalNodeRuntime:
         self._promoted_peer_ids: dict[str, float] = {}
         self.public_ip: str | None = None
         self.relay_client: RelayClient = RelayClient()
+        self.quic_transport: IrohP2PTransport = IrohP2PTransport()
         self.upnp_mapper: UpnpPortMapper = UpnpPortMapper()
         self.upnp_mapped_port: int | None = None
         self._peer_routes: dict[str, tuple[str, float]] = {}
@@ -586,6 +608,21 @@ class LocalNodeRuntime:
         if self.model_runner is None or not self.model_runner.is_real_model:
             return False
         return len(raw_bytes) >= AUTO_BF16_WIRE_MIN_BYTES and (len(raw_bytes) % 4) == 0
+
+    def _should_use_int8_wire(self, raw_bytes: bytes) -> bool:
+        """Return True when hidden-state tensors should use per-row symmetric INT8 encoding."""
+        mode = os.getenv("SHARDAI_WIRE_QUANT", "auto").strip().lower()
+        if mode in {"fp32", "bf16", "off", "false", "0"}:
+            return False
+        if os.getenv("SHARDAI_WIRE_BF16", "true").lower() != "true" and mode == "auto":
+            return False
+        if self.model_runner is None or not self.model_runner.is_real_model:
+            return False
+        if len(raw_bytes) < AUTO_INT8_WIRE_MIN_BYTES or (len(raw_bytes) % 4) != 0:
+            return False
+        if mode == "int8":
+            return True
+        return self.network_mode == NetworkMode.INTERNET or congestion_monitor.is_congested
 
     def get_lifecycle_lock(self) -> asyncio.Lock:
         """Return the lifecycle serialization lock bound to the active event loop."""
@@ -794,16 +831,56 @@ class LocalNodeRuntime:
         timeout_seconds: float = 5.0,
         ack_timeout_seconds: float | None = None,
     ) -> float:
-        """Send a binary frame directly over TCP, falling back to relay only on `PeerUnreachableError`."""
+        """Send a binary frame across Iroh QUIC (hole-punched UDP + E2EE relay), TCP, or WS relay."""
         ack_wait = timeout_seconds if ack_timeout_seconds is None else ack_timeout_seconds
+        can_quic = bool(self.quic_transport.is_running and peer.p2p_ticket)
+        can_relay = bool(self.relay_client.is_connected)
         cached_route = self._get_cached_peer_route(peer.peer_id)
-        if cached_route == "relay" and self.relay_client.is_connected:
-            return await self.relay_client.send_frame(
+
+        if cached_route == "quic" and can_quic:
+            try:
+                rtt_ms = await self.quic_transport.send_frame(
+                    peer.p2p_ticket or "",
+                    frame,
+                    connect_timeout=max(timeout_seconds, QUIC_CONNECT_TIMEOUT_SECONDS),
+                    ack_timeout=ack_wait,
+                )
+                self._set_cached_peer_route(peer.peer_id, "quic")
+                return rtt_ms
+            except PeerUnreachableError:
+                self._peer_routes.pop(peer.peer_id, None)
+
+        if cached_route == "relay" and can_relay:
+            rtt_ms = await self.relay_client.send_frame(
                 peer.peer_id, frame, ack_timeout=ack_wait
             )
+            self._set_cached_peer_route(peer.peer_id, "relay")
+            return rtt_ms
+
+        prefer_quic = bool(
+            can_quic
+            and self.network_mode == NetworkMode.INTERNET
+            and not _is_lan_or_loopback_ip(peer.ip_address)
+        )
+        if prefer_quic:
+            try:
+                rtt_ms = await self.quic_transport.send_frame(
+                    peer.p2p_ticket or "",
+                    frame,
+                    connect_timeout=max(timeout_seconds, QUIC_CONNECT_TIMEOUT_SECONDS),
+                    ack_timeout=ack_wait,
+                )
+                self._set_cached_peer_route(peer.peer_id, "quic")
+                return rtt_ms
+            except PeerUnreachableError as quic_exc:
+                logger.warning(
+                    "Iroh QUIC unreachable for peer %s (%s); falling back to TCP/Relay.",
+                    peer.peer_id,
+                    quic_exc,
+                )
 
         direct_connect_timeout = (
-            min(2.0, timeout_seconds) if self.relay_client.is_connected else timeout_seconds
+            min(2.0, timeout_seconds) if (can_quic or can_relay) else timeout_seconds
         )
         send_kwargs: dict[str, Any] = {
             "peer_ip": peer.ip_address,
@@ -818,7 +895,19 @@ class LocalNodeRuntime:
             self._set_cached_peer_route(peer.peer_id, "direct")
             return rtt_ms
         except PeerUnreachableError:
-            if not self.relay_client.is_connected:
+            if can_quic and not prefer_quic:
+                try:
+                    rtt_ms = await self.quic_transport.send_frame(
+                        peer.p2p_ticket or "",
+                        frame,
+                        connect_timeout=max(timeout_seconds, QUIC_CONNECT_TIMEOUT_SECONDS),
+                        ack_timeout=ack_wait,
+                    )
+                    self._set_cached_peer_route(peer.peer_id, "quic")
+                    return rtt_ms
+                except PeerUnreachableError:
+                    pass
+            if not can_relay:
                 raise
             rtt_ms = await self.relay_client.send_frame(
                 peer.peer_id, frame, ack_timeout=ack_wait
@@ -848,15 +937,15 @@ class LocalNodeRuntime:
         ip: str,
         port: int,
         frame: bytes,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = 15.0,
         ack_timeout_seconds: float | None = None,
     ) -> float:
-        """Send a return frame to a peer via relay-aware routing when a matching peer exists."""
-        relay_src = current_relay_source.get()
+        """Send a return frame to a peer via QUIC/relay-aware routing when a matching peer exists."""
+        auth_src = current_quic_peer_id.get() or current_relay_source.get()
         peer: PeerNodeInfo | None = None
-        if relay_src is not None:
+        if auth_src is not None:
             for candidate in self.peers:
-                if candidate.peer_id == relay_src:
+                if candidate.peer_id == auth_src:
                     peer = candidate
                     break
         if peer is None:
@@ -892,6 +981,35 @@ class LocalNodeRuntime:
             )
         finally:
             current_relay_source.reset(token)
+
+    async def _handle_quic_frame(
+        self, frame_bytes: bytes, remote_endpoint_id: str
+    ) -> None:
+        """Authenticate an incoming QUIC frame by `p2p_endpoint_id` and dispatch it."""
+        matched_peer = next(
+            (p for p in self.peers if p.p2p_endpoint_id == remote_endpoint_id),
+            None,
+        )
+        if matched_peer is None:
+            logger.warning(
+                "Rejecting QUIC frame from unauthorized EndpointId %s.",
+                remote_endpoint_id,
+            )
+            raise RuntimeError(
+                f"Rejected QUIC frame from unauthorized endpoint {remote_endpoint_id}."
+            )
+        token = current_quic_peer_id.set(matched_peer.peer_id)
+        try:
+            await dispatch_p2p_frame(
+                frame_bytes=frame_bytes,
+                on_activation_frame=self.handle_incoming_activation,
+                on_token_frame=self.handle_incoming_decoded_token,
+                on_inference_request=self.handle_incoming_inference_request,
+                on_inference_error=self.handle_incoming_inference_error,
+                on_inference_heartbeat=self.handle_incoming_inference_heartbeat,
+            )
+        finally:
+            current_quic_peer_id.reset(token)
 
     async def _apply_tracker_assignment_network_info(
         self,
@@ -1015,25 +1133,39 @@ class LocalNodeRuntime:
                 return True
         return False
 
+    @staticmethod
+    def _get_authenticated_peer_id() -> str | None:
+        """Return the authenticated peer_id from active QUIC or Relay transport context."""
+        return current_quic_peer_id.get() or current_relay_source.get()
+
     def _is_authorized_peer_endpoint(self, ip: str, port: int) -> bool:
-        """Verify `(ip, port)` matches a registered peer in `self.peers`."""
+        """Verify `(ip, port)` or cryptographic QUIC/relay peer identity matches `self.peers`."""
         if not self.peers:
             return False
-        relay_src = current_relay_source.get()
-        if relay_src is not None and relay_src not in {p.peer_id for p in self.peers}:
-            return False
+        auth_peer_id = self._get_authenticated_peer_id()
+        if auth_peer_id is not None:
+            return auth_peer_id in {p.peer_id for p in self.peers}
         return self._matches_peer_endpoint(self.peers, ip, port)
 
     def _is_authorized_activation_origin(self, origin_ip: str, origin_port: int) -> bool:
-        """Verify `frame.origin_ip`/`origin_port` matches the head node or a verified peer."""
+        """Verify `frame.origin_ip`/`origin_port` or authenticated QUIC/relay peer identity."""
         if not self.peers:
             return False
-        relay_src = current_relay_source.get()
-        if relay_src is not None and relay_src not in {p.peer_id for p in self.peers}:
-            return False
-
         head_peers = [peer for peer in self.peers if peer.shard_layer_start == 0]
         allowed_peers = head_peers if head_peers else self.peers
+        auth_peer_id = self._get_authenticated_peer_id()
+        if auth_peer_id is not None:
+            sender_peer = next(
+                (p for p in self.peers if p.peer_id == auth_peer_id), None
+            )
+            if sender_peer is None:
+                return False
+            if self._matches_peer_endpoint(allowed_peers, origin_ip, origin_port):
+                return True
+            # Over NAT/CGNAT or dual-stack QUIC/relay, peer identity is already authenticated.
+            return any(p.peer_id == auth_peer_id for p in allowed_peers) or (
+                sender_peer.shard_layer_end < self.shard_layer_start
+            )
         return self._matches_peer_endpoint(allowed_peers, origin_ip, origin_port)
 
     async def handle_incoming_activation(self, frame: ActivationFrame) -> None:
@@ -1124,6 +1256,7 @@ class LocalNodeRuntime:
                 force_compression=True,
                 temperature=frame.temperature,
                 use_bfloat16_wire=self._should_use_bf16_wire(output_tensor_bytes),
+                use_int8_wire=self._should_use_int8_wire(output_tensor_bytes),
             )
             await self.send_with_failover(
                 completed_layer=completed_layer,
@@ -1279,7 +1412,7 @@ class LocalNodeRuntime:
                 ip=frame.requester_ip,
                 port=frame.requester_port,
                 frame=err_packet,
-                timeout_seconds=5.0,
+                timeout_seconds=15.0,
             )
             return
 
@@ -1317,7 +1450,7 @@ class LocalNodeRuntime:
                             ip=frame.requester_ip,
                             port=frame.requester_port,
                             frame=hb_packet,
-                            timeout_seconds=5.0,
+                            timeout_seconds=15.0,
                         )
                     except Exception:
                         break
@@ -1339,7 +1472,7 @@ class LocalNodeRuntime:
                     ip=frame.requester_ip,
                     port=frame.requester_port,
                     frame=err_packet,
-                    timeout_seconds=5.0,
+                    timeout_seconds=15.0,
                 )
             except Exception as err_send_exc:
                 logger.warning(
@@ -1377,7 +1510,7 @@ class LocalNodeRuntime:
                             ip=frame.requester_ip,
                             port=frame.requester_port,
                             frame=token_packet,
-                            timeout_seconds=5.0,
+                            timeout_seconds=15.0,
                         )
                     except Exception as send_exc:
                         send_failed = True
@@ -1406,7 +1539,7 @@ class LocalNodeRuntime:
                         ip=frame.requester_ip,
                         port=frame.requester_port,
                         frame=eos_packet,
-                        timeout_seconds=5.0,
+                        timeout_seconds=15.0,
                     )
                 except Exception as eos_send_exc:
                     send_failed = True
@@ -2045,6 +2178,7 @@ class LocalNodeRuntime:
                         last_step_err: Exception | None = None
                         failed_candidates: list[PeerNodeInfo] = []
                         use_bf16 = self._should_use_bf16_wire(hidden_bytes)
+                        use_int8 = self._should_use_int8_wire(hidden_bytes)
 
                         for idx, candidate in enumerate(candidates):
                             step_timeout = self.resolve_step_timeout(
@@ -2069,6 +2203,7 @@ class LocalNodeRuntime:
                                 force_compression=compress_activations,
                                 temperature=temperature,
                                 use_bfloat16_wire=use_bf16,
+                                use_int8_wire=use_int8,
                             )
                             self._drain_token_queue_for_step(
                                 token_queue,
@@ -2318,6 +2453,14 @@ class LocalNodeRuntime:
             return False, None
 
         max_layers = self._active_max_layers_can_hold or max(1, self.n_layers)
+        quic_kwargs: dict[str, str] = {}
+        if self.quic_transport.is_running:
+            ep_id = self.quic_transport.endpoint_id
+            ticket = self.quic_transport.get_ticket()
+            if ep_id:
+                quic_kwargs["p2p_endpoint_id"] = ep_id
+            if ticket:
+                quic_kwargs["p2p_ticket"] = ticket
         try:
             assignment = await self.tracker_client.register_node_with_assignment(
                 heartbeat_req,
@@ -2326,6 +2469,7 @@ class LocalNodeRuntime:
                 model_fingerprint=self.model_fingerprint,
                 room_key_hash=self.room_key_hash,
                 modality=self.modality,
+                **quic_kwargs,
             )
             if self.state != NodeState.RUNNING:
                 return False, None
@@ -2586,6 +2730,11 @@ class LocalNodeRuntime:
             public_ip=self.public_ip if is_running else None,
             upnp_mapped=(self.upnp_mapped_port is not None) if is_running else False,
             relay_connected=self.relay_client.is_connected if is_running else False,
+            p2p_quic_enabled=self.quic_transport.is_running if is_running else False,
+            p2p_endpoint_id=self.quic_transport.endpoint_id if is_running else None,
+            p2p_direct_peers_count=(
+                self.quic_transport.get_direct_peers_count() if is_running else 0
+            ),
             message=message,
         )
 
@@ -2672,6 +2821,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         runtime._active_max_layers_can_hold = 0
         runtime._last_heartbeat_at = 0.0
         await runtime.stop_coverage_monitor()
+        await runtime.quic_transport.stop()
         await runtime.relay_client.stop()
         try:
             await asyncio.wait_for(runtime.upnp_mapper.cleanup(), timeout=2.0)
@@ -3257,6 +3407,7 @@ async def _release_runtime_resources(target_state: NodeState) -> None:
     try:
         for cleanup_step in (
             runtime.stop_coverage_monitor,
+            runtime.quic_transport.stop,
             runtime.relay_client.stop,
             _cleanup_upnp_mapping_bounded,
             lan_mdns_service.stop_advertising,
@@ -3459,6 +3610,25 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                 runtime.upnp_mapped_port = bound_port if mapped else None
             except Exception:
                 runtime.upnp_mapped_port = None
+        if is_quic_p2p_enabled() and (
+            request.network_mode == NetworkMode.INTERNET
+            or os.getenv("SHARDAI_P2P_QUIC_LAN", "false").strip().lower() == "true"
+        ):
+            try:
+                quic_relay_mode: str | None = (
+                    "disabled"
+                    if (is_offline_mode() and not os.getenv("SHARDAI_IROH_RELAY_MODE"))
+                    else None
+                )
+                await runtime.quic_transport.start(
+                    on_frame=runtime._handle_quic_frame,
+                    relay_mode=quic_relay_mode,
+                )
+            except Exception as quic_exc:
+                logger.warning(
+                    "Could not start Iroh QUIC P2P transport (%s); continuing with TCP/Relay.",
+                    quic_exc,
+                )
         if request.node_id in ("shardai-client-01", "local-node-01"):
             host_slug = (
                 re.sub(r"[^A-Za-z0-9-]+", "-", socket.gethostname().split(".")[0]).strip("-")
@@ -3478,6 +3648,13 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             request.model_id,
             mmproj_filename=request.mmproj_filename,
         )
+        initial_quic_kwargs: dict[str, str] = {}
+        if runtime.quic_transport.is_running:
+            if runtime.quic_transport.endpoint_id:
+                initial_quic_kwargs["p2p_endpoint_id"] = runtime.quic_transport.endpoint_id
+            initial_ticket = runtime.quic_transport.get_ticket()
+            if initial_ticket:
+                initial_quic_kwargs["p2p_ticket"] = initial_ticket
         if _is_tracker_enabled() and request.network_mode == NetworkMode.INTERNET:
             try:
                 assignment: AnnounceAssignment = (
@@ -3487,6 +3664,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                         max_layers_can_hold=max_layers_can_hold,
                         model_fingerprint=initial_fingerprint,
                         modality=initial_modality,
+                        **initial_quic_kwargs,
                     )
                 )
                 latest_assignment = assignment
@@ -3686,6 +3864,15 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
             or final_end != target_end
         ):
             try:
+                post_quic_kwargs: dict[str, str] = {}
+                if runtime.quic_transport.is_running:
+                    if runtime.quic_transport.endpoint_id:
+                        post_quic_kwargs["p2p_endpoint_id"] = (
+                            runtime.quic_transport.endpoint_id
+                        )
+                    post_ticket = runtime.quic_transport.get_ticket()
+                    if post_ticket:
+                        post_quic_kwargs["p2p_ticket"] = post_ticket
                 post_assignment: AnnounceAssignment = (
                     await runtime.tracker_client.register_node_with_assignment(
                         request,
@@ -3693,6 +3880,7 @@ async def _start_node_unlocked(request: StartNodeRequest) -> NodeStatusResponse:
                         max_layers_can_hold=max_layers_can_hold,
                         model_fingerprint=model_fingerprint,
                         modality=post_download_modality,
+                        **post_quic_kwargs,
                     )
                 )
                 latest_assignment = post_assignment

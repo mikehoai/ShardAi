@@ -66,6 +66,15 @@ def _normalize_peer(
     if end_val is None:
         end_val = raw.get("shard_layer_end")
 
+    raw_ep_id = raw.get("p2p_endpoint_id")
+    clean_ep_id = (
+        raw_ep_id.strip() if isinstance(raw_ep_id, str) and raw_ep_id.strip() else None
+    )
+    raw_ticket = raw.get("p2p_ticket")
+    clean_ticket = (
+        raw_ticket.strip() if isinstance(raw_ticket, str) and raw_ticket.strip() else None
+    )
+
     return PeerNodeInfo(
         peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
         ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
@@ -75,6 +84,8 @@ def _normalize_peer(
         role=role,
         available_vram_mb=int(raw.get("available_vram_mb") or 0),
         room_id=str(raw.get("room_id") or default_room_id),
+        p2p_endpoint_id=clean_ep_id,
+        p2p_ticket=clean_ticket,
     )
 
 
@@ -316,6 +327,8 @@ class SignalingTrackerClient:
         model_fingerprint: str | None = None,
         room_key_hash: str | None = None,
         modality: str | None = None,
+        p2p_endpoint_id: str | None = None,
+        p2p_ticket: str | None = None,
     ) -> AnnounceAssignment:
         """Announce node capacity to `POST /announce` and receive Cloud layer assignment & role."""
         resolved_total_layers: int = total_model_layers or config.total_layers
@@ -330,6 +343,17 @@ class SignalingTrackerClient:
         headers: dict[str, str] | None = (
             {"X-Room-Key-Hash": effective_room_key_hash}
             if effective_room_key_hash is not None
+            else None
+        )
+
+        clean_ep_id = (
+            p2p_endpoint_id.strip()
+            if isinstance(p2p_endpoint_id, str) and p2p_endpoint_id.strip()
+            else None
+        )
+        clean_ticket = (
+            p2p_ticket.strip()
+            if isinstance(p2p_ticket, str) and p2p_ticket.strip()
             else None
         )
 
@@ -357,6 +381,8 @@ class SignalingTrackerClient:
             "source_type": config.source_type.value,
             **({"model_fingerprint": model_fingerprint} if model_fingerprint else {}),
             **({"modality": normalized_modality} if normalized_modality else {}),
+            **({"p2p_endpoint_id": clean_ep_id} if clean_ep_id else {}),
+            **({"p2p_ticket": clean_ticket} if clean_ticket else {}),
         }
         response_data: dict[str, Any] = await self._request_with_retry(
             method="POST",

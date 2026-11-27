@@ -24,7 +24,10 @@ from p2p.serializer import (
     serialize_decoded_token,
 )
 from p2p.transport import receive_activations, send_activations
-from shard_engine.memory_manager import calculate_max_layers
+from shard_engine.memory_manager import (
+    calculate_max_layers,
+    calculate_room_ram_requirements,
+)
 from shard_engine.schemas import NodeState, StartNodeRequest
 from shard_engine.tracker_client import SignalingTrackerClient, hash_room_key
 from tests._mock_runner import patch_start_node_runner
@@ -624,3 +627,51 @@ async def test_two_node_pytorch_p2p_pipeline_inference_over_tcp(tmp_path: Path) 
         tail_runner.release()
         assert head_runner.is_real_model is False
         assert tail_runner.is_real_model is False
+
+
+def test_room_ram_requirements_formula() -> None:
+    """Verify multi-node Room Stable RAM scales with per-node KV/runtime overhead and slack."""
+    # 5.5 GB DeepSeek-class 8B Q4_K_M across 1, 2, and 3 peers
+    solo = calculate_room_ram_requirements(
+        model_id="custom/deepseek-r1-8b-q4",
+        node_count=1,
+        model_size_gb=5.5,
+    )
+    two_peers = calculate_room_ram_requirements(
+        model_id="custom/deepseek-r1-8b-q4",
+        node_count=2,
+        model_size_gb=5.5,
+    )
+    three_peers = calculate_room_ram_requirements(
+        model_id="custom/deepseek-r1-8b-q4",
+        node_count=3,
+        model_size_gb=5.5,
+    )
+
+    assert solo.total_layers == 32
+    assert solo.per_node_overhead_gb == 0.6
+    assert solo.min_room_ram_gb == 6.1
+    assert solo.stable_room_ram_gb == 7.0
+    assert solo.recommended_slider_gb == 7
+
+    # 2 GB + 4 GB = 6.0 GB is below 2-peer minimum (6.87 GB) and stable target (7.5 GB)
+    assert two_peers.min_room_ram_gb == 6.87
+    assert two_peers.stable_room_ram_gb == 7.5
+    assert three_peers.min_room_ram_gb == 7.64
+    assert three_peers.stable_room_ram_gb == 8.5
+
+    # Small model (<= 1.5 GB) uses reduced 0.35 GB per-node overhead
+    small = calculate_room_ram_requirements(
+        model_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        node_count=2,
+        model_size_gb=0.6,
+    )
+    assert small.per_node_overhead_gb == 0.35
+    assert small.min_room_ram_gb < 1.5
+    assert small.stable_room_ram_gb <= 2.0
+
+    # Large 20 GB model scales monotonically with node count
+    large_2 = calculate_room_ram_requirements("qwen-2.5-coder-32b", node_count=2)
+    large_4 = calculate_room_ram_requirements("qwen-2.5-coder-32b", node_count=4)
+    assert large_4.min_room_ram_gb > large_2.min_room_ram_gb
+    assert large_4.stable_room_ram_gb > large_2.stable_room_ram_gb

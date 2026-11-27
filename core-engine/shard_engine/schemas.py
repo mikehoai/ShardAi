@@ -144,6 +144,14 @@ class PeerNodeInfo(BaseModel):
         default="public",
         description="Room identifier ('public' or custom private room passphrase)",
     )
+    p2p_endpoint_id: str | None = Field(
+        default=None,
+        description="Cryptographic Iroh QUIC EndpointId for NAT-traversed P2P",
+    )
+    p2p_ticket: str | None = Field(
+        default=None,
+        description="Self-contained Iroh EndpointTicket for QUIC hole punching and relay fallback",
+    )
 
 
 class StartNodeRequest(BaseModel):
@@ -413,6 +421,9 @@ class NodeStatusResponse(BaseModel):
     public_ip: str | None = None
     upnp_mapped: bool = False
     relay_connected: bool = False
+    p2p_quic_enabled: bool = False
+    p2p_endpoint_id: str | None = None
+    p2p_direct_peers_count: int = 0
     message: str = ""
 
 

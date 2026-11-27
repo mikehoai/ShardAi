@@ -5274,4 +5274,115 @@ describe("ShardAi Gateway & Network Rooms Lobby UI", () => {
       "C:/models/modal-invite.gguf"
     );
   });
+
+  it("displays recalculated Solo/Room RAM readiness card, Lobby target RAM, and Modal hint", async () => {
+    const catalogItems: CatalogModelItem[] = [
+      {
+        id: "deepseek-8b",
+        name: "DeepSeek-R1 Distill Llama 8B",
+        repo_id: "bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF",
+        filename: "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf",
+        estimated_ram_gb: 5.5,
+        enabled: true,
+      },
+      {
+        id: "qwen-05b",
+        name: "Qwen 2.5 0.5B",
+        repo_id: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        estimated_ram_gb: 0.6,
+        enabled: true,
+      },
+    ];
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (url.includes("/models/catalog")) {
+        return new Response(
+          JSON.stringify({
+            source: "cloud",
+            count: catalogItems.length,
+            models: catalogItems,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/available-rooms")) {
+        return new Response(
+          JSON.stringify([
+            {
+              room_id: "deepseek-duo-room",
+              model: "bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF",
+              nodes_online: 2,
+              total_shared_ram_gb: 6,
+              is_private: false,
+              network_scope: "internet",
+              coverage_percent: 84,
+              redundancy_factor: 1,
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/network-status")) {
+        return new Response(
+          JSON.stringify({
+            network_status: "online",
+            tracker_reachable: true,
+            tracker_url: "https://network.shardai.online",
+            lan_peers_count: 0,
+            zeroconf_available: false,
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/system/memory")) {
+        return new Response(
+          JSON.stringify({
+            total_ram_gb: 16,
+            available_ram_gb: 12,
+            max_shareable_ram_gb: 11,
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ state: "STOPPED", peers: [] }), { status: 200 });
+    });
+
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ram-requirement-card")).toBeTruthy();
+    });
+
+    const card = screen.getByTestId("ram-requirement-card");
+    expect(card.textContent).toContain("Model: ~5.5 GB");
+    expect(card.textContent).toContain("Solo Stable: 7 GB");
+    expect(card.textContent).toContain("2-Node Room: 7.5 GB");
+    expect(screen.getByTestId("ram-readiness-status").textContent).toContain(
+      "Swarm required"
+    );
+
+    // Sliding RAM to 7 GB flips the card to Solo-ready
+    const slider = screen.getByLabelText("Shared RAM Contribution") as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: "7" } });
+    expect(screen.getByTestId("ram-readiness-status").textContent).toContain("Solo-ready");
+
+    // Lobby room cell preserves 6 GB and shows recalculated stable target (7.5 GB for 2 nodes)
+    expect(screen.getByTestId("room-ram-cell-deepseek-duo-room").textContent).toContain(
+      "6 GB"
+    );
+    expect(screen.getByTestId("room-ram-target-deepseek-duo-room").textContent).toContain(
+      "~7.5 GB stable"
+    );
+
+    // Create Room modal also displays the RAM readiness hint
+    fireEvent.click(screen.getByTestId("create-room-modal-btn"));
+    const modalHint = await screen.findByTestId("modal-ram-requirement-hint");
+    expect(modalHint.textContent).toContain("Solo Stable: 7 GB");
+    expect(modalHint.textContent).toContain("2-Node Room: 7.5 GB");
+  });
 });

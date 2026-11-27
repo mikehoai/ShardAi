@@ -35,7 +35,8 @@ logger = logging.getLogger("shardai.p2p.relay")
 
 MAX_CONCURRENT_PARTIALS_PER_SOURCE: int = 8
 MAX_TRACKED_PARTIAL_SOURCES: int = 256
-PARTIAL_MESSAGE_TTL_SECONDS: float = 30.0
+PARTIAL_MESSAGE_TTL_SECONDS: float = 90.0
+DEFAULT_RELAY_SEND_CHUNK_BYTES: int = 128 * 1024
 MAX_CONCURRENT_INCOMING_TASKS: int = 64
 RELAY_RECONNECT_INITIAL_SECONDS: float = 1.0
 RELAY_RECONNECT_MAX_SECONDS: float = 30.0
@@ -263,7 +264,7 @@ class RelayClient:
         if not self.is_connected or self._node_id is None:
             raise PeerUnreachableError("Relay client is not connected")
 
-        chunks = split_into_chunks(frame)
+        chunks = split_into_chunks(frame, chunk_size=DEFAULT_RELAY_SEND_CHUNK_BYTES)
         msg_id = uuid.uuid4().bytes
         loop = asyncio.get_running_loop()
         ack_future: asyncio.Future[None] = loop.create_future()
@@ -500,7 +501,7 @@ class RelayClient:
                     additional_headers={"Authorization": f"Bearer {token}"},
                     max_size=RELAY_WS_MAX_SIZE_BYTES,
                     ping_interval=RELAY_WS_PING_INTERVAL_SECONDS,
-                    open_timeout=5.0,
+                    open_timeout=10.0,
                 ) as ws:
                     self._ws = ws
                     connected_at = time.monotonic()

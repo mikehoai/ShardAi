@@ -40,6 +40,9 @@ CONGESTION_RTT_THRESHOLD_MS: float = 25.0
 current_relay_source: ContextVar[str | None] = ContextVar(
     "current_relay_source", default=None
 )
+current_quic_peer_id: ContextVar[str | None] = ContextVar(
+    "current_quic_peer_id", default=None
+)
 
 
 class PeerUnreachableError(OSError):

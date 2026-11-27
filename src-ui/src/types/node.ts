@@ -55,6 +55,8 @@ export interface PeerNodeInfo {
   role?: PeerRole;
   available_vram_mb: number;
   room_id: string;
+  p2p_endpoint_id?: string | null;
+  p2p_ticket?: string | null;
 }
 
 export interface RoomLobbyItem {
@@ -128,6 +130,9 @@ export interface NodeStatusResponse {
   allocated_ram_mb: number;
   allocated_vram_mb: number;
   p2p_listen_port: number | null;
+  p2p_quic_enabled?: boolean;
+  p2p_endpoint_id?: string | null;
+  p2p_direct_peers_count?: number;
   connected_peers_count: number;
   peers: PeerNodeInfo[];
   session_token?: string | null;

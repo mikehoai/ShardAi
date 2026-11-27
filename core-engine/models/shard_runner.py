@@ -224,6 +224,7 @@ class ShardModelRunner:
         self._shard_container: Any | None = None
         self._compute_dtype: Any | None = None
         self._device: Any = "cpu"
+        self._ggml_engine: Any | None = None
         self._sessions: OrderedDict[str, _RequestSession] = OrderedDict()
 
         if hf_model is not None and hf_config is not None:
@@ -545,6 +546,7 @@ class ShardModelRunner:
         self._lm_head = loaded.lm_head
         self._compute_dtype = loaded.compute_dtype
         self._device = loaded.device
+        self._ggml_engine = loaded.ggml_engine
         self._tokenizer = loaded.tokenizer
         if self._tokenizer is not None:
             self._eos_token_ids = _extract_eos_token_ids(self._hf_config, self._tokenizer)
@@ -1090,6 +1092,12 @@ class ShardModelRunner:
         self._eos_token_ids.clear()
         self._is_real_pytorch = False
         self._use_simple_kv_cache = False
+        ggml_engine = self._ggml_engine
+        self._ggml_engine = None
+        if ggml_engine is not None:
+            close_engine = getattr(ggml_engine, "close", None)
+            if callable(close_engine):
+                close_engine()
 
         with self._native_lock:
             if self._native_handle is not None:

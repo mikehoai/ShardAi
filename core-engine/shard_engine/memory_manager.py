@@ -39,6 +39,117 @@ class LayerAllocationPlan:
     estimated_ram_mb: int
 
 
+@dataclass(frozen=True, slots=True)
+class RoomRamRequirements:
+    """Stable physical RAM budget required for a 1-node or N-node room without OS swap."""
+
+    model_id: str
+    model_size_gb: float
+    total_layers: int
+    node_count: int
+    per_node_overhead_gb: float
+    shard_rounding_slack_gb: float
+    safety_margin_gb: float
+    min_room_ram_gb: float
+    stable_room_ram_gb: float
+    recommended_slider_gb: int
+
+
+def _resolve_model_ram_metadata(
+    model_id: str,
+    model_size_gb: float | None = None,
+    total_layers: int | None = None,
+) -> tuple[float, int, float]:
+    """Resolve `(model_size_gb, total_layers, per_node_overhead_gb)` consistently."""
+    spec = SUPPORTED_MODELS.get(model_id)
+    if spec is not None:
+        resolved_size = (
+            float(model_size_gb)
+            if model_size_gb is not None and model_size_gb > 0
+            else float(spec.estimated_total_size_gb)
+        )
+        resolved_layers = (
+            int(total_layers)
+            if total_layers is not None and total_layers > 0
+            else int(spec.total_layers)
+        )
+        resolved_overhead = float(spec.base_overhead_gb)
+        return resolved_size, resolved_layers, resolved_overhead
+
+    catalog_match = next(
+        (
+            m
+            for m in DEFAULT_CATALOG_MODELS
+            if m.get("repo_id") == model_id or m.get("id") == model_id
+        ),
+        None,
+    )
+    resolved_size = (
+        float(model_size_gb)
+        if model_size_gb is not None and model_size_gb > 0
+        else (float(catalog_match["estimated_ram_gb"]) if catalog_match else 5.0)
+    )
+    if total_layers is not None and total_layers > 0:
+        resolved_layers = int(total_layers)
+    elif resolved_size <= 2.5:
+        resolved_layers = 24
+    elif resolved_size < 9.0:
+        resolved_layers = 32
+    elif resolved_size < 18.0:
+        resolved_layers = 40
+    else:
+        resolved_layers = 64
+
+    resolved_overhead = 0.35 if resolved_size <= 1.5 else 0.6
+    return resolved_size, resolved_layers, resolved_overhead
+
+
+def _ceil_half_gb(value: float) -> float:
+    """Round up `value` to the nearest 0.5 GB step."""
+    return math.ceil(value * 2.0 - 1e-9) / 2.0
+
+
+def calculate_room_ram_requirements(
+    model_id: str,
+    node_count: int = 1,
+    model_size_gb: float | None = None,
+    total_layers: int | None = None,
+) -> RoomRamRequirements:
+    """Calculate minimum and stable physical room RAM for a 1-node or N-node shard swarm.
+
+    With native `libggml` zero-copy quantized execution, weights remain compressed in RAM
+    (no BF16/FP32 weight expansion), while each peer incurs per-node KV-cache/runtime
+    overhead (`0.60 GB` or `0.35 GB` for <= 1.5 GB models) plus floor-rounding shard slack
+    for multi-node partitioning and a 10% KV-growth safety buffer.
+    """
+    safe_nodes = max(1, int(node_count))
+    resolved_size, resolved_layers, per_node_overhead = _resolve_model_ram_metadata(
+        model_id=model_id,
+        model_size_gb=model_size_gb,
+        total_layers=total_layers,
+    )
+    per_layer_gb = resolved_size / float(resolved_layers)
+    shard_rounding_slack = float(safe_nodes - 1) * per_layer_gb
+    safety_margin = max(0.2, 0.10 * resolved_size)
+
+    raw_min = resolved_size + (float(safe_nodes) * per_node_overhead) + shard_rounding_slack
+    raw_stable = raw_min + safety_margin
+    stable_room_ram_gb = _ceil_half_gb(raw_stable)
+
+    return RoomRamRequirements(
+        model_id=model_id,
+        model_size_gb=round(resolved_size, 2),
+        total_layers=resolved_layers,
+        node_count=safe_nodes,
+        per_node_overhead_gb=round(per_node_overhead, 2),
+        shard_rounding_slack_gb=round(shard_rounding_slack, 2),
+        safety_margin_gb=round(safety_margin, 2),
+        min_room_ram_gb=round(raw_min, 2),
+        stable_room_ram_gb=stable_room_ram_gb,
+        recommended_slider_gb=max(2, math.ceil(stable_room_ram_gb - 1e-9)),
+    )
+
+
 def calculate_max_layers(
     model_id: str,
     ram_gb: int,
