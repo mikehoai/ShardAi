@@ -25,6 +25,7 @@ from shard_engine.schemas import (
     PeerRole,
     RoomLobbyItem,
     StartNodeRequest,
+    coerce_non_negative_float,
     normalize_model_modality,
 )
 
@@ -75,6 +76,14 @@ def _normalize_peer(
         raw_ticket.strip() if isinstance(raw_ticket, str) and raw_ticket.strip() else None
     )
 
+    raw_ram = (
+        raw.get("available_ram_gb")
+        or raw.get("shared_ram_gb")
+        or raw.get("ram_gb")
+        or 0.0
+    )
+    available_ram_gb = coerce_non_negative_float(raw_ram)
+
     return PeerNodeInfo(
         peer_id=str(raw.get("peer_id") or raw.get("node_id") or "unknown"),
         ip_address=str(raw.get("ip_address") or raw.get("ip") or "127.0.0.1"),
@@ -83,6 +92,7 @@ def _normalize_peer(
         shard_layer_end=int(end_val if end_val is not None else default_end_layer),
         role=role,
         available_vram_mb=int(raw.get("available_vram_mb") or 0),
+        available_ram_gb=available_ram_gb,
         room_id=str(raw.get("room_id") or default_room_id),
         p2p_endpoint_id=clean_ep_id,
         p2p_ticket=clean_ticket,

@@ -103,6 +103,7 @@ from shard_engine.schemas import (
     ModelSourceType,
     NetworkMode,
     NetworkStatus,
+    coerce_non_negative_float,
     NetworkStatusResponse,
     NodeState,
     NodeStatusResponse,
@@ -324,6 +325,7 @@ def _beacon_to_peer(beacon: dict[str, Any], room_id: str, total_layers: int) -> 
         shard_layer_end=int(beacon.get("shard_layer_end") or (total_layers - 1)),
         role=PeerRole.BACKUP if raw_role == PeerRole.BACKUP.value else PeerRole.PRIMARY,
         available_vram_mb=0,
+        available_ram_gb=coerce_non_negative_float(beacon.get("ram_gb")),
         room_id=room_id,
     )
 
@@ -2654,7 +2656,10 @@ class LocalNodeRuntime:
                 if self.state != NodeState.RUNNING:
                     return
                 for room in rooms:
-                    if room.room_id == self.room_id:
+                    if room.room_id == self.room_id and (
+                        self.model_id is None
+                        or room.model.strip() == self.model_id.strip()
+                    ):
                         cloud_coverage = room.coverage_percent
                         cloud_room_total_ram_gb = room.total_shared_ram_gb
                         break
@@ -2783,7 +2788,7 @@ class LocalNodeRuntime:
             )
         else:
             peer_ram_gb = sum(
-                max(0.0, float(p.available_vram_mb) / 1024.0) for p in self.peers
+                coerce_non_negative_float(p.available_ram_gb) for p in self.peers
             )
             self.room_total_shared_ram_gb = round(self_ram_gb + peer_ram_gb, 2)
         if cloud_coverage is not None:
