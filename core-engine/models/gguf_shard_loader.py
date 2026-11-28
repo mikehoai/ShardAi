@@ -17,6 +17,7 @@ loading unowned layers into RAM or pre-dequantizing full weight matrices:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import logging
 import math
@@ -395,6 +396,27 @@ def read_gguf_header_and_tensors(gguf_path: Path) -> GgufFileIndex:
                     continue
                 if val_type == _GGUF_TYPE_STRING:
                     metadata[key] = _read_gguf_string(f)
+                    continue
+                if val_type == _GGUF_TYPE_ARRAY:
+                    arr_hdr = f.read(12)
+                    if len(arr_hdr) < 12:
+                        raise EOFError(f"Unexpected EOF reading array header for '{key}'")
+                    elem_type, count = struct.unpack("<IQ", arr_hdr)
+                    if count > _MAX_GGUF_ARRAY_ELEMENTS:
+                        raise ValueError(
+                            f"GGUF array element count ({count}) exceeds safety cap ({_MAX_GGUF_ARRAY_ELEMENTS})"
+                        )
+                    if elem_type in _SCALAR_STRUCT_FMTS and count <= 4096:
+                        metadata[key] = [
+                            _read_scalar_value(f, elem_type) for _ in range(int(count))
+                        ]
+                    elif elem_type in _SCALAR_SIZES:
+                        f.seek(_SCALAR_SIZES[elem_type] * count, 1)
+                    elif elem_type == _GGUF_TYPE_STRING:
+                        _skip_large_string_array_fast(f, int(count))
+                    else:
+                        for _ in range(count):
+                            _skip_gguf_value(f, elem_type, depth=1)
                     continue
 
             _skip_gguf_value(f, val_type)
@@ -888,31 +910,87 @@ class GgufQuantizedEmbedding(nn.Module):
         ggml_type: int,
         embed_scale: float = 1.0,
         output_dtype: torch.dtype = torch.float32,
+        fallback_token_id: int = 0,
     ) -> None:
         super().__init__()
+        if isinstance(vocab_size, bool) or vocab_size <= 0:
+            raise ValueError(
+                f"GgufQuantizedEmbedding requires vocab_size > 0, got {vocab_size!r}"
+            )
+        if isinstance(embedding_dim, bool) or embedding_dim <= 0:
+            raise ValueError(
+                f"GgufQuantizedEmbedding requires embedding_dim > 0, got {embedding_dim!r}"
+            )
         if raw_weight.dtype != torch.uint8:
             raise ValueError("GgufQuantizedEmbedding expects torch.uint8 raw_weight")
+        if ggml_type not in GGML_TYPE_INFO:
+            raise ValueError(f"Unsupported GGML tensor type ID: {ggml_type}")
         block_elems, block_bytes = GGML_TYPE_INFO[ggml_type]
+        if embedding_dim % block_elems != 0:
+            raise ValueError(
+                f"embedding_dim={embedding_dim} must be divisible by block_elems={block_elems}"
+            )
         row_bytes = (embedding_dim // block_elems) * block_bytes
         if raw_weight.ndim == 1:
+            if int(raw_weight.numel()) != vocab_size * row_bytes:
+                raise ValueError(
+                    f"raw_weight byte length {raw_weight.numel()} != expected "
+                    f"{vocab_size * row_bytes}"
+                )
             raw_weight = raw_weight.view(vocab_size, row_bytes)
         if tuple(raw_weight.shape) != (vocab_size, row_bytes):
             raise ValueError(
                 f"raw_weight shape {tuple(raw_weight.shape)} != expected {(vocab_size, row_bytes)}"
             )
-        self.vocab_size: int = vocab_size
-        self.embedding_dim: int = embedding_dim
+        safe_fallback = (
+            int(fallback_token_id)
+            if not isinstance(fallback_token_id, bool)
+            and 0 <= int(fallback_token_id) < vocab_size
+            else 0
+        )
+        self.vocab_size: int = int(vocab_size)
+        self.embedding_dim: int = int(embedding_dim)
         self.ggml_type: int = ggml_type
         self.embed_scale: float = float(embed_scale)
         self.output_dtype: torch.dtype = output_dtype
+        self.fallback_token_id: int = safe_fallback
         self._row_bytes: int = row_bytes
         self.target_device: torch.device = torch.device("cpu")
         self.register_buffer("raw_weight", raw_weight.detach().contiguous(), persistent=True)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Gather only `input_ids` rows and dequantize those rows on the fly."""
+        if self.vocab_size <= 0:
+            raise ValueError(
+                f"GgufQuantizedEmbedding requires vocab_size > 0, got {self.vocab_size}"
+            )
         with torch.inference_mode():
             ids_cpu = input_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+            if ids_cpu.numel() == 0:
+                return torch.empty(
+                    (*input_ids.shape, self.embedding_dim),
+                    dtype=self.output_dtype,
+                    device=self.target_device,
+                )
+            if bool((ids_cpu < 0).any() or (ids_cpu >= self.vocab_size).any()):
+                out_of_bounds = (ids_cpu < 0) | (ids_cpu >= self.vocab_size)
+                bad_count = int(out_of_bounds.sum().item())
+                fallback_id = (
+                    self.fallback_token_id
+                    if 0 <= self.fallback_token_id < self.vocab_size
+                    else 0
+                )
+                logger.warning(
+                    "Clamping %d out-of-bounds token ID(s) outside [0, %d) to fallback ID %d",
+                    bad_count,
+                    self.vocab_size,
+                    fallback_id,
+                )
+                ids_cpu = torch.where(
+                    out_of_bounds,
+                    torch.tensor(fallback_id, dtype=torch.long, device="cpu"),
+                    ids_cpu,
+                )
             selected_u8 = self.raw_weight.index_select(0, ids_cpu).reshape(-1)
             deq = _dequantize_blocks_u8(
                 selected_u8, ggml_type=self.ggml_type, dtype=self.output_dtype
@@ -952,7 +1030,7 @@ class GgufModelConfig:
     query_pre_attn_scalar: float
     tie_word_embeddings: bool
     bos_token_id: int | None
-    eos_token_id: int | None
+    eos_token_id: int | list[int] | None
     pad_token_id: int | None
 
 
@@ -1123,10 +1201,27 @@ class GgufAttention(nn.Module):
         sliding_window: int | None = None,
     ) -> None:
         super().__init__()
+        if isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError(
+                f"GgufAttention requires num_heads > 0, got {num_heads!r}"
+            )
+        if isinstance(num_kv_heads, bool) or num_kv_heads <= 0:
+            raise ValueError(
+                f"GgufAttention requires num_kv_heads > 0, got {num_kv_heads!r}"
+            )
+        if num_kv_heads > num_heads or num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"GgufAttention requires num_heads ({num_heads}) to be divisible by "
+                f"num_kv_heads ({num_kv_heads})"
+            )
+        if isinstance(head_dim, bool) or head_dim <= 0:
+            raise ValueError(
+                f"GgufAttention requires head_dim > 0, got {head_dim!r}"
+            )
         self.layer_idx: int = layer_idx
         self.num_heads: int = num_heads
         self.num_kv_heads: int = num_kv_heads
-        self.num_kv_groups: int = max(1, num_heads // num_kv_heads)
+        self.num_kv_groups: int = num_heads // num_kv_heads
         self.head_dim: int = head_dim
         self.rotary_dim: int = rotary_dim
         self.attn_scale: float = float(attn_scale)
@@ -1332,6 +1427,111 @@ class GgufDecoderLayer(nn.Module):
         return (hidden_states,)
 
 
+def _require_positive_int_meta(metadata: dict[str, Any], key: str) -> int:
+    """Read a required strictly-positive integer GGUF metadata entry."""
+    if key not in metadata or metadata[key] is None:
+        raise ValueError(f"Missing required GGUF metadata key '{key}'")
+    raw = metadata[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, np.integer)):
+        raise ValueError(
+            f"Invalid GGUF metadata key '{key}': expected positive integer, got {raw!r}"
+        )
+    val = int(raw)
+    if val <= 0:
+        raise ValueError(
+            f"Invalid GGUF metadata key '{key}': must be > 0, got {val}"
+        )
+    return val
+
+
+def _optional_positive_int_meta(
+    metadata: dict[str, Any],
+    key: str,
+    default: int | None = None,
+) -> int | None:
+    """Read an optional strictly-positive integer GGUF metadata entry."""
+    if key not in metadata or metadata[key] is None:
+        return default
+    raw = metadata[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, np.integer)):
+        raise ValueError(
+            f"Invalid GGUF metadata key '{key}': expected positive integer, got {raw!r}"
+        )
+    val = int(raw)
+    if val <= 0:
+        raise ValueError(
+            f"Invalid GGUF metadata key '{key}': must be > 0, got {val}"
+        )
+    return val
+
+
+def _optional_positive_float_meta(
+    metadata: dict[str, Any],
+    key: str,
+    default: float,
+) -> float:
+    """Read an optional strictly-positive finite float GGUF metadata entry."""
+    if key not in metadata or metadata[key] is None:
+        return default
+    raw = metadata[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, np.number)):
+        raise ValueError(
+            f"Invalid GGUF metadata key '{key}': expected positive float, got {raw!r}"
+        )
+    val = float(raw)
+    if not math.isfinite(val) or val <= 0.0:
+        raise ValueError(
+            f"Invalid GGUF metadata key '{key}': must be finite and > 0, got {val}"
+        )
+    return val
+
+
+def _resolve_vocab_size_from_gguf(index: GgufFileIndex) -> int | None:
+    """Determine `vocab_size` from `token_embd.weight`, token array count, or `output.weight`."""
+    if "token_embd.weight" in index.tensors:
+        return int(index.tensors["token_embd.weight"].shape_pt[0])
+    if index.vocab_size_from_tokens is not None:
+        return int(index.vocab_size_from_tokens)
+    if "output.weight" in index.tensors:
+        return int(index.tensors["output.weight"].shape_pt[0])
+    return None
+
+
+def _sanitize_token_id_list(raw: Any, vocab_size: int | None) -> list[int]:
+    """Extract unique integer token IDs within `[0, vocab_size)` from a scalar or iterable."""
+    if raw is None or isinstance(raw, (bool, str, bytes, bytearray, Mapping)):
+        return []
+    items: Iterable[Any] = raw if isinstance(raw, Iterable) else (raw,)
+    valid: list[int] = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (int, np.integer)):
+            continue
+        tid = int(item)
+        if tid < 0:
+            continue
+        if vocab_size is not None and tid >= vocab_size:
+            continue
+        if tid not in valid:
+            valid.append(tid)
+    return valid
+
+
+def _sanitize_single_token_id(raw: Any, vocab_size: int | None) -> int | None:
+    """Validate a single special token ID against `[0, vocab_size)`."""
+    valid = _sanitize_token_id_list(raw, vocab_size)
+    return valid[0] if valid else None
+
+
+def _sanitize_eos_token_id(raw: Any, vocab_size: int | None) -> int | list[int] | None:
+    """Validate scalar or iterable EOS token IDs against `[0, vocab_size)`."""
+    if raw is None or isinstance(raw, (bool, str, bytes, bytearray, Mapping)):
+        return None
+    if isinstance(raw, Iterable):
+        valid = _sanitize_token_id_list(raw, vocab_size)
+        return valid if valid else None
+    return _sanitize_single_token_id(raw, vocab_size)
+
+
 def _build_model_config_from_gguf(index: GgufFileIndex) -> GgufModelConfig:
     """Reconstruct a pure-PyTorch `GgufModelConfig` from GGUF header metadata."""
     arch = str(index.metadata.get("general.architecture") or "").strip().lower()
@@ -1341,30 +1541,75 @@ def _build_model_config_from_gguf(index: GgufFileIndex) -> GgufModelConfig:
     def _meta(suffix: str, default: Any = None) -> Any:
         return index.metadata.get(f"{arch}.{suffix}", default)
 
-    num_hidden_layers = int(_meta("block_count"))
-    hidden_size = int(_meta("embedding_length"))
-    intermediate_size = int(_meta("feed_forward_length"))
-    max_position_embeddings = int(_meta("context_length", 2048))
-    num_attention_heads = int(_meta("attention.head_count"))
-    num_key_value_heads = int(_meta("attention.head_count_kv", num_attention_heads))
+    num_hidden_layers = _require_positive_int_meta(index.metadata, f"{arch}.block_count")
+    hidden_size = _require_positive_int_meta(index.metadata, f"{arch}.embedding_length")
+    intermediate_size = _require_positive_int_meta(index.metadata, f"{arch}.feed_forward_length")
+    max_pos_opt = _optional_positive_int_meta(
+        index.metadata, f"{arch}.context_length", default=2048
+    )
+    assert max_pos_opt is not None
+    max_position_embeddings = max_pos_opt
 
-    head_dim_raw = _meta("attention.key_length")
-    if head_dim_raw is not None and int(head_dim_raw) > 0:
-        head_dim = int(head_dim_raw)
-    elif (
-        "blk.0.attn_q.weight" in index.tensors
-        and int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) > 0
-        and int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) % num_attention_heads == 0
-    ):
-        head_dim = int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) // num_attention_heads
+    num_attention_heads = _require_positive_int_meta(
+        index.metadata, f"{arch}.attention.head_count"
+    )
+    num_kv_opt = _optional_positive_int_meta(
+        index.metadata, f"{arch}.attention.head_count_kv", default=num_attention_heads
+    )
+    assert num_kv_opt is not None
+    num_key_value_heads = num_kv_opt
+    if num_key_value_heads <= 0 or num_key_value_heads > num_attention_heads:
+        raise ValueError(
+            f"Invalid GGUF metadata key '{arch}.attention.head_count_kv': "
+            f"must satisfy 0 < num_key_value_heads <= num_attention_heads ({num_attention_heads}), "
+            f"got {num_key_value_heads}"
+        )
+    if num_attention_heads % num_key_value_heads != 0:
+        raise ValueError(
+            f"Invalid GGUF head geometry: '{arch}.attention.head_count' ({num_attention_heads}) "
+            f"must be divisible by '{arch}.attention.head_count_kv' ({num_key_value_heads})"
+        )
+
+    explicit_key_len = _optional_positive_int_meta(
+        index.metadata, f"{arch}.attention.key_length", default=None
+    )
+    if explicit_key_len is not None:
+        head_dim = explicit_key_len
     else:
-        head_dim = hidden_size // num_attention_heads
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                f"Invalid GGUF head geometry: '{arch}.embedding_length' ({hidden_size}) "
+                f"must be divisible by '{arch}.attention.head_count' ({num_attention_heads}) "
+                f"when '{arch}.attention.key_length' is not specified"
+            )
+        if (
+            "blk.0.attn_q.weight" in index.tensors
+            and len(index.tensors["blk.0.attn_q.weight"].shape_pt) == 2
+            and int(index.tensors["blk.0.attn_q.weight"].shape_pt[1]) == hidden_size
+            and int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) > 0
+            and int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) % num_attention_heads == 0
+        ):
+            head_dim = int(index.tensors["blk.0.attn_q.weight"].shape_pt[0]) // num_attention_heads
+        else:
+            head_dim = hidden_size // num_attention_heads
 
-    rms_norm_eps = float(_meta("attention.layer_norm_rms_epsilon", 1e-6))
-    rope_theta = float(_meta("rope.freq_base", 10000.0))
+    if head_dim <= 0:
+        raise ValueError(f"Resolved GGUF head_dim must be > 0, got {head_dim}")
+
+    rms_norm_eps = _optional_positive_float_meta(
+        index.metadata, f"{arch}.attention.layer_norm_rms_epsilon", default=1e-6
+    )
+    rope_theta = _optional_positive_float_meta(
+        index.metadata, f"{arch}.rope.freq_base", default=10000.0
+    )
 
     rope_dim_raw = _meta("rope.dimension_count")
-    if rope_dim_raw is not None and 0 < int(rope_dim_raw) <= head_dim:
+    if (
+        rope_dim_raw is not None
+        and not isinstance(rope_dim_raw, bool)
+        and isinstance(rope_dim_raw, (int, np.integer))
+        and 0 < int(rope_dim_raw) <= head_dim
+    ):
         rotary_dim = int(rope_dim_raw)
     else:
         rotary_dim = head_dim
@@ -1372,51 +1617,59 @@ def _build_model_config_from_gguf(index: GgufFileIndex) -> GgufModelConfig:
     sliding_window_raw = _meta("attention.sliding_window")
     sliding_window = (
         int(sliding_window_raw)
-        if sliding_window_raw is not None and int(sliding_window_raw) > 0
+        if sliding_window_raw is not None
+        and not isinstance(sliding_window_raw, bool)
+        and isinstance(sliding_window_raw, (int, np.integer))
+        and int(sliding_window_raw) > 0
         else None
     )
 
     final_softcap_raw = _meta("final_logit_softcapping")
     final_logit_softcapping = (
         float(final_softcap_raw)
-        if final_softcap_raw is not None and float(final_softcap_raw) > 0.0
+        if final_softcap_raw is not None
+        and not isinstance(final_softcap_raw, bool)
+        and isinstance(final_softcap_raw, (int, float, np.number))
+        and float(final_softcap_raw) > 0.0
         else None
     )
 
     attn_softcap_raw = _meta("attn_logit_softcapping")
     attn_logit_softcapping = (
         float(attn_softcap_raw)
-        if attn_softcap_raw is not None and float(attn_softcap_raw) > 0.0
+        if attn_softcap_raw is not None
+        and not isinstance(attn_softcap_raw, bool)
+        and isinstance(attn_softcap_raw, (int, float, np.number))
+        and float(attn_softcap_raw) > 0.0
         else None
     )
 
     q_scalar_raw = _meta("attention.query_pre_attn_scalar")
-    if q_scalar_raw is not None and float(q_scalar_raw) > 0.0:
+    if (
+        q_scalar_raw is not None
+        and not isinstance(q_scalar_raw, bool)
+        and isinstance(q_scalar_raw, (int, float, np.number))
+        and float(q_scalar_raw) > 0.0
+    ):
         query_pre_attn_scalar = float(q_scalar_raw)
     elif arch in ("gemma2", "gemma3"):
         query_pre_attn_scalar = 256.0
     else:
         query_pre_attn_scalar = float(head_dim)
 
-    if "token_embd.weight" in index.tensors:
-        vocab_size = int(index.tensors["token_embd.weight"].shape_pt[0])
-    elif index.vocab_size_from_tokens is not None:
-        vocab_size = int(index.vocab_size_from_tokens)
-    elif "output.weight" in index.tensors:
-        vocab_size = int(index.tensors["output.weight"].shape_pt[0])
-    else:
+    vocab_size_opt = _resolve_vocab_size_from_gguf(index)
+    if vocab_size_opt is None or vocab_size_opt <= 0:
         raise ValueError("Unable to determine vocab_size from GGUF tensors or metadata")
+    vocab_size = vocab_size_opt
 
     tie_word_embeddings = "output.weight" not in index.tensors
     bos_raw = index.metadata.get("tokenizer.ggml.bos_token_id")
     eos_raw = index.metadata.get("tokenizer.ggml.eos_token_id")
     pad_raw = index.metadata.get("tokenizer.ggml.padding_token_id")
 
-    bos_token_id = int(bos_raw) if bos_raw is not None else None
-    eos_token_id = int(eos_raw) if eos_raw is not None else None
-    pad_token_id = (
-        int(pad_raw) if pad_raw is not None and 0 <= int(pad_raw) < vocab_size else None
-    )
+    bos_token_id = _sanitize_single_token_id(bos_raw, vocab_size)
+    eos_token_id = _sanitize_eos_token_id(eos_raw, vocab_size)
+    pad_token_id = _sanitize_single_token_id(pad_raw, vocab_size)
 
     return GgufModelConfig(
         arch=arch,
@@ -1681,35 +1934,43 @@ def _build_layer_from_gguf(
 class GgufTokenizerAdapter:
     """Lightweight tokenizer backed by `llama_cpp(vocab_only=True)` or GGUF token fallback."""
 
-    def __init__(self, index: GgufFileIndex) -> None:
+    def __init__(self, index: GgufFileIndex, vocab_size: int | None = None) -> None:
+        resolved_vocab_size = (
+            vocab_size
+            if vocab_size is not None and vocab_size > 0
+            else _resolve_vocab_size_from_gguf(index)
+        )
+        self._vocab_size: int | None = (
+            resolved_vocab_size if resolved_vocab_size is not None and resolved_vocab_size > 0 else None
+        )
         self.chat_template: str | None = (
             str(index.metadata["tokenizer.chat_template"])
             if index.metadata.get("tokenizer.chat_template")
             else None
         )
-        self.bos_token_id: int | None = (
-            int(index.metadata["tokenizer.ggml.bos_token_id"])
-            if "tokenizer.ggml.bos_token_id" in index.metadata
-            else None
+        has_bos_meta = "tokenizer.ggml.bos_token_id" in index.metadata
+        has_eos_meta = "tokenizer.ggml.eos_token_id" in index.metadata
+        self.bos_token_id: int | None = _sanitize_single_token_id(
+            index.metadata.get("tokenizer.ggml.bos_token_id"),
+            self._vocab_size,
         )
-        self.eos_token_id: int | None = (
-            int(index.metadata["tokenizer.ggml.eos_token_id"])
-            if "tokenizer.ggml.eos_token_id" in index.metadata
-            else None
+        valid_eos_ids = _sanitize_token_id_list(
+            index.metadata.get("tokenizer.ggml.eos_token_id"),
+            self._vocab_size,
         )
-        self.pad_token_id: int | None = (
-            int(index.metadata["tokenizer.ggml.padding_token_id"])
-            if "tokenizer.ggml.padding_token_id" in index.metadata
-            else None
+        self.eos_token_id: int | None = valid_eos_ids[0] if valid_eos_ids else None
+        self.pad_token_id: int | None = _sanitize_single_token_id(
+            index.metadata.get("tokenizer.ggml.padding_token_id"),
+            self._vocab_size,
         )
         self._add_bos_token: bool = bool(index.metadata.get("tokenizer.ggml.add_bos_token", False))
         self._llama: Any | None = None
         self._vocab_tokens: list[str] = []
         self._token_to_id: dict[str, int] = {}
-        self._special_ids: set[int] = set()
+        self._special_ids: set[int] = set(valid_eos_ids)
 
-        for tid in (self.bos_token_id, self.eos_token_id, self.pad_token_id):
-            if tid is not None and tid >= 0:
+        for tid in (self.bos_token_id, self.pad_token_id):
+            if tid is not None:
                 self._special_ids.add(tid)
 
         try:
@@ -1721,14 +1982,14 @@ class GgufTokenizerAdapter:
                 use_mmap=True,
                 verbose=False,
             )
-            if self.bos_token_id is None and hasattr(self._llama, "token_bos"):
-                bos = int(self._llama.token_bos())
-                if bos >= 0:
+            if not has_bos_meta and self.bos_token_id is None and hasattr(self._llama, "token_bos"):
+                bos = _sanitize_single_token_id(self._llama.token_bos(), self._vocab_size)
+                if bos is not None:
                     self.bos_token_id = bos
                     self._special_ids.add(bos)
-            if self.eos_token_id is None and hasattr(self._llama, "token_eos"):
-                eos = int(self._llama.token_eos())
-                if eos >= 0:
+            if not has_eos_meta and self.eos_token_id is None and hasattr(self._llama, "token_eos"):
+                eos = _sanitize_single_token_id(self._llama.token_eos(), self._vocab_size)
+                if eos is not None:
                     self.eos_token_id = eos
                     self._special_ids.add(eos)
             for special_tok in ("<|im_end|>", "<|eot_id|>", "<|im_start|>", "<|endoftext|>", "</s>"):
@@ -1743,7 +2004,11 @@ class GgufTokenizerAdapter:
             )
             self._llama = None
             self._vocab_tokens = _read_gguf_tokens_list(index)
-            self._token_to_id = {tok: idx for idx, tok in enumerate(self._vocab_tokens)}
+            self._token_to_id = {
+                tok: idx
+                for idx, tok in enumerate(self._vocab_tokens)
+                if self._vocab_size is None or idx < self._vocab_size
+            }
             for special_tok in ("<|im_end|>", "<|eot_id|>", "<|im_start|>", "<|endoftext|>", "</s>", "<s>"):
                 if special_tok in self._token_to_id:
                     self._special_ids.add(self._token_to_id[special_tok])
@@ -1756,11 +2021,11 @@ class GgufTokenizerAdapter:
                     token.encode("utf-8"), add_bos=False, special=True
                 )
                 if len(ids) == 1:
-                    return int(ids[0])
+                    return _sanitize_single_token_id(int(ids[0]), self._vocab_size)
             except Exception:
                 return None
             return None
-        return self._token_to_id.get(token)
+        return _sanitize_single_token_id(self._token_to_id.get(token), self._vocab_size)
 
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         """Encode text into integer token IDs."""
@@ -2138,7 +2403,7 @@ def load_gguf_pytorch_shard(
 
         tokenizer: GgufTokenizerAdapter | None = None
         if is_head or is_tail:
-            tokenizer = GgufTokenizerAdapter(index)
+            tokenizer = GgufTokenizerAdapter(index, vocab_size=cfg.vocab_size)
 
         return LoadedGgufShard(
             hf_config=cfg,
