@@ -2,9 +2,23 @@
 
 from collections.abc import Mapping
 from enum import StrEnum
+import math
 import os
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
+
+
+def coerce_non_negative_float(value: Any) -> float:
+    """Convert an external numeric value to a finite non-negative float, defaulting to 0.0."""
+    if value is None or isinstance(value, bool):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return 0.0
+    return parsed
 
 
 def resolve_local_ipc_token(env: Mapping[str, str] | None = None) -> str | None:
@@ -140,6 +154,11 @@ class PeerNodeInfo(BaseModel):
         description="Fault-tolerance role ('primary' or 'backup') assigned by Tracker",
     )
     available_vram_mb: int = Field(default=0, ge=0, description="Available VRAM shared by peer")
+    available_ram_gb: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Available system RAM (GB) shared by peer",
+    )
     room_id: str = Field(
         default="public",
         description="Room identifier ('public' or custom private room passphrase)",
