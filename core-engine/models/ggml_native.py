@@ -53,6 +53,7 @@ NATIVE_QUANTIZED_GGML_TYPES: frozenset[int] = frozenset(
 )
 GGML_TYPE_F32_ID: int = 0
 _GGML_BACKEND_DEVICE_TYPE_GPU: int = 1
+_GGML_TYPE_COUNT: int = 40
 
 
 class _GgmlInitParams(ctypes.Structure):
@@ -115,6 +116,10 @@ class _GgmlCApi:
         self.lib_base.ggml_backend_dev_name.restype = ctypes.c_char_p
         self.lib_base.ggml_backend_dev_type.argtypes = [ctypes.c_void_p]
         self.lib_base.ggml_backend_dev_type.restype = ctypes.c_int
+        self.lib_base.ggml_backend_get_device.argtypes = [ctypes.c_void_p]
+        self.lib_base.ggml_backend_get_device.restype = ctypes.c_void_p
+        self.lib_base.ggml_backend_name.argtypes = [ctypes.c_void_p]
+        self.lib_base.ggml_backend_name.restype = ctypes.c_char_p
 
         # Context & tensor graph construction
         self.lib_base.ggml_init.argtypes = [_GgmlInitParams]
@@ -287,6 +292,7 @@ class GgmlNativeEngine:
         self._api: _GgmlCApi = api
         self._lock: threading.Lock = threading.Lock()
         self._closed: bool = False
+        self._backend: int | None = None
         self._handles: list[GgmlWeightHandle] = []
         self._weight_refs: list[torch.Tensor] = []
 
@@ -307,9 +313,21 @@ class GgmlNativeEngine:
         if use_gpu:
             best = api.lib_ggml.ggml_backend_init_best()
             if best:
-                backend = int(best)
-                is_cpu = False
-                backend_kind = "gpu"
+                dev = api.lib_base.ggml_backend_get_device(best)
+                dev_type = int(api.lib_base.ggml_backend_dev_type(dev)) if dev else -1
+                if dev_type == _GGML_BACKEND_DEVICE_TYPE_GPU:
+                    backend = int(best)
+                    is_cpu = False
+                    raw_name = api.lib_base.ggml_backend_name(best)
+                    bname = (
+                        raw_name.decode("utf-8", errors="replace").strip()
+                        if isinstance(raw_name, (bytes, bytearray))
+                        else ""
+                    )
+                    backend_kind = f"gpu({bname})" if bname else "gpu"
+                else:
+                    # ggml_backend_init_best fell back to non-GPU (e.g., CPU/ACCEL); free and use configured CPU path
+                    api.lib_base.ggml_backend_free(best)
 
         if backend is None:
             cpu_backend = api.lib_cpu.ggml_backend_cpu_init()
@@ -325,12 +343,23 @@ class GgmlNativeEngine:
             is_cpu = True
             backend_kind = f"cpu({n_threads}t)"
 
-        self._backend: int | None = backend
+        try:
+            default_buft = int(
+                api.lib_base.ggml_backend_get_default_buffer_type(backend)
+            )
+            if not default_buft:
+                raise RuntimeError("ggml_backend_get_default_buffer_type returned null")
+        except Exception:
+            try:
+                api.lib_base.ggml_backend_free(backend)
+            except Exception:
+                pass
+            raise
+
+        self._backend = backend
         self._is_cpu: bool = is_cpu
         self._backend_kind: str = backend_kind
-        self._default_buft: int = int(
-            api.lib_base.ggml_backend_get_default_buffer_type(backend)
-        )
+        self._default_buft: int = default_buft
         logger.info("Initialized native libggml engine (%s)", self._backend_kind)
 
     @staticmethod
@@ -373,15 +402,43 @@ class GgmlNativeEngine:
         """Register a packed 1D `torch.uint8` weight tensor on the GGML backend (zero-copy on CPU)."""
         if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 1:
             raise ValueError("Expected 1D torch.uint8 raw_weight tensor")
-        raw_cpu = raw_weight.detach().to(device="cpu").contiguous()
-        nbytes = int(raw_cpu.numel())
+        out_f = int(out_features)
+        in_f = int(in_features)
+        if out_f <= 0 or in_f <= 0:
+            raise ValueError(
+                f"Expected positive weight dimensions, got out_features={out_f}, in_features={in_f}"
+            )
+        nbytes = int(raw_weight.numel())
         if nbytes <= 0:
             raise ValueError("Cannot register empty weight buffer in GgmlNativeEngine")
+
+        gtype = int(ggml_type)
+        # Guard C type_traits[] indexing against out-of-bounds type IDs
+        if gtype < 0 or gtype >= _GGML_TYPE_COUNT:
+            raise ValueError(f"Unsupported or invalid ggml_type: {gtype}")
+        api = self._api
+        blck_size = int(api.lib_base.ggml_blck_size(gtype))
+        type_size = int(api.lib_base.ggml_type_size(gtype))
+        if blck_size <= 0 or type_size <= 0:
+            raise ValueError(
+                f"Unsupported ggml_type={gtype} (blck_size={blck_size}, type_size={type_size})"
+            )
+        if in_f % blck_size != 0:
+            raise ValueError(
+                f"in_features={in_f} must be divisible by blck_size={blck_size} for ggml_type={gtype}"
+            )
+        expected_nbytes = (in_f // blck_size) * type_size * out_f
+        if nbytes != expected_nbytes:
+            raise ValueError(
+                f"Weight buffer byte length {nbytes} != expected {expected_nbytes} "
+                f"for shape=({out_f}, {in_f}) and ggml_type={gtype}"
+            )
+
+        raw_cpu = raw_weight.detach().to(device="cpu").contiguous()
 
         with self._lock:
             if self._closed or self._backend is None:
                 raise RuntimeError("GgmlNativeEngine is closed")
-            api = self._api
             ctx_bytes = max(4096, api.tensor_overhead * 4)
             w_ctx = api.lib_base.ggml_init(_GgmlInitParams(ctx_bytes, None, True))
             if not w_ctx:
@@ -390,11 +447,11 @@ class GgmlNativeEngine:
             w_buf: int | None = None
             try:
                 w_tensor = api.lib_base.ggml_new_tensor_2d(
-                    w_ctx, int(ggml_type), int(in_features), int(out_features)
+                    w_ctx, gtype, in_f, out_f
                 )
                 if not w_tensor:
                     raise RuntimeError(
-                        f"ggml_new_tensor_2d failed (type={ggml_type}, shape=({in_features}, {out_features}))"
+                        f"ggml_new_tensor_2d failed (type={gtype}, shape=({in_f}, {out_f}))"
                     )
 
                 ptr = int(raw_cpu.data_ptr())
@@ -412,14 +469,16 @@ class GgmlNativeEngine:
                     api.lib_base.ggml_backend_tensor_set(w_tensor, ptr, 0, nbytes)
 
                 handle = GgmlWeightHandle(
-                    out_features=int(out_features),
-                    in_features=int(in_features),
-                    ggml_type=int(ggml_type),
+                    out_features=out_f,
+                    in_features=in_f,
+                    ggml_type=gtype,
                     w_ctx=int(w_ctx),
                     w_buf=int(w_buf),
                     w_tensor=int(w_tensor),
                 )
-                self._weight_refs.append(raw_cpu)
+                # Pin host tensor only on CPU zero-copy path; GPU copies data into VRAM
+                if self._is_cpu:
+                    self._weight_refs.append(raw_cpu)
                 self._handles.append(handle)
                 return handle
             except Exception:
@@ -472,9 +531,13 @@ class GgmlNativeEngine:
 
     def matmul(self, handle: GgmlWeightHandle, x_2d_f32: np.ndarray) -> np.ndarray:
         """Compute `x_2d_f32 @ W.T` directly against quantized `handle` weights."""
-        if x_2d_f32.ndim != 2 or x_2d_f32.shape[1] != handle.in_features:
+        if (
+            x_2d_f32.ndim != 2
+            or int(x_2d_f32.shape[0]) <= 0
+            or int(x_2d_f32.shape[1]) != handle.in_features
+        ):
             raise ValueError(
-                f"Expected 2D input with width {handle.in_features}, got {x_2d_f32.shape}"
+                f"Expected non-empty 2D input with width {handle.in_features}, got {x_2d_f32.shape}"
             )
         x_contig = np.ascontiguousarray(x_2d_f32, dtype=np.float32)
         n_rows = int(x_contig.shape[0])
