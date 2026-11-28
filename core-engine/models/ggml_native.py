@@ -52,7 +52,57 @@ NATIVE_QUANTIZED_GGML_TYPES: frozenset[int] = frozenset(
     }
 )
 GGML_TYPE_F32_ID: int = 0
+GGML_TENSOR_ALIGNMENT: int = 32
 _GGML_BACKEND_DEVICE_TYPE_GPU: int = 1
+
+
+def _alloc_aligned_cpu_u8(
+    nbytes: int,
+    alignment: int = GGML_TENSOR_ALIGNMENT,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate a contiguous 1D `torch.uint8` CPU tensor aligned to `alignment` bytes.
+
+    Returns `(aligned_tensor, backing_tensor)`. Keeping `backing_tensor` alive ensures
+    the underlying storage is never freed while C code holds `aligned_tensor.data_ptr()`.
+    """
+    if nbytes < 0:
+        raise ValueError(f"nbytes must be non-negative, got {nbytes}")
+    if nbytes == 0:
+        empty = torch.empty(0, dtype=torch.uint8, device="cpu")
+        return empty, empty
+
+    candidate = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+    if int(candidate.data_ptr()) % alignment == 0:
+        return candidate, candidate
+
+    backing = torch.empty(nbytes + alignment, dtype=torch.uint8, device="cpu")
+    offset = (alignment - (int(backing.data_ptr()) % alignment)) % alignment
+    aligned = backing[offset : offset + nbytes]
+    assert int(aligned.data_ptr()) % alignment == 0
+    return aligned, backing
+
+
+def _ensure_aligned_cpu_bytes(
+    raw_weight: torch.Tensor,
+    alignment: int = GGML_TENSOR_ALIGNMENT,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a contiguous 1D CPU `torch.uint8` tensor aligned to `alignment` bytes.
+
+    Reuses `raw_weight` zero-copy when it is already a contiguous CPU `torch.uint8`
+    tensor whose `data_ptr()` satisfies `alignment`. Otherwise copies into a newly
+    allocated aligned buffer and returns `(aligned_tensor, backing_tensor)`.
+    """
+    if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 1:
+        raise ValueError("Expected 1D torch.uint8 raw_weight tensor")
+
+    raw_cpu = raw_weight.detach().to(device="cpu").contiguous()
+    nbytes = int(raw_cpu.numel())
+    if nbytes == 0 or int(raw_cpu.data_ptr()) % alignment == 0:
+        return raw_cpu, raw_cpu
+
+    aligned, backing = _alloc_aligned_cpu_u8(nbytes, alignment=alignment)
+    aligned.copy_(raw_cpu)
+    return aligned, backing
 
 
 class _GgmlInitParams(ctypes.Structure):
@@ -371,9 +421,7 @@ class GgmlNativeEngine:
         ggml_type: int,
     ) -> GgmlWeightHandle:
         """Register a packed 1D `torch.uint8` weight tensor on the GGML backend (zero-copy on CPU)."""
-        if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 1:
-            raise ValueError("Expected 1D torch.uint8 raw_weight tensor")
-        raw_cpu = raw_weight.detach().to(device="cpu").contiguous()
+        raw_cpu, backing_ref = _ensure_aligned_cpu_bytes(raw_weight, alignment=GGML_TENSOR_ALIGNMENT)
         nbytes = int(raw_cpu.numel())
         if nbytes <= 0:
             raise ValueError("Cannot register empty weight buffer in GgmlNativeEngine")
@@ -399,6 +447,9 @@ class GgmlNativeEngine:
 
                 ptr = int(raw_cpu.data_ptr())
                 if self._is_cpu:
+                    assert ptr % GGML_TENSOR_ALIGNMENT == 0, (
+                        f"Expected {GGML_TENSOR_ALIGNMENT}-byte aligned CPU pointer, got {ptr:#x}"
+                    )
                     w_buf = api.lib_base.ggml_backend_cpu_buffer_from_ptr(ptr, nbytes)
                     if not w_buf:
                         raise RuntimeError("ggml_backend_cpu_buffer_from_ptr returned null")
@@ -419,7 +470,8 @@ class GgmlNativeEngine:
                     w_buf=int(w_buf),
                     w_tensor=int(w_tensor),
                 )
-                self._weight_refs.append(raw_cpu)
+                # Pin backing_ref (not just a view) so C pointers remain valid until close().
+                self._weight_refs.append(backing_ref)
                 self._handles.append(handle)
                 return handle
             except Exception:
