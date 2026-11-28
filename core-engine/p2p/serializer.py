@@ -215,6 +215,12 @@ def bfloat16_bytes_to_float32_bytes(raw_bf16: bytes) -> bytes:
         raise ValueError(
             f"BFloat16 buffer length ({len(raw_bf16)} bytes) must be a multiple of 2."
         )
+    expanded_bytes = len(raw_bf16) * 2
+    if expanded_bytes > MAX_UNCOMPRESSED_TENSOR_BYTES:
+        raise ValueError(
+            f"Rejected BF16 wire tensor exceeding safety cap after expansion: "
+            f"{expanded_bytes} bytes > {MAX_UNCOMPRESSED_TENSOR_BYTES} bytes."
+        )
     bf16_u16 = np.frombuffer(raw_bf16, dtype="<u2")
     words_f32 = bf16_u16.astype("<u4") << np.uint32(16)
     return words_f32.tobytes()
@@ -248,6 +254,12 @@ def int8_wire_to_float32_bytes(raw_int8: bytes, shape: tuple[int, int]) -> bytes
     rows, cols = int(shape[0]), int(shape[1])
     if rows <= 0 or cols <= 0:
         raise ValueError(f"Invalid tensor shape for INT8 wire dequantization: {shape}")
+    expanded_f32_bytes = rows * cols * 4
+    if expanded_f32_bytes > MAX_UNCOMPRESSED_TENSOR_BYTES:
+        raise ValueError(
+            f"Rejected INT8 wire tensor exceeding safety cap after expansion: "
+            f"{expanded_f32_bytes} bytes > {MAX_UNCOMPRESSED_TENSOR_BYTES} bytes."
+        )
     scale_bytes = rows * 4
     expected_bytes = scale_bytes + (rows * cols)
     if len(raw_int8) != expected_bytes:
@@ -256,6 +268,10 @@ def int8_wire_to_float32_bytes(raw_int8: bytes, shape: tuple[int, int]) -> bytes
             f"(expected {expected_bytes} bytes)."
         )
     scales = np.frombuffer(raw_int8[:scale_bytes], dtype="<f4").reshape(rows, 1)
+    if not bool(np.all(np.isfinite(scales))) or bool(np.any(scales < 0.0)):
+        raise ValueError(
+            "Invalid INT8 wire tensor: non-finite or negative per-row scale."
+        )
     quantized = np.frombuffer(raw_int8[scale_bytes:], dtype=np.int8).reshape(rows, cols)
     return (quantized.astype(np.float32) * scales).astype("<f4").tobytes()
 
@@ -519,6 +535,48 @@ def _decode_wire_tensor(
     codec = CompressionCodec(
         codec_val & ~(TENSOR_DTYPE_BFLOAT16_FLAG | TENSOR_DTYPE_INT8_FLAG)
     )
+
+    dim0, dim1 = int(shape[0]), int(shape[1])
+    if dim0 < 0 or dim1 < 0:
+        raise ValueError(f"Invalid negative tensor shape in P2P frame: {shape}")
+
+    if dim0 > 0 and dim1 > 0:
+        expanded_f32_bytes = dim0 * dim1 * 4
+        if expanded_f32_bytes > MAX_UNCOMPRESSED_TENSOR_BYTES:
+            raise ValueError(
+                f"Rejected P2P tensor exceeding safety cap after expansion: "
+                f"{expanded_f32_bytes} bytes > {MAX_UNCOMPRESSED_TENSOR_BYTES} bytes."
+            )
+        if is_int8:
+            expected_wire = (dim0 * 4) + (dim0 * dim1)
+            if uncompressed_len != expected_wire:
+                raise ValueError(
+                    f"INT8 wire length ({uncompressed_len} bytes) does not match shape "
+                    f"{shape} (expected {expected_wire} bytes)."
+                )
+        elif is_bf16:
+            expected_wire = dim0 * dim1 * 2
+            if uncompressed_len != expected_wire:
+                raise ValueError(
+                    f"BF16 wire length ({uncompressed_len} bytes) does not match shape "
+                    f"{shape} (expected {expected_wire} bytes)."
+                )
+    else:
+        if is_int8:
+            raise ValueError(
+                f"Invalid tensor shape for INT8 wire dequantization: {shape}"
+            )
+        if is_bf16:
+            if uncompressed_len % 2 != 0:
+                raise ValueError(
+                    f"BFloat16 buffer length ({uncompressed_len} bytes) must be a multiple of 2."
+                )
+            if uncompressed_len * 2 > MAX_UNCOMPRESSED_TENSOR_BYTES:
+                raise ValueError(
+                    f"Rejected BF16 P2P tensor exceeding safety cap after expansion: "
+                    f"{uncompressed_len * 2} bytes > {MAX_UNCOMPRESSED_TENSOR_BYTES} bytes."
+                )
+
     raw_wire = _decompress_buffer(payload_slice, codec, uncompressed_len)
     if is_int8:
         return int8_wire_to_float32_bytes(raw_wire, shape), codec, False, True
