@@ -136,6 +136,19 @@ NATIVE_STREAM_QUEUE_MAXSIZE: int = 64
 NATIVE_STREAM_CANCEL_JOIN_TIMEOUT_SECONDS: float = 2.0
 
 
+class UnknownInferenceRequestError(RuntimeError):
+    """Raised when a token/heartbeat frame targets an unknown or already-closed request.
+
+    Every P2P transport (TCP, QUIC, relay) maps exceptions raised by the frame handler
+    to a NACK, so raising this lets the sender (e.g. a Head Node streaming tokens to an
+    aborted proxy requester) detect the cancellation and stop generating promptly.
+    """
+
+
+class _PipelineStopRequested(Exception):
+    """Internal signal raised when `stop_event` cancels an in-flight pipeline wait."""
+
+
 class _ClosableStreamingResponse(StreamingResponse):
     """StreamingResponse that triggers a stop callback and closes its async iterator on teardown."""
 
@@ -1410,7 +1423,13 @@ class LocalNodeRuntime:
         """Callback triggered on a proxying non-Head node when the Head sends a keep-alive."""
         proxy_queue = self.pending_proxy_queues.get(hb_frame.request_id)
         if proxy_queue is None:
-            return
+            logger.debug(
+                "Rejecting inference heartbeat for inactive/unknown proxy request %s.",
+                hb_frame.request_id,
+            )
+            raise UnknownInferenceRequestError(
+                f"Unknown or inactive proxy request {hb_frame.request_id}"
+            )
         self._enqueue_proxy_frame(proxy_queue, hb_frame)
 
     async def handle_incoming_decoded_token(self, token_frame: DecodedTokenFrame) -> None:
@@ -1423,11 +1442,13 @@ class LocalNodeRuntime:
         queue = self.pending_token_queues.get(token_frame.request_id)
         if queue is None:
             logger.debug(
-                "Dropping decoded token for inactive/unknown request %s (step %d).",
+                "Rejecting decoded token for inactive/unknown request %s (step %d).",
                 token_frame.request_id,
                 token_frame.step_index,
             )
-            return
+            raise UnknownInferenceRequestError(
+                f"Unknown or inactive inference request {token_frame.request_id}"
+            )
 
         expected_step: int | None = self.active_request_steps.get(token_frame.request_id)
         if expected_step is not None and token_frame.step_index != expected_step:
@@ -1550,11 +1571,17 @@ class LocalNodeRuntime:
         hb_interval: float = max(0.05, float(self.proxy_heartbeat_interval_seconds))
 
         async def _heartbeat_loop() -> None:
-            """Send periodic keep-alive heartbeats while queued or running slow prefill/decode."""
+            """Send periodic keep-alive heartbeats while queued or running slow prefill/decode.
+
+            A rejected (NACK) or failed heartbeat means the requester is gone (e.g. the
+            client aborted the proxied stream), so stop generation and release the
+            pipeline turn instead of computing up to `max_tokens` for nobody.
+            """
+            nonlocal send_failed
             try:
-                while not proxy_stop_event.is_set() and not send_failed:
+                while not proxy_stop_event.is_set() and not send_failed and not saw_eos:
                     await asyncio.sleep(hb_interval)
-                    if proxy_stop_event.is_set() or send_failed:
+                    if proxy_stop_event.is_set() or send_failed or saw_eos:
                         break
                     is_computing_now = last_step_idx >= 0 or self._queued_pipeline_requests == 0
                     hb_packet = serialize_inference_heartbeat(
@@ -1570,7 +1597,19 @@ class LocalNodeRuntime:
                             timeout_seconds=15.0,
                             target_peer_id=requester_peer_id,
                         )
-                    except Exception:
+                    except Exception as hb_exc:
+                        if proxy_stop_event.is_set() or saw_eos:
+                            break
+                        send_failed = True
+                        proxy_stop_event.set()
+                        logger.warning(
+                            "Proxied heartbeat to %s:%d for request %s failed (%s); "
+                            "stopping proxied generation.",
+                            frame.requester_ip,
+                            frame.requester_port,
+                            frame.request_id,
+                            hb_exc,
+                        )
                         break
             except asyncio.CancelledError:
                 pass
@@ -1614,6 +1653,8 @@ class LocalNodeRuntime:
                 )
             ) as token_stream:
                 async for _req_id, step_idx, token_id, token_text, is_eos in token_stream:
+                    if send_failed or proxy_stop_event.is_set():
+                        break
                     last_step_idx = step_idx
                     if is_eos:
                         saw_eos = True
@@ -1739,20 +1780,29 @@ class LocalNodeRuntime:
         request_id: str,
         expected_step: int,
         timeout_seconds: float,
+        stop_event: threading.Event | None = None,
     ) -> DecodedTokenFrame:
         """Await a `DecodedTokenFrame` matching `(request_id, expected_step)` within a fixed deadline."""
         deadline: float = time.monotonic() + timeout_seconds
         while True:
+            if stop_event is not None and stop_event.is_set():
+                raise _PipelineStopRequested()
             remaining: float = deadline - time.monotonic()
             if remaining <= 0.0:
                 raise asyncio.TimeoutError(
                     f"Timed out waiting for decoded token at step {expected_step} "
                     f"for request {request_id}."
                 )
-            candidate_frame: DecodedTokenFrame = await asyncio.wait_for(
-                token_queue.get(),
-                timeout=remaining,
-            )
+            wait_slice: float = min(0.2, remaining) if stop_event is not None else remaining
+            try:
+                candidate_frame: DecodedTokenFrame = await asyncio.wait_for(
+                    token_queue.get(),
+                    timeout=wait_slice,
+                )
+            except asyncio.TimeoutError:
+                if stop_event is not None:
+                    continue
+                raise
             if (
                 candidate_frame.request_id != request_id
                 or candidate_frame.step_index != expected_step
@@ -2262,9 +2312,11 @@ class LocalNodeRuntime:
                         ),
                     )
                 if messages and self.model_runner.is_real_model:
-                    token_ids: list[int] = self.model_runner.tokenize_chat(messages)
+                    token_ids: list[int] = await asyncio.to_thread(
+                        self.model_runner.tokenize_chat, messages
+                    )
                 else:
-                    token_ids = self.model_runner.tokenize(prompt)
+                    token_ids = await asyncio.to_thread(self.model_runner.tokenize, prompt)
                 origin_port: int = self.p2p_listen_port or 49152
 
                 for step_idx in range(max_tokens):
@@ -2302,6 +2354,8 @@ class LocalNodeRuntime:
                         use_int8 = self._should_use_int8_wire(hidden_bytes)
 
                         for idx, candidate in enumerate(candidates):
+                            if stop_event is not None and stop_event.is_set():
+                                return
                             step_timeout = self.resolve_step_timeout(
                                 step_idx, len(candidates), candidate.peer_id
                             )
@@ -2345,6 +2399,7 @@ class LocalNodeRuntime:
                                     request_id=request_id,
                                     expected_step=step_idx,
                                     timeout_seconds=step_timeout,
+                                    stop_event=stop_event,
                                 )
                                 elapsed_step_ms = (time.perf_counter() - step_t0) * 1000.0
                                 self.record_peer_step_latency(
@@ -2365,6 +2420,8 @@ class LocalNodeRuntime:
                                         len(failed_candidates),
                                     )
                                 break
+                            except _PipelineStopRequested:
+                                return
                             except (
                                 TimeoutError,
                                 asyncio.TimeoutError,
