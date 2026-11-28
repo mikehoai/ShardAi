@@ -73,16 +73,17 @@ def _install_fast_backoff_wait_for(
     real_wait_for = asyncio.wait_for
     recorded_waits: list[float] = []
 
-    def _is_stop_event_wait(awaitable: Any) -> bool:
+    def _is_backoff_stop_wait(awaitable: Any) -> bool:
         frame = getattr(awaitable, "cr_frame", None)
         return (
             frame is not None
+            and asyncio.current_task() is client._runner_task
             and client._stop_event is not None
             and frame.f_locals.get("self") is client._stop_event
         )
 
     async def _fast_wait_for(awaitable: Any, timeout: float | None = None) -> Any:
-        if _is_stop_event_wait(awaitable) and timeout is not None:
+        if _is_backoff_stop_wait(awaitable) and timeout is not None:
             recorded_waits.append(float(timeout))
             if hasattr(awaitable, "close"):
                 awaitable.close()
