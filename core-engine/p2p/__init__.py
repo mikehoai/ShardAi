@@ -2,8 +2,11 @@
 
 from p2p.mdns_discovery import LanRoomBeacon, lan_mdns_service
 from p2p.serializer import (
+    ACTIVATION_ROUTING_EXT_FLAG,
     AUTO_BF16_WIRE_MIN_BYTES,
     AUTO_INT8_WIRE_MIN_BYTES,
+    MAX_ENDPOINT_IP_BYTES,
+    MAX_PEER_ID_BYTES,
     TENSOR_DTYPE_BFLOAT16_FLAG,
     TENSOR_DTYPE_INT8_FLAG,
     ActivationFrame,
@@ -47,6 +50,7 @@ from p2p.transport import (
     congestion_monitor,
     current_quic_peer_id,
     current_relay_source,
+    current_tcp_peer_ip,
     dispatch_p2p_frame,
     receive_activations,
     send_activations,
@@ -54,6 +58,7 @@ from p2p.transport import (
 
 __all__ = [
     "ACK_BYTE",
+    "ACTIVATION_ROUTING_EXT_FLAG",
     "AUTO_BF16_WIRE_MIN_BYTES",
     "AUTO_INT8_WIRE_MIN_BYTES",
     "ActivationFrame",
@@ -65,6 +70,8 @@ __all__ = [
     "InferenceRequestFrame",
     "IrohP2PTransport",
     "LanRoomBeacon",
+    "MAX_ENDPOINT_IP_BYTES",
+    "MAX_PEER_ID_BYTES",
     "NACK_BYTE",
     "PacketType",
     "PeerUnreachableError",
@@ -77,6 +84,7 @@ __all__ = [
     "congestion_monitor",
     "current_quic_peer_id",
     "current_relay_source",
+    "current_tcp_peer_ip",
     "decode_envelope",
     "deserialize_activation_tensor",
     "deserialize_decoded_token",

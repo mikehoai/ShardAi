@@ -43,10 +43,17 @@ MAX_PROXIED_TOKENS: int = 4096
 DEFAULT_COMPRESSION_THRESHOLD_BYTES: int = 32 * 1024
 
 # Codec flag bits for wire tensor compression (50% BF16 / 75% INT8 wire bandwidth reduction)
+# and v2+ routing metadata extension (`origin_ip` IPv6 + `origin_peer_id`).
+ACTIVATION_ROUTING_EXT_FLAG: int = 0x20
 TENSOR_DTYPE_BFLOAT16_FLAG: int = 0x40
 TENSOR_DTYPE_INT8_FLAG: int = 0x80
 AUTO_BF16_WIRE_MIN_BYTES: int = 16 * 1024
 AUTO_INT8_WIRE_MIN_BYTES: int = 16 * 1024
+
+# Strict UTF-8 byte caps for wire endpoint IPs and peer identifiers
+MAX_ENDPOINT_IP_BYTES: int = 64
+MAX_PEER_ID_BYTES: int = 128
+ROUTING_EXT_HEADER_STRUCT = struct.Struct("!BB")
 
 
 class PacketType(IntEnum):
@@ -145,6 +152,7 @@ class ActivationFrame:
     temperature: float = DEFAULT_TEMPERATURE
     wire_bfloat16: bool = False
     wire_int8: bool = False
+    origin_peer_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +178,7 @@ class InferenceRequestFrame:
     max_tokens: int
     temperature: float
     compress_activations: bool
+    requester_peer_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,16 +407,98 @@ def _validate_temperature(temperature: float) -> float:
     return temp_float
 
 
+def _parse_wire_ip(ip_str: str) -> tuple[bytes, str, bool]:
+    """Validate and canonicalize an IPv4 or IPv6 literal for binary wire framing.
+
+    Returns `(legacy_ipv4_slot_bytes, canonical_ip_str, is_ipv6)`. Raises `OSError`
+    when `ip_str` is not a valid IPv4 or IPv6 address.
+    """
+    cleaned = ip_str.strip()
+    if not cleaned:
+        raise OSError("IP address must not be empty.")
+
+    if cleaned.startswith("[") or cleaned.endswith("]"):
+        if not (cleaned.startswith("[") and cleaned.endswith("]")):
+            raise OSError(f"Malformed bracketed IPv6 address: {ip_str!r}")
+        inner = cleaned[1:-1].strip()
+        if not inner:
+            raise OSError(f"Empty bracketed IPv6 address: {ip_str!r}")
+        ip_base, sep, zone = inner.partition("%")
+        if sep and not zone:
+            raise OSError(f"Empty zone identifier in IPv6 address: {ip_str!r}")
+        try:
+            addr = ipaddress.ip_address(ip_base)
+        except ValueError as exc:
+            raise OSError(f"Invalid bracketed IPv6 address: {ip_str!r}") from exc
+        if addr.version != 6:
+            raise OSError(f"Bracketed address must be IPv6: {ip_str!r}")
+        canonical = str(addr)
+        if len(canonical.encode("utf-8")) > MAX_ENDPOINT_IP_BYTES:
+            raise ValueError(f"Canonical IP exceeds {MAX_ENDPOINT_IP_BYTES} bytes.")
+        return b"\x7f\x00\x00\x01", canonical, True
+
+    ip_base, sep, zone = cleaned.partition("%")
+    if sep and not zone:
+        raise OSError(f"Empty zone identifier in IP address: {ip_str!r}")
+    try:
+        addr = ipaddress.ip_address(ip_base)
+    except ValueError as exc:
+        if ":" in cleaned or sep:
+            raise OSError(f"Invalid IP address: {ip_str!r}") from exc
+        packed = socket.inet_aton(cleaned)
+        addr4 = ipaddress.IPv4Address(packed)
+        return packed, str(addr4), False
+
+    if sep and addr.version != 6:
+        raise OSError(f"Zone identifier is only valid for IPv6 addresses: {ip_str!r}")
+    canonical = str(addr)
+    if len(canonical.encode("utf-8")) > MAX_ENDPOINT_IP_BYTES:
+        raise ValueError(f"Canonical IP exceeds {MAX_ENDPOINT_IP_BYTES} bytes.")
+    if addr.version == 4:
+        return addr.packed, canonical, False
+    return b"\x7f\x00\x00\x01", canonical, True
+
+
 def _pack_ipv4_or_loopback(ip_str: str) -> bytes:
-    """Pack an IPv4 address into 4 bytes, or map IPv6 addresses to loopback `127.0.0.1`."""
-    cleaned = ip_str.strip().split("%", 1)[0]
+    """Pack an IPv4 address into 4 bytes, or return legacy `127.0.0.1` slot bytes for IPv6."""
+    ipv4_bytes, _canonical, _is_ipv6 = _parse_wire_ip(ip_str)
+    return ipv4_bytes
+
+
+def _validate_peer_id(peer_id: str | None) -> str | None:
+    """Validate and normalize an optional peer identifier within `MAX_PEER_ID_BYTES`."""
+    if peer_id is None:
+        return None
+    if not isinstance(peer_id, str):
+        raise ValueError("peer_id must be a string or None.")
+    cleaned = peer_id.strip()
+    if not cleaned:
+        return None
+    if "\x00" in cleaned:
+        raise ValueError("peer_id must not contain NUL bytes.")
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > MAX_PEER_ID_BYTES:
+        raise ValueError(
+            f"peer_id ({len(encoded)} bytes) exceeds {MAX_PEER_ID_BYTES} byte limit."
+        )
+    return cleaned
+
+
+def _decode_wire_ip_field(raw_ip_str: str) -> str:
+    """Validate and canonicalize a UTF-8 endpoint IP string decoded from a wire frame."""
+    encoded_len = len(raw_ip_str.encode("utf-8"))
+    if encoded_len == 0 or encoded_len > MAX_ENDPOINT_IP_BYTES:
+        raise ValueError(
+            f"Invalid wire IP length ({encoded_len} bytes; max {MAX_ENDPOINT_IP_BYTES})."
+        )
+    cleaned = raw_ip_str.strip()
+    if not cleaned or "%" in cleaned or "[" in cleaned or "]" in cleaned:
+        raise ValueError(f"Invalid wire IP literal: {raw_ip_str!r}")
     try:
         addr = ipaddress.ip_address(cleaned)
-    except ValueError:
-        return socket.inet_aton(ip_str)
-    if addr.version == 4:
-        return addr.packed
-    return b"\x7f\x00\x00\x01"
+    except ValueError as exc:
+        raise ValueError(f"Malformed wire IP literal: {raw_ip_str!r}") from exc
+    return str(addr)
 
 
 def serialize_activation_tensor(
@@ -425,14 +516,18 @@ def serialize_activation_tensor(
     temperature: float = DEFAULT_TEMPERATURE,
     use_bfloat16_wire: bool = False,
     use_int8_wire: bool = False,
+    origin_peer_id: str | None = None,
 ) -> bytes:
     """Pack a hidden-state tensor and routing metadata into a compact binary byte stream.
 
     Automatically engages LZ4 or Zlib compression when `force_compression` is True,
     `network_congested` is True, or the raw tensor size >= 32 KB. Supports `use_int8_wire`
-    (75% wire reduction via per-row symmetric INT8) and `use_bfloat16_wire` (50% reduction).
+    (75% wire reduction via per-row symmetric INT8), `use_bfloat16_wire` (50% reduction),
+    and lossless IPv6 `origin_ip` + `origin_peer_id` routing extension.
     """
     validated_temperature: float = _validate_temperature(temperature)
+    origin_ip_bytes, canonical_origin_ip, is_ipv6 = _parse_wire_ip(origin_ip)
+    normalized_peer_id: str | None = _validate_peer_id(origin_peer_id)
     raw_bytes: bytes = extract_contiguous_float32_bytes(tensor_data)
     if len(raw_bytes) > MAX_UNCOMPRESSED_TENSOR_BYTES:
         raise ValueError(
@@ -480,10 +575,25 @@ def serialize_activation_tensor(
         if wire_int8_active
         else (TENSOR_DTYPE_BFLOAT16_FLAG if wire_bf16_active else 0)
     )
-    codec_flags: int = int(codec) | dtype_flag
-    crc: int = zlib.crc32(wire_payload) & 0xFFFFFFFF
+    if is_ipv6 or normalized_peer_id is not None:
+        ext_ip_bytes = canonical_origin_ip.encode("utf-8") if is_ipv6 else b""
+        ext_peer_bytes = (
+            normalized_peer_id.encode("utf-8") if normalized_peer_id is not None else b""
+        )
+        ext_prefix = (
+            ROUTING_EXT_HEADER_STRUCT.pack(len(ext_ip_bytes), len(ext_peer_bytes))
+            + ext_ip_bytes
+            + ext_peer_bytes
+        )
+        framed_payload = ext_prefix + wire_payload
+        ext_flag = ACTIVATION_ROUTING_EXT_FLAG
+    else:
+        framed_payload = wire_payload
+        ext_flag = 0
+
+    codec_flags: int = int(codec) | dtype_flag | ext_flag
+    crc: int = zlib.crc32(framed_payload) & 0xFFFFFFFF
     req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
-    origin_ip_bytes: bytes = _pack_ipv4_or_loopback(origin_ip)
 
     header: bytes = ACTIVATION_HEADER_STRUCT.pack(
         MAGIC_HEADER,
@@ -502,7 +612,7 @@ def serialize_activation_tensor(
         crc,
         validated_temperature,
     )
-    return header + wire_payload
+    return header + framed_payload
 
 
 def _decode_wire_tensor(
@@ -527,10 +637,61 @@ def _decode_wire_tensor(
     return raw_wire, codec, False, False
 
 
+def _unpack_activation_routing_ext(
+    payload_slice: bytes,
+    fallback_ipv4_bytes: bytes,
+) -> tuple[str, str | None, bytes]:
+    """Unpack bounded `(origin_ip, origin_peer_id)` routing extension prefix before tensor bytes."""
+    if len(payload_slice) < ROUTING_EXT_HEADER_STRUCT.size:
+        raise ValueError("Truncated activation routing extension header.")
+    ip_len, peer_id_len = ROUTING_EXT_HEADER_STRUCT.unpack(
+        payload_slice[: ROUTING_EXT_HEADER_STRUCT.size]
+    )
+    if ip_len > MAX_ENDPOINT_IP_BYTES:
+        raise ValueError(
+            f"Activation routing origin_ip length ({ip_len} bytes) exceeds "
+            f"{MAX_ENDPOINT_IP_BYTES} byte limit."
+        )
+    if peer_id_len > MAX_PEER_ID_BYTES:
+        raise ValueError(
+            f"Activation routing origin_peer_id length ({peer_id_len} bytes) exceeds "
+            f"{MAX_PEER_ID_BYTES} byte limit."
+        )
+    ext_end = ROUTING_EXT_HEADER_STRUCT.size + ip_len + peer_id_len
+    if len(payload_slice) < ext_end:
+        raise ValueError("Truncated activation routing extension payload.")
+
+    cursor = ROUTING_EXT_HEADER_STRUCT.size
+    if ip_len > 0:
+        try:
+            raw_ip = payload_slice[cursor : cursor + ip_len].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Invalid UTF-8 in activation origin_ip: {exc}") from exc
+        resolved_ip = _decode_wire_ip_field(raw_ip)
+        cursor += ip_len
+    else:
+        resolved_ip = socket.inet_ntoa(fallback_ipv4_bytes)
+
+    if peer_id_len > 0:
+        try:
+            raw_peer_id = payload_slice[cursor : cursor + peer_id_len].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"Invalid UTF-8 in activation origin_peer_id: {exc}"
+            ) from exc
+        resolved_peer_id = _validate_peer_id(raw_peer_id)
+        if resolved_peer_id is None:
+            raise ValueError("Activation origin_peer_id extension must not be blank.")
+    else:
+        resolved_peer_id = None
+
+    return resolved_ip, resolved_peer_id, payload_slice[ext_end:]
+
+
 def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
     """Unpack and verify a binary activation tensor frame from an upstream P2P node.
 
-    Supports both the current 60-byte v2 header (with IEEE-754 float64 `temperature`)
+    Supports 60-byte v2 headers (with optional IPv6 + `origin_peer_id` routing extension)
     and legacy 52-byte v1 headers (defaulting `temperature` to `0.7`) via CRC32 verification.
     """
     if len(frame_bytes) < LEGACY_ACTIVATION_HEADER_STRUCT.size:
@@ -573,12 +734,22 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
         actual_crc: int = zlib.crc32(payload_slice) & 0xFFFFFFFF
         if actual_crc == expected_crc:
             validated_temperature: float = _validate_temperature(temperature)
+            if codec_val & ACTIVATION_ROUTING_EXT_FLAG:
+                resolved_origin_ip, resolved_origin_peer_id, tensor_payload = (
+                    _unpack_activation_routing_ext(payload_slice, origin_ip_bytes)
+                )
+                effective_codec_val = codec_val & ~ACTIVATION_ROUTING_EXT_FLAG
+            else:
+                resolved_origin_ip = socket.inet_ntoa(origin_ip_bytes)
+                resolved_origin_peer_id = None
+                tensor_payload = payload_slice
+                effective_codec_val = codec_val
             raw_tensor, codec, wire_bfloat16, wire_int8 = _decode_wire_tensor(
-                payload_slice, codec_val, uncompressed_len, (dim0, dim1)
+                tensor_payload, effective_codec_val, uncompressed_len, (dim0, dim1)
             )
             return ActivationFrame(
                 request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
-                origin_ip=socket.inet_ntoa(origin_ip_bytes),
+                origin_ip=resolved_origin_ip,
                 origin_port=origin_port,
                 current_layer=current_layer,
                 total_layers=total_layers,
@@ -590,6 +761,7 @@ def deserialize_activation_tensor(frame_bytes: bytes) -> ActivationFrame:
                 temperature=validated_temperature,
                 wire_bfloat16=wire_bfloat16,
                 wire_int8=wire_int8,
+                origin_peer_id=resolved_origin_peer_id,
             )
         v2_crc_mismatch = (expected_crc, actual_crc)
 
@@ -699,6 +871,7 @@ def serialize_inference_request(
     max_tokens: int = 256,
     temperature: float = DEFAULT_TEMPERATURE,
     compress_activations: bool = True,
+    requester_peer_id: str | None = None,
 ) -> bytes:
     """Pack a proxied inference request into a bounded binary frame for a Head Node peer."""
     if not (1 <= requester_port <= 65535):
@@ -709,10 +882,17 @@ def serialize_inference_request(
         )
     validated_temperature: float = _validate_temperature(temperature)
     req_uuid_bytes: bytes = uuid.UUID(request_id).bytes
-    requester_ip_bytes: bytes = _pack_ipv4_or_loopback(requester_ip)
+    requester_ip_bytes, canonical_requester_ip, is_ipv6 = _parse_wire_ip(requester_ip)
+    normalized_peer_id: str | None = _validate_peer_id(requester_peer_id)
+
+    body_dict: dict[str, Any] = {"prompt": prompt, "messages": messages}
+    if is_ipv6:
+        body_dict["requester_ip"] = canonical_requester_ip
+    if normalized_peer_id is not None:
+        body_dict["requester_peer_id"] = normalized_peer_id
 
     body_bytes: bytes = json.dumps(
-        {"prompt": prompt, "messages": messages},
+        body_dict,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -803,15 +983,34 @@ def deserialize_inference_request(frame_bytes: bytes) -> InferenceRequestFrame:
                 "Inference request 'messages' must be None or a list of JSON objects."
             )
 
+    raw_requester_ip = decoded_body.get("requester_ip")
+    if raw_requester_ip is not None:
+        if not isinstance(raw_requester_ip, str):
+            raise ValueError("Inference request 'requester_ip' must be a string.")
+        resolved_requester_ip = _decode_wire_ip_field(raw_requester_ip)
+    else:
+        resolved_requester_ip = socket.inet_ntoa(requester_ip_bytes)
+
+    raw_requester_peer_id = decoded_body.get("requester_peer_id")
+    if raw_requester_peer_id is not None:
+        if not isinstance(raw_requester_peer_id, str):
+            raise ValueError("Inference request 'requester_peer_id' must be a string.")
+        resolved_requester_peer_id = _validate_peer_id(raw_requester_peer_id)
+        if resolved_requester_peer_id is None:
+            raise ValueError("Inference request 'requester_peer_id' must not be blank.")
+    else:
+        resolved_requester_peer_id = None
+
     return InferenceRequestFrame(
         request_id=str(uuid.UUID(bytes=req_uuid_bytes)),
-        requester_ip=socket.inet_ntoa(requester_ip_bytes),
+        requester_ip=resolved_requester_ip,
         requester_port=requester_port,
         prompt=prompt,
         messages=messages,
         max_tokens=max_tokens,
         temperature=validated_temperature,
         compress_activations=bool(flags & 0x01),
+        requester_peer_id=resolved_requester_peer_id,
     )
 
 

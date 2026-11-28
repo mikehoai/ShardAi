@@ -81,6 +81,7 @@ from p2p.transport import (
     congestion_monitor,
     current_quic_peer_id,
     current_relay_source,
+    current_tcp_peer_ip,
     dispatch_p2p_frame,
     receive_activations,
     send_activations,
@@ -250,33 +251,114 @@ def _extract_prompt_from_messages(messages: list[ChatMessage]) -> str:
     return "\n".join(parts) if parts else "Hello"
 
 
+def _normalize_ip_host(host: str) -> str:
+    """Strip whitespace and optional `[...]` brackets around an IPv6 literal."""
+    cleaned = host.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        inner = cleaned[1:-1].strip()
+        if inner:
+            try:
+                addr = ipaddress.ip_address(inner.split("%", 1)[0])
+                if addr.version == 6:
+                    return inner
+            except ValueError:
+                pass
+    return cleaned
+
+
+def _parse_comparable_ip(
+    ip_str: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse an IPv4 or IPv6 literal into a canonical address, unwrapping IPv4-mapped IPv6."""
+    cleaned = ip_str.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("[") or cleaned.endswith("]"):
+        if not (cleaned.startswith("[") and cleaned.endswith("]")):
+            return None
+        inner = cleaned[1:-1].strip()
+        if not inner:
+            return None
+        ip_base, sep, zone = inner.partition("%")
+        if sep and not zone:
+            return None
+        try:
+            addr = ipaddress.ip_address(ip_base)
+        except ValueError:
+            return None
+        if addr.version != 6:
+            return None
+    else:
+        ip_base, sep, zone = cleaned.partition("%")
+        if sep and not zone:
+            return None
+        try:
+            addr = ipaddress.ip_address(ip_base)
+        except ValueError:
+            return None
+        if sep and addr.version != 6:
+            return None
+
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
 def _resolve_advertise_ip(
     target_peer_ip: str,
     target_peer_port: int,
     *,
     public_ip: str | None = None,
 ) -> str:
-    """Resolve the local IPv4 address reachable by `target_peer_ip` for return token frames."""
+    """Resolve the local IPv4 or IPv6 address reachable by `target_peer_ip` for return frames."""
     explicit_ip = os.getenv("SHARDAI_ADVERTISE_IP", "").strip()
     if explicit_ip:
-        return explicit_ip
-    if target_peer_ip.startswith("127.") or target_peer_ip == "localhost":
+        return _normalize_ip_host(explicit_ip)
+
+    cleaned_target = _normalize_ip_host(target_peer_ip)
+    if cleaned_target.startswith("127.") or cleaned_target.lower() == "localhost":
         return "127.0.0.1"
+
+    target_addr: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    try:
+        target_addr = ipaddress.ip_address(cleaned_target.split("%", 1)[0])
+    except ValueError:
+        target_addr = None
+
     effective_public_ip = public_ip if public_ip is not None else runtime.public_ip
-    if effective_public_ip:
+    if effective_public_ip and target_addr is not None and target_addr.is_global:
         try:
             pub_addr = ipaddress.ip_address(
-                effective_public_ip.strip().split("%", 1)[0]
+                _normalize_ip_host(effective_public_ip).split("%", 1)[0]
             )
-            target_addr = ipaddress.ip_address(target_peer_ip.strip().split("%", 1)[0])
-            if pub_addr.version == 4 and target_addr.is_global:
+            if pub_addr.version == 6 and target_addr.version == 6:
+                return str(pub_addr)
+            if pub_addr.version == 4:
                 return str(pub_addr)
         except ValueError:
             pass
+
+    if target_addr is not None and target_addr.version == 6:
+        sock_v6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        try:
+            sock_v6.connect((str(target_addr), target_peer_port))
+            raw_local_v6 = str(sock_v6.getsockname()[0]).split("%", 1)[0]
+            local_v6_addr = ipaddress.ip_address(raw_local_v6)
+            if not local_v6_addr.is_unspecified:
+                return str(local_v6_addr)
+            return "::1"
+        except (OSError, ValueError, OverflowError):
+            return "::1"
+        finally:
+            sock_v6.close()
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect((target_peer_ip, target_peer_port))
-        return str(sock.getsockname()[0])
+        sock.connect((cleaned_target, target_peer_port))
+        raw_local_v4 = str(sock.getsockname()[0])
+        if raw_local_v4 == "0.0.0.0":
+            return "127.0.0.1"
+        return raw_local_v4
     except (OSError, ValueError, OverflowError):
         return "127.0.0.1"
     finally:
@@ -389,16 +471,15 @@ _MAX_PEER_ROUTES: int = 256
 
 def _is_lan_or_loopback_ip(ip: str) -> bool:
     """Return True if `ip` is a loopback, private RFC1918/ULA, or link-local address."""
-    cleaned = ip.strip().split("%", 1)[0]
+    cleaned = _normalize_ip_host(ip).split("%", 1)[0]
     if not cleaned:
         return True
     if cleaned.lower() == "localhost":
         return True
-    try:
-        addr = ipaddress.ip_address(cleaned)
-        return bool(addr.is_loopback or addr.is_private or addr.is_link_local)
-    except ValueError:
+    addr = _parse_comparable_ip(ip)
+    if addr is None:
         return False
+    return bool(addr.is_loopback or addr.is_private or addr.is_link_local)
 
 
 class LocalNodeRuntime:
@@ -1013,18 +1094,14 @@ class LocalNodeRuntime:
 
     def _peer_for_endpoint(self, ip: str, port: int) -> PeerNodeInfo | None:
         """Return the matching `PeerNodeInfo` for `(ip, port)` if known in `self.peers`."""
-        try:
-            target_addr = ipaddress.ip_address(ip.strip().split("%", 1)[0])
-        except ValueError:
+        target_addr = _parse_comparable_ip(ip)
+        if target_addr is None:
             return None
         for peer in self.peers:
             if peer.port != port:
                 continue
-            try:
-                peer_addr = ipaddress.ip_address(peer.ip_address.strip().split("%", 1)[0])
-            except ValueError:
-                continue
-            if peer_addr == target_addr:
+            peer_addr = _parse_comparable_ip(peer.ip_address)
+            if peer_addr is not None and peer_addr == target_addr:
                 return peer
         return None
 
@@ -1038,19 +1115,42 @@ class LocalNodeRuntime:
         target_peer_id: str | None = None,
     ) -> float:
         """Send a return frame to a peer via QUIC/relay-aware routing when a matching peer exists."""
-        preferred_peer_id = (
-            target_peer_id
-            if target_peer_id is not None
-            else (current_quic_peer_id.get() or current_relay_source.get())
-        )
         peer: PeerNodeInfo | None = None
-        if preferred_peer_id is not None:
-            for candidate in self.peers:
-                if candidate.peer_id == preferred_peer_id:
-                    peer = candidate
-                    break
-        if peer is None:
+        if target_peer_id is not None:
+            peer = next(
+                (
+                    candidate
+                    for candidate in self.peers
+                    if candidate.peer_id == target_peer_id
+                ),
+                None,
+            )
+            if peer is None:
+                endpoint_peer = self._peer_for_endpoint(ip, port)
+                if endpoint_peer is not None and endpoint_peer.peer_id == target_peer_id:
+                    peer = endpoint_peer
+        else:
             peer = self._peer_for_endpoint(ip, port)
+            if peer is None:
+                auth_sender_id = current_quic_peer_id.get() or current_relay_source.get()
+                if auth_sender_id is not None:
+                    auth_peer = next(
+                        (
+                            candidate
+                            for candidate in self.peers
+                            if candidate.peer_id == auth_sender_id
+                        ),
+                        None,
+                    )
+                    # Only fall back to the immediate transport sender when this node is Head
+                    # replying to a direct proxy requester, or when the immediate sender is itself
+                    # a Head node (2-node NAT/QUIC/Relay pipeline). Never route Tail return frames
+                    # to an intermediate Middle hop (`shard_layer_start > 0`).
+                    if auth_peer is not None and (
+                        self.shard_layer_start == 0 or auth_peer.shard_layer_start == 0
+                    ):
+                        peer = auth_peer
+
         if peer is not None:
             return await self.send_frame_to_peer(
                 peer=peer,
@@ -1214,9 +1314,8 @@ class LocalNodeRuntime:
         """Verify `(ip, port)` is a valid non-unspecified/multicast/link-local endpoint in `peers`."""
         if not (1 <= port <= 65535):
             return False
-        try:
-            target_addr = ipaddress.ip_address(ip.strip().split("%", 1)[0])
-        except ValueError:
+        target_addr = _parse_comparable_ip(ip)
+        if target_addr is None:
             return False
 
         if (
@@ -1229,36 +1328,101 @@ class LocalNodeRuntime:
         for peer in peers:
             if peer.port != port:
                 continue
-            try:
-                peer_addr = ipaddress.ip_address(
-                    peer.ip_address.strip().split("%", 1)[0]
-                )
-            except ValueError:
-                continue
-            if peer_addr == target_addr:
+            peer_addr = _parse_comparable_ip(peer.ip_address)
+            if peer_addr is not None and peer_addr == target_addr:
                 return True
         return False
+
+    @staticmethod
+    def _matching_peers_by_ip(
+        peers: list[PeerNodeInfo], ip: str
+    ) -> list[PeerNodeInfo]:
+        """Return peers in `peers` whose normalized IP matches `ip`."""
+        target_addr = _parse_comparable_ip(ip)
+        if (
+            target_addr is None
+            or target_addr.is_unspecified
+            or target_addr.is_multicast
+        ):
+            return []
+        matched: list[PeerNodeInfo] = []
+        for peer in peers:
+            peer_addr = _parse_comparable_ip(peer.ip_address)
+            if peer_addr is not None and peer_addr == target_addr:
+                matched.append(peer)
+        return matched
 
     @staticmethod
     def _get_authenticated_peer_id() -> str | None:
         """Return the authenticated peer_id from active QUIC or Relay transport context."""
         return current_quic_peer_id.get() or current_relay_source.get()
 
-    def _is_authorized_peer_endpoint(self, ip: str, port: int) -> bool:
+    def _is_authorized_peer_endpoint(
+        self,
+        ip: str,
+        port: int,
+        requester_peer_id: str | None = None,
+    ) -> bool:
         """Verify `(ip, port)` or cryptographic QUIC/relay peer identity matches `self.peers`."""
         if not self.peers:
             return False
+        if requester_peer_id is not None and not any(
+            p.peer_id == requester_peer_id for p in self.peers
+        ):
+            return False
         auth_peer_id = self._get_authenticated_peer_id()
         if auth_peer_id is not None:
-            return auth_peer_id in {p.peer_id for p in self.peers}
-        return self._matches_peer_endpoint(self.peers, ip, port)
+            if auth_peer_id not in {p.peer_id for p in self.peers}:
+                return False
+            if requester_peer_id is not None and requester_peer_id != auth_peer_id:
+                return False
+            return True
 
-    def _is_authorized_activation_origin(self, origin_ip: str, origin_port: int) -> bool:
-        """Verify `frame.origin_ip`/`origin_port` or authenticated QUIC/relay peer identity."""
+        tcp_peer_ip = current_tcp_peer_ip.get()
+        if tcp_peer_ip is not None and not self._matching_peers_by_ip(
+            self.peers, tcp_peer_ip
+        ):
+            return False
+
+        if not self._matches_peer_endpoint(self.peers, ip, port):
+            return False
+        if requester_peer_id is not None:
+            matched_peer = self._peer_for_endpoint(ip, port)
+            if matched_peer is None or matched_peer.peer_id != requester_peer_id:
+                return False
+        return True
+
+    def _is_authorized_activation_origin(
+        self,
+        origin_ip: str,
+        origin_port: int,
+        origin_peer_id: str | None = None,
+    ) -> bool:
+        """Verify `frame.origin_ip`/`origin_port`/`origin_peer_id` and immediate hop identity."""
         if not self.peers:
             return False
         head_peers = [peer for peer in self.peers if peer.shard_layer_start == 0]
         allowed_peers = head_peers if head_peers else self.peers
+
+        origin_peer: PeerNodeInfo | None = None
+        if origin_peer_id is not None:
+            origin_peer = next(
+                (p for p in allowed_peers if p.peer_id == origin_peer_id), None
+            )
+            if origin_peer is None:
+                return False
+            if not (1 <= origin_port <= 65535):
+                return False
+            parsed_origin = _parse_comparable_ip(origin_ip)
+            if (
+                parsed_origin is None
+                or parsed_origin.is_unspecified
+                or parsed_origin.is_multicast
+            ):
+                return False
+        else:
+            parsed_origin = _parse_comparable_ip(origin_ip)
+
         auth_peer_id = self._get_authenticated_peer_id()
         if auth_peer_id is not None:
             sender_peer = next(
@@ -1266,11 +1430,40 @@ class LocalNodeRuntime:
             )
             if sender_peer is None:
                 return False
+            if origin_peer is not None:
+                return auth_peer_id == origin_peer.peer_id or (
+                    sender_peer.shard_layer_end < self.shard_layer_start
+                )
             if self._matches_peer_endpoint(allowed_peers, origin_ip, origin_port):
                 return True
             # Over NAT/CGNAT or dual-stack QUIC/relay, peer identity is already authenticated.
             return any(p.peer_id == auth_peer_id for p in allowed_peers) or (
                 sender_peer.shard_layer_end < self.shard_layer_start
+            )
+
+        if parsed_origin is None or parsed_origin.is_link_local:
+            return False
+
+        tcp_peer_ip = current_tcp_peer_ip.get()
+        if tcp_peer_ip is not None:
+            tcp_sender_peers = self._matching_peers_by_ip(self.peers, tcp_peer_ip)
+            if not tcp_sender_peers:
+                return False
+            if origin_peer is not None:
+                return any(
+                    p.peer_id == origin_peer.peer_id
+                    or p.shard_layer_end < self.shard_layer_start
+                    for p in tcp_sender_peers
+                )
+            return self._matches_peer_endpoint(allowed_peers, origin_ip, origin_port)
+
+        if origin_peer is not None:
+            if self._matches_peer_endpoint([origin_peer], origin_ip, origin_port):
+                return True
+            return any(
+                p.shard_layer_end < self.shard_layer_start
+                and p.peer_id != origin_peer.peer_id
+                for p in self.peers
             )
         return self._matches_peer_endpoint(allowed_peers, origin_ip, origin_port)
 
@@ -1284,11 +1477,16 @@ class LocalNodeRuntime:
                 "Node is not RUNNING and cannot process incoming activation frames."
             )
 
-        if not self._is_authorized_activation_origin(frame.origin_ip, frame.origin_port):
+        if not self._is_authorized_activation_origin(
+            frame.origin_ip,
+            frame.origin_port,
+            origin_peer_id=frame.origin_peer_id,
+        ):
             logger.warning(
-                "Rejecting incoming activation frame from unauthorized origin %s:%d.",
+                "Rejecting incoming activation frame from unauthorized origin %s:%d (peer=%s).",
                 frame.origin_ip,
                 frame.origin_port,
+                frame.origin_peer_id,
             )
             raise RuntimeError(
                 f"Rejected activation frame from unauthorized origin {frame.origin_ip}:{frame.origin_port}."
@@ -1336,17 +1534,44 @@ class LocalNodeRuntime:
                 token_text=token_text,
                 is_eos=is_eos,
             )
-            origin_peer = self._peer_for_endpoint(frame.origin_ip, frame.origin_port)
-            origin_peer_id: str | None = origin_peer.peer_id if origin_peer is not None else None
-            if origin_peer_id is None:
-                head_peers = self.find_head_node_peers()
-                if head_peers:
-                    origin_peer_id = head_peers[0].peer_id
+            origin_peer: PeerNodeInfo | None = None
+            if frame.origin_peer_id is not None:
+                origin_peer = next(
+                    (p for p in self.peers if p.peer_id == frame.origin_peer_id),
+                    None,
+                )
+            else:
+                origin_peer = self._peer_for_endpoint(frame.origin_ip, frame.origin_port)
+                if origin_peer is None:
+                    auth_sender_id = self._get_authenticated_peer_id()
+                    if auth_sender_id is not None:
+                        sender_peer = next(
+                            (p for p in self.peers if p.peer_id == auth_sender_id),
+                            None,
+                        )
+                        if sender_peer is not None and sender_peer.shard_layer_start == 0:
+                            origin_peer = sender_peer
+                if origin_peer is None:
+                    head_peers = self.find_head_node_peers()
+                    if len(head_peers) == 1:
+                        origin_peer = head_peers[0]
+
+            dest_ip = (
+                origin_peer.ip_address if origin_peer is not None else frame.origin_ip
+            )
+            dest_port = (
+                origin_peer.port if origin_peer is not None else frame.origin_port
+            )
+            dest_peer_id = (
+                origin_peer.peer_id
+                if origin_peer is not None
+                else frame.origin_peer_id
+            )
             await self._send_to_endpoint(
-                ip=frame.origin_ip,
-                port=frame.origin_port,
+                ip=dest_ip,
+                port=dest_port,
                 frame=token_packet,
-                target_peer_id=origin_peer_id,
+                target_peer_id=dest_peer_id,
             )
         elif next_peer is not None:
             next_candidates = self.find_candidate_peers_for_next_layer(completed_layer)
@@ -1370,6 +1595,7 @@ class LocalNodeRuntime:
                 temperature=frame.temperature,
                 use_bfloat16_wire=self._should_use_bf16_wire(output_tensor_bytes),
                 use_int8_wire=self._should_use_int8_wire(output_tensor_bytes),
+                origin_peer_id=frame.origin_peer_id,
             )
             await self.send_with_failover(
                 completed_layer=completed_layer,
@@ -1489,12 +1715,15 @@ class LocalNodeRuntime:
             )
 
         if not self._is_authorized_peer_endpoint(
-            frame.requester_ip, frame.requester_port
+            frame.requester_ip,
+            frame.requester_port,
+            requester_peer_id=frame.requester_peer_id,
         ):
             logger.warning(
-                "Rejecting incoming proxied inference request from unauthorized peer %s:%d.",
+                "Rejecting incoming proxied inference request from unauthorized peer %s:%d (peer=%s).",
                 frame.requester_ip,
                 frame.requester_port,
+                frame.requester_peer_id,
             )
             raise RuntimeError(
                 f"Rejected proxied inference request from unauthorized peer "
@@ -1511,7 +1740,15 @@ class LocalNodeRuntime:
                 "Head Node reached maximum concurrent proxied inference capacity."
             )
 
-        requester_peer_id: str | None = self._get_authenticated_peer_id()
+        requester_peer_id: str | None = (
+            self._get_authenticated_peer_id() or frame.requester_peer_id
+        )
+        if requester_peer_id is None:
+            matched_requester = self._peer_for_endpoint(
+                frame.requester_ip, frame.requester_port
+            )
+            if matched_requester is not None:
+                requester_peer_id = matched_requester.peer_id
         try:
             self.validate_pipeline_preflight(
                 has_image_attachments=messages_contain_image(frame.messages)
@@ -2097,6 +2334,7 @@ class LocalNodeRuntime:
                     max_tokens=effective_max_tokens,
                     temperature=temperature,
                     compress_activations=compress_activations,
+                    requester_peer_id=self.node_id,
                 )
                 try:
                     await self.send_frame_to_peer(
@@ -2325,6 +2563,7 @@ class LocalNodeRuntime:
                                 temperature=temperature,
                                 use_bfloat16_wire=use_bf16,
                                 use_int8_wire=use_int8,
+                                origin_peer_id=self.node_id,
                             )
                             self._drain_token_queue_for_step(
                                 token_queue,
