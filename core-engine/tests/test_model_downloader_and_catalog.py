@@ -28,9 +28,12 @@ from models.downloader import (
     ModelDownloader,
     compute_model_fingerprint,
     compute_model_fingerprint_async,
+    expand_split_gguf_filenames,
     has_gguf_magic,
     is_valid_gguf_file,
+    sanitize_catalog_entries,
     sanitize_catalog_entry,
+    select_best_gguf_filename,
 )
 from shard_engine.memory_manager import LayerAllocationPlan, calculate_max_layers
 from shard_engine.schemas import CatalogModelItem, CatalogModelTask, NodeState
@@ -1049,14 +1052,15 @@ def test_catalog_endpoint_and_cache_preserve_task_and_category_end_to_end(
     assert cached_by_id["wan-2.1"]["task"] == "video"
     assert cached_by_id["qwen-vl"]["task"] == "multimodal"
 
-    # 3. Default catalog fallback includes task="text"
+    # 3. Default catalog fallback includes valid task types ("text" and "multimodal")
     downloader.catalog_cache_path.unlink()
     default_res = client.get("/models/catalog")
     assert default_res.status_code == 200
     default_body = default_res.json()
     assert default_body["source"] == "default"
     assert default_body["count"] == len(DEFAULT_CATALOG_MODELS)
-    assert all(item["task"] == "text" for item in default_body["models"])
+    assert all(item["task"] in ("text", "multimodal") for item in default_body["models"])
+    assert {item["task"] for item in default_body["models"]} == {"text", "multimodal"}
 
 
 @pytest.mark.asyncio
@@ -1461,3 +1465,317 @@ async def test_direct_url_split_magic_across_tiny_chunks_aborts_early_or_accepts
     assert ok_stream.chunks_yielded == 3
     assert ok_path.is_file()
     assert has_gguf_magic(ok_path)
+
+
+def test_featured_unsloth_models_in_default_catalog_and_endpoint_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All 8 featured Unsloth GGUF models sanitize cleanly and surface via `GET /models/catalog` fallback."""
+    monkeypatch.setenv("SHARDAI_ENABLE_TRACKER", "false")
+    downloader = _make_downloader(tmp_path)
+    runtime.model_downloader = downloader
+
+    expected_unsloth = [
+        (
+            "deepseek-v4.1-flash",
+            "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+            "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf",
+            "mmproj-F16.gguf",
+            "vision",
+            470.0,
+            "multimodal",
+            "llm",
+        ),
+        (
+            "qwen-3.8-27b",
+            "unsloth/Qwen3.8-27B-GGUF",
+            "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            "mmproj-F16.gguf",
+            "vision",
+            18.0,
+            "multimodal",
+            "llm",
+        ),
+        (
+            "deepseek-v4-pro-0813",
+            "unsloth/DeepSeek-V4-Pro-0813-GGUF",
+            "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf",
+            None,
+            None,
+            795.0,
+            "text",
+            "llm",
+        ),
+        (
+            "nemotron-3.5-lightning-30b-a3b",
+            "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+            "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf",
+            None,
+            None,
+            24.5,
+            "text",
+            "llm",
+        ),
+        (
+            "qwen-3.8-2.4t-a95b",
+            "unsloth/Qwen3.8-2.4T-A95B-GGUF",
+            "UD-IQ4_XS/Qwen3.8-2.4T-A95B-UD-IQ4_XS-00001-of-00029.gguf",
+            None,
+            None,
+            1225.0,
+            "text",
+            "llm",
+        ),
+        (
+            "muse-glimmer-30b",
+            "unsloth/Muse-Glimmer-30B-GGUF",
+            "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+            "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+            "vision",
+            17.0,
+            "multimodal",
+            "llm",
+        ),
+        (
+            "deepseek-v4-flash-0731",
+            "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+            "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf",
+            None,
+            None,
+            146.0,
+            "text",
+            "llm",
+        ),
+        (
+            "minimax-h3",
+            "unsloth/MiniMax-H3-GGUF",
+            "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+            None,
+            "vision",
+            18.0,
+            "multimodal",
+            "vision",
+        ),
+    ]
+
+    catalog_ids = [entry["id"] for entry in DEFAULT_CATALOG_MODELS]
+    assert catalog_ids[:8] == [item[0] for item in expected_unsloth]
+    assert "deepseek-r1-distill-qwen-14b" not in catalog_ids
+    for preserved_id in (
+        "deepseek-r1-distill-llama-8b",
+        "qwen-2.5-coder-7b",
+        "qwen-2.5-coder-32b",
+        "llama-3.1-8b",
+        "gemma-2-9b",
+    ):
+        assert preserved_id in catalog_ids
+
+    sanitized = sanitize_catalog_entries(DEFAULT_CATALOG_MODELS)
+    assert len(sanitized) == len(DEFAULT_CATALOG_MODELS) == 13
+    for entry in sanitized:
+        CatalogModelItem.model_validate(entry)
+
+    res = client.get("/models/catalog")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["source"] == "default"
+    assert body["count"] == 13
+    by_id = {m["id"]: m for m in body["models"]}
+
+    for (
+        model_id,
+        repo_id,
+        filename,
+        mmproj_filename,
+        modality,
+        ram_gb,
+        task,
+        category,
+    ) in expected_unsloth:
+        item = by_id[model_id]
+        assert item["repo_id"] == repo_id
+        assert item["filename"] == filename
+        assert item["mmproj_filename"] == mmproj_filename
+        assert item["modality"] == modality
+        assert item["estimated_ram_gb"] == ram_gb
+        assert item["task"] == task
+        assert item["category"] == category
+
+    # Subdirectory GGUF path resolution stays anchored inside models_dir
+    resolved_sub = downloader.resolve_gguf_in_models_dir("deepseek-v4.1-flash", None)
+    assert resolved_sub == (
+        downloader.models_dir
+        / "UD-Q4_K_XL"
+        / "DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf"
+    ).resolve()
+
+
+def test_expand_split_gguf_filenames_and_select_best_gguf_filename() -> None:
+    """`expand_split_gguf_filenames` and `select_best_gguf_filename` handle Unsloth split sets and helper files."""
+    assert expand_split_gguf_filenames("Qwen3.8-27B-UD-Q4_K_XL.gguf") == [
+        "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    ]
+    assert expand_split_gguf_filenames("Single-00001-of-00001.gguf") == [
+        "Single-00001-of-00001.gguf"
+    ]
+    assert expand_split_gguf_filenames(
+        "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00003.GGUF"
+    ) == [
+        "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00003.GGUF",
+        "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00002-of-00003.GGUF",
+        "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00003-of-00003.GGUF",
+    ]
+
+    # Filters out mmproj, imatrix, mtp-*, dspark-*, dflash-* and picks part 00001 even when listed after 00002
+    repo_files = [
+        "imatrix_unsloth.gguf",
+        "mmproj-F16.gguf",
+        "mtp-UD-Q4_K_XL.gguf",
+        "dspark-Q4_K_M.gguf",
+        "dflash-Q4_K_M.gguf",
+        "UD-Q4_K_XL/Model-UD-Q4_K_XL-00002-of-00003.gguf",
+        "UD-Q4_K_XL/Model-UD-Q4_K_XL-00003-of-00003.gguf",
+        "UD-Q4_K_XL/Model-UD-Q4_K_XL-00001-of-00003.gguf",
+        "Q8_0/Model-Q8_0-00001-of-00005.gguf",
+    ]
+    assert (
+        select_best_gguf_filename(repo_files)
+        == "UD-Q4_K_XL/Model-UD-Q4_K_XL-00001-of-00003.gguf"
+    )
+
+    # Recognizes UD-Q4_K_M and UD-IQ4_XS over lower-priority quants
+    assert (
+        select_best_gguf_filename(["Model-Q8_0.gguf", "Model-UD-IQ4_XS.gguf"])
+        == "Model-UD-IQ4_XS.gguf"
+    )
+    assert (
+        select_best_gguf_filename(["Model-UD-IQ4_XS.gguf", "Model-UD-Q4_K_M.gguf"])
+        == "Model-UD-Q4_K_M.gguf"
+    )
+
+
+@pytest.mark.asyncio
+async def test_multipart_split_gguf_download_online_and_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-part split GGUF downloads and validates all parts in both online and offline modes."""
+    split_part_1 = "UD-Q4_K_XL/TestSplit-UD-Q4_K_XL-00001-of-00003.gguf"
+    expected_parts = expand_split_gguf_filenames(split_part_1)
+    assert len(expected_parts) == 3
+
+    # 1. Online mode: downloads all 3 split parts + mmproj, caches when all valid, repairs missing/corrupt parts
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "false")
+    online_dl = _make_downloader(tmp_path / "online")
+    valid_bytes = _build_synthetic_gguf_bytes(block_count=32, total_size=1_120_000)
+    hf_calls: list[tuple[str, str]] = []
+
+    def _fake_hf_hub_download(**kwargs: Any) -> str:
+        repo_id = str(kwargs["repo_id"])
+        filename = str(kwargs["filename"])
+        local_dir = Path(str(kwargs["local_dir"]))
+        tqdm_cls = kwargs.get("tqdm_class")
+        hf_calls.append((repo_id, filename))
+        out_path = local_dir / filename
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(valid_bytes)
+        if tqdm_cls is not None:
+            with tqdm_cls(total=len(valid_bytes)) as bar:
+                bar.update(len(valid_bytes))
+        return str(out_path)
+
+    monkeypatch.setattr(downloader_module, "hf_hub_download", _fake_hf_hub_download)
+
+    online_events: list[DownloadProgressEvent] = []
+    artifacts = await online_dl.ensure_model_artifacts_downloaded(
+        model_id="unsloth/TestSplit-GGUF",
+        source_type="huggingface",
+        filename=split_part_1,
+        mmproj_filename="mmproj-F16.gguf",
+        on_event=online_events.append,
+    )
+
+    resolved_parts = [
+        online_dl.resolve_gguf_in_models_dir("unsloth/TestSplit-GGUF", fn)
+        for fn in expected_parts
+    ]
+    assert artifacts.model_path == resolved_parts[0]
+    assert all(is_valid_gguf_file(p) for p in resolved_parts)
+    assert artifacts.mmproj_path == (online_dl.models_dir / "mmproj-F16.gguf").resolve()
+    assert [fn for _repo, fn in hf_calls] == [*expected_parts, "mmproj-F16.gguf"]
+    assert online_events[-1].status == "completed"
+    assert online_events[-1].local_path == str(resolved_parts[0])
+
+    # Second call with all 3 parts valid hits cache without calling hf_hub_download
+    hf_calls.clear()
+    cached_events: list[DownloadProgressEvent] = []
+    cached_artifacts = await online_dl.ensure_model_artifacts_downloaded(
+        model_id="unsloth/TestSplit-GGUF",
+        source_type="huggingface",
+        filename=split_part_1,
+        mmproj_filename="mmproj-F16.gguf",
+        on_event=cached_events.append,
+    )
+    assert hf_calls == []
+    assert cached_artifacts.model_path == resolved_parts[0]
+    assert cached_events[-1].status == "cached"
+
+    # Corrupt part 2 and delete part 3 -> only part 2 and part 3 are re-downloaded; part 1 stays cached
+    resolved_parts[1].write_bytes(b"<html>corrupt shard</html>" + (b"x" * 1_120_000))
+    resolved_parts[2].unlink()
+    repair_events: list[DownloadProgressEvent] = []
+    repaired = await online_dl.ensure_model_artifacts_downloaded(
+        model_id="unsloth/TestSplit-GGUF",
+        source_type="huggingface",
+        filename=split_part_1,
+        mmproj_filename="mmproj-F16.gguf",
+        on_event=repair_events.append,
+    )
+    assert [fn for _repo, fn in hf_calls] == [expected_parts[1], expected_parts[2]]
+    assert repaired.model_path == resolved_parts[0]
+    assert all(is_valid_gguf_file(p) for p in resolved_parts)
+    assert "cached" not in [e.status for e in repair_events]
+    assert repair_events[-1].status == "completed"
+
+    # 2. Offline mode: generates deterministic GGUF stubs for all 3 split parts and caches when all exist
+    monkeypatch.setenv("SHARDAI_OFFLINE_MODE", "true")
+    offline_dl = _make_downloader(tmp_path / "offline")
+    offline_parts = [
+        offline_dl.resolve_gguf_in_models_dir("unsloth/TestSplit-GGUF", fn)
+        for fn in expected_parts
+    ]
+    offline_events: list[DownloadProgressEvent] = []
+    offline_artifacts = await offline_dl.ensure_model_artifacts_downloaded(
+        model_id="unsloth/TestSplit-GGUF",
+        source_type="huggingface",
+        filename=split_part_1,
+        on_event=offline_events.append,
+    )
+    assert offline_artifacts.model_path == offline_parts[0]
+    assert all(is_valid_gguf_file(p, min_bytes=len(GGUF_MAGIC)) for p in offline_parts)
+    assert offline_events[-1].status == "completed"
+    assert offline_events[-1].local_path == str(offline_parts[0])
+
+    # Subsequent offline call reports "cached" only when all 3 parts exist
+    offline_cached_events: list[DownloadProgressEvent] = []
+    await offline_dl.ensure_model_artifacts_downloaded(
+        model_id="unsloth/TestSplit-GGUF",
+        source_type="huggingface",
+        filename=split_part_1,
+        on_event=offline_cached_events.append,
+    )
+    assert offline_cached_events[-1].status == "cached"
+
+    # Deleting part 3 invalidates offline cache and regenerates missing part 3
+    offline_parts[2].unlink()
+    offline_regen_events: list[DownloadProgressEvent] = []
+    await offline_dl.ensure_model_artifacts_downloaded(
+        model_id="unsloth/TestSplit-GGUF",
+        source_type="huggingface",
+        filename=split_part_1,
+        on_event=offline_regen_events.append,
+    )
+    assert "cached" not in [e.status for e in offline_regen_events]
+    assert offline_regen_events[-1].status == "completed"
+    assert all(is_valid_gguf_file(p, min_bytes=len(GGUF_MAGIC)) for p in offline_parts)

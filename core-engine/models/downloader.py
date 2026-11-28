@@ -290,20 +290,98 @@ def sanitize_catalog_entries(entries: Any) -> list[dict[str, Any]]:
 
 DEFAULT_CATALOG_MODELS: list[dict[str, Any]] = [
     {
+        "id": "deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "repo_id": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+        "filename": "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf",
+        "mmproj_filename": "mmproj-F16.gguf",
+        "modality": "vision",
+        "estimated_ram_gb": 470.0,
+        "enabled": True,
+        "task": "multimodal",
+        "category": "llm",
+    },
+    {
+        "id": "qwen-3.8-27b",
+        "name": "Qwen3.8-27B",
+        "repo_id": "unsloth/Qwen3.8-27B-GGUF",
+        "filename": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        "mmproj_filename": "mmproj-F16.gguf",
+        "modality": "vision",
+        "estimated_ram_gb": 18.0,
+        "enabled": True,
+        "task": "multimodal",
+        "category": "llm",
+    },
+    {
+        "id": "deepseek-v4-pro-0813",
+        "name": "DeepSeek V4-Pro-0813",
+        "repo_id": "unsloth/DeepSeek-V4-Pro-0813-GGUF",
+        "filename": "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf",
+        "estimated_ram_gb": 795.0,
+        "enabled": True,
+        "task": "text",
+        "category": "llm",
+    },
+    {
+        "id": "nemotron-3.5-lightning-30b-a3b",
+        "name": "Nemotron 3.5 Lightning-30B-A3B",
+        "repo_id": "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+        "filename": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf",
+        "estimated_ram_gb": 24.5,
+        "enabled": True,
+        "task": "text",
+        "category": "llm",
+    },
+    {
+        "id": "qwen-3.8-2.4t-a95b",
+        "name": "Qwen3.8-2.4T-A95B",
+        "repo_id": "unsloth/Qwen3.8-2.4T-A95B-GGUF",
+        "filename": "UD-IQ4_XS/Qwen3.8-2.4T-A95B-UD-IQ4_XS-00001-of-00029.gguf",
+        "estimated_ram_gb": 1225.0,
+        "enabled": True,
+        "task": "text",
+        "category": "llm",
+    },
+    {
+        "id": "muse-glimmer-30b",
+        "name": "Muse Glimmer-30B",
+        "repo_id": "unsloth/Muse-Glimmer-30B-GGUF",
+        "filename": "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+        "mmproj_filename": "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+        "modality": "vision",
+        "estimated_ram_gb": 17.0,
+        "enabled": True,
+        "task": "multimodal",
+        "category": "llm",
+    },
+    {
+        "id": "deepseek-v4-flash-0731",
+        "name": "DeepSeek V4-Flash-0731",
+        "repo_id": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+        "filename": "UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf",
+        "estimated_ram_gb": 146.0,
+        "enabled": True,
+        "task": "text",
+        "category": "llm",
+    },
+    {
+        "id": "minimax-h3",
+        "name": "MiniMax H3 (Omni-Modal Image & Video)",
+        "repo_id": "unsloth/MiniMax-H3-GGUF",
+        "filename": "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+        "modality": "vision",
+        "estimated_ram_gb": 18.0,
+        "enabled": True,
+        "task": "multimodal",
+        "category": "vision",
+    },
+    {
         "id": "deepseek-r1-distill-llama-8b",
         "name": "DeepSeek-R1 Distill Llama 8B",
         "repo_id": "bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF",
         "filename": "DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf",
         "estimated_ram_gb": 5.2,
-        "enabled": True,
-        "task": "text",
-    },
-    {
-        "id": "deepseek-r1-distill-qwen-14b",
-        "name": "DeepSeek-R1 Distill Qwen 14B",
-        "repo_id": "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
-        "filename": "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf",
-        "estimated_ram_gb": 9.2,
         "enabled": True,
         "task": "text",
     },
@@ -437,8 +515,36 @@ async def compute_model_fingerprint_async(model_path: Path) -> str:
     return await asyncio.to_thread(compute_model_fingerprint, model_path)
 
 
+_SPLIT_GGUF_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})(\.gguf)$", re.IGNORECASE)
+MAX_SPLIT_GGUF_PARTS: int = 1024
+
+
+def expand_split_gguf_filenames(filename: str) -> list[str]:
+    """Expand a split GGUF filename (`*-00001-of-0000N.gguf`) into all ordered part filenames."""
+    cleaned = filename.strip()
+    if not cleaned:
+        return [filename]
+    match = _SPLIT_GGUF_RE.match(cleaned)
+    if match is None:
+        return [cleaned]
+    prefix, raw_idx, raw_total, ext = match.groups()
+    part_idx = int(raw_idx)
+    total_parts = int(raw_total)
+    if (
+        total_parts < 2
+        or total_parts > MAX_SPLIT_GGUF_PARTS
+        or part_idx < 1
+        or part_idx > total_parts
+    ):
+        return [cleaned]
+    return [
+        f"{prefix}-{idx:05d}-of-{total_parts:05d}{ext}"
+        for idx in range(1, total_parts + 1)
+    ]
+
+
 def select_best_gguf_filename(repo_files: list[str]) -> str | None:
-    """Pick the best `.gguf` file from a Hugging Face repo, prioritizing `Q4_K_M` quantization."""
+    """Pick the best `.gguf` file from a Hugging Face repo, prioritizing Unsloth UD-Q4 / `Q4_K_M`."""
     gguf_files = [
         f
         for f in repo_files
@@ -447,11 +553,34 @@ def select_best_gguf_filename(repo_files: list[str]) -> str | None:
     if not gguf_files:
         return None
 
-    non_mmproj = [f for f in gguf_files if "mmproj" not in Path(f).name.lower()]
-    pool = non_mmproj or gguf_files
+    def _is_auxiliary_gguf(path_str: str) -> bool:
+        base_name = Path(path_str).name.lower()
+        return (
+            "mmproj" in base_name
+            or "imatrix" in base_name
+            or base_name.startswith(("mtp-", "dspark-", "dflash-"))
+        )
+
+    main_candidates = [f for f in gguf_files if not _is_auxiliary_gguf(f)]
+    pool = main_candidates or gguf_files
+
+    primary_parts = [
+        f
+        for f in pool
+        if not (
+            (m := _SPLIT_GGUF_RE.match(f)) is not None
+            and int(m.group(3)) >= 2
+            and int(m.group(2)) != 1
+        )
+    ]
+    if primary_parts:
+        pool = primary_parts
 
     quant_ranks: tuple[str, ...] = (
+        "ud-q4_k_xl",
+        "ud-q4_k_m",
         "q4_k_m",
+        "ud-iq4_xs",
         "q4_k_s",
         "q4_k",
         "q5_k_m",
@@ -461,15 +590,17 @@ def select_best_gguf_filename(repo_files: list[str]) -> str | None:
         "q8_0",
     )
 
-    def _score(filename: str) -> tuple[int, int, str]:
+    def _score(filename: str) -> tuple[int, int, int, str]:
         lowered = filename.lower()
-        split_penalty = 1 if re.search(r"-\d{5}-of-\d{5}\.gguf$", lowered) else 0
+        split_match = _SPLIT_GGUF_RE.match(filename)
+        split_penalty = 1 if split_match is not None else 0
+        split_part_num = int(split_match.group(2)) if split_match is not None else 0
         quant_rank = len(quant_ranks)
         for idx, token in enumerate(quant_ranks):
             if token in lowered:
                 quant_rank = idx
                 break
-        return (quant_rank, split_penalty, filename)
+        return (quant_rank, split_penalty, split_part_num, filename)
 
     return min(pool, key=_score)
 
@@ -1638,7 +1769,20 @@ class ModelDownloader:
 
         # In offline simulation mode, check both ~/.shardai/models and legacy cache_models
         if is_offline_mode():
-            target_path = self.resolve_gguf_in_models_dir(repo_id, resolved_filename)
+            split_filenames = (
+                expand_split_gguf_filenames(resolved_filename)
+                if resolved_filename is not None
+                else []
+            )
+            part_paths = (
+                [
+                    self.resolve_gguf_in_models_dir(repo_id, part_fn)
+                    for part_fn in split_filenames
+                ]
+                if split_filenames
+                else [self.resolve_gguf_in_models_dir(repo_id, None)]
+            )
+            target_path = part_paths[0]
             _emit(
                 DownloadProgressEvent(
                     model_id=model_id,
@@ -1659,8 +1803,8 @@ class ModelDownloader:
             self._resolved_mmproj_paths[repo_id] = mmproj_path
             mmproj_str = str(mmproj_path) if mmproj_path is not None else None
 
-            if is_valid_gguf_file(target_path, min_bytes=len(GGUF_MAGIC)):
-                size_bytes = target_path.stat().st_size
+            if all(is_valid_gguf_file(p, min_bytes=len(GGUF_MAGIC)) for p in part_paths):
+                size_bytes = sum(p.stat().st_size for p in part_paths)
                 _emit(
                     DownloadProgressEvent(
                         model_id=model_id,
@@ -1674,37 +1818,90 @@ class ModelDownloader:
                     )
                 )
                 return DownloadedModelArtifacts(model_path=target_path, mmproj_path=mmproj_path)
-            if target_path.is_file():
-                logger.warning(
-                    "Offline cached GGUF '%s' failed validation (size=%d); regenerating stub.",
-                    target_path.name,
-                    target_path.stat().st_size,
-                )
-                target_path.unlink(missing_ok=True)
-            cached, existing_path = self.is_model_cached(model_id)
-            if cached:
-                size_bytes = existing_path.stat().st_size
-                _emit(
-                    DownloadProgressEvent(
-                        model_id=model_id,
-                        status="cached",
-                        progress_percent=100.0,
-                        downloaded_bytes=size_bytes,
-                        total_bytes=size_bytes,
-                        local_path=str(existing_path),
-                        mmproj_path=mmproj_str,
-                        message=f"Model '{model_id}' ready from cache ({existing_path.name}).",
+
+            for part_path in part_paths:
+                if part_path.is_file() and not is_valid_gguf_file(
+                    part_path, min_bytes=len(GGUF_MAGIC)
+                ):
+                    logger.warning(
+                        "Offline cached GGUF '%s' failed validation (size=%d); regenerating stub.",
+                        part_path.name,
+                        part_path.stat().st_size,
                     )
+                    part_path.unlink(missing_ok=True)
+
+            if len(part_paths) == 1:
+                cached, existing_path = self.is_model_cached(model_id)
+                if cached:
+                    size_bytes = existing_path.stat().st_size
+                    _emit(
+                        DownloadProgressEvent(
+                            model_id=model_id,
+                            status="cached",
+                            progress_percent=100.0,
+                            downloaded_bytes=size_bytes,
+                            total_bytes=size_bytes,
+                            local_path=str(existing_path),
+                            mmproj_path=mmproj_str,
+                            message=f"Model '{model_id}' ready from cache ({existing_path.name}).",
+                        )
+                    )
+                    return DownloadedModelArtifacts(
+                        model_path=existing_path, mmproj_path=mmproj_path
+                    )
+                sim_path = await self._simulate_offline_gguf(model_id, target_path, _emit)
+                return DownloadedModelArtifacts(model_path=sim_path, mmproj_path=mmproj_path)
+
+            total_parts = len(part_paths)
+            simulated_total = 4_680_000_000 * total_parts
+            for idx, part_path in enumerate(part_paths):
+                part_path.parent.mkdir(parents=True, exist_ok=True)
+                if not is_valid_gguf_file(part_path, min_bytes=len(GGUF_MAGIC)):
+                    await asyncio.sleep(0.02)
+                    step_pct = min(
+                        99.0,
+                        round(((idx + 0.8) / float(total_parts)) * 100.0, 1),
+                    )
+                    _emit(
+                        DownloadProgressEvent(
+                            model_id=model_id,
+                            status="downloading",
+                            progress_percent=step_pct,
+                            downloaded_bytes=int(simulated_total * (step_pct / 100.0)),
+                            total_bytes=simulated_total,
+                            message=(
+                                f"Downloading {part_path.name} "
+                                f"(part {idx + 1}/{total_parts}, {step_pct:.0f}%)..."
+                            ),
+                        )
+                    )
+                    part_path.write_bytes(
+                        b"GGUF\x03\x00\x00\x00"
+                        + f"{model_id}:{part_path.name}".encode("utf-8")
+                    )
+            final_size = sum(p.stat().st_size for p in part_paths)
+            _emit(
+                DownloadProgressEvent(
+                    model_id=model_id,
+                    status="completed",
+                    progress_percent=100.0,
+                    downloaded_bytes=final_size,
+                    total_bytes=final_size,
+                    local_path=str(target_path),
+                    mmproj_path=mmproj_str,
+                    message=(
+                        f"Model '{model_id}' ready at {target_path.name} "
+                        f"({total_parts} split GGUF parts)."
+                    ),
                 )
-                return DownloadedModelArtifacts(model_path=existing_path, mmproj_path=mmproj_path)
-            sim_path = await self._simulate_offline_gguf(model_id, target_path, _emit)
-            return DownloadedModelArtifacts(model_path=sim_path, mmproj_path=mmproj_path)
+            )
+            return DownloadedModelArtifacts(model_path=target_path, mmproj_path=mmproj_path)
 
         if hf_hub_download is None:
             raise RuntimeError("`huggingface_hub` is not installed.")
 
         repo_files: list[str] | None = None
-        # Auto-discover best .gguf (Q4_K_M priority) if caller only gave repo_id
+        # Auto-discover best .gguf (UD-Q4 / Q4_K_M priority) if caller only gave repo_id
         if resolved_filename is None:
             _emit(
                 DownloadProgressEvent(
@@ -1734,7 +1931,13 @@ class ModelDownloader:
                 )
 
         assert resolved_filename is not None
-        target_path = self.resolve_gguf_in_models_dir(repo_id, resolved_filename)
+        split_filenames = expand_split_gguf_filenames(resolved_filename)
+        part_paths = [
+            self.resolve_gguf_in_models_dir(repo_id, part_fn)
+            for part_fn in split_filenames
+        ]
+        target_path = part_paths[0]
+        total_parts = len(part_paths)
         _emit(
             DownloadProgressEvent(
                 model_id=model_id,
@@ -1743,7 +1946,7 @@ class ModelDownloader:
                 message=f"Checking ~/.shardai/models for {target_path.name}...",
             )
         )
-        if is_valid_gguf_file(target_path, min_bytes=MIN_ONLINE_GGUF_BYTES):
+        if all(is_valid_gguf_file(p, min_bytes=MIN_ONLINE_GGUF_BYTES) for p in part_paths):
             mmproj_path = await self._ensure_mmproj_downloaded(
                 model_id=model_id,
                 repo_id=repo_id,
@@ -1754,7 +1957,7 @@ class ModelDownloader:
             )
             self._resolved_mmproj_paths[model_id] = mmproj_path
             self._resolved_mmproj_paths[repo_id] = mmproj_path
-            size_bytes = target_path.stat().st_size
+            size_bytes = sum(p.stat().st_size for p in part_paths)
             _emit(
                 DownloadProgressEvent(
                     model_id=model_id,
@@ -1769,46 +1972,80 @@ class ModelDownloader:
             )
             return DownloadedModelArtifacts(model_path=target_path, mmproj_path=mmproj_path)
 
-        if target_path.is_file():
-            logger.warning(
-                "Cached GGUF file '%s' failed validation (size=%d); removing and re-downloading.",
-                target_path.name,
-                target_path.stat().st_size,
-            )
-            target_path.unlink(missing_ok=True)
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
         loop = asyncio.get_running_loop()
+        final_part_paths: list[Path] = []
+        completed_bytes_before_part = 0
 
-        def _progress_hook(downloaded: int, total: int) -> None:
-            pct = min(99.9, round((downloaded / float(total)) * 100.0, 1)) if total > 0 else 0.0
-            evt = DownloadProgressEvent(
-                model_id=model_id,
-                status="downloading",
-                progress_percent=pct,
-                downloaded_bytes=downloaded,
-                total_bytes=total,
-                message=f"Downloading {resolved_filename} ({pct:.1f}%)...",
+        for part_idx, (part_fn, part_path) in enumerate(
+            zip(split_filenames, part_paths, strict=True)
+        ):
+            if is_valid_gguf_file(part_path, min_bytes=MIN_ONLINE_GGUF_BYTES):
+                completed_bytes_before_part += part_path.stat().st_size
+                final_part_paths.append(part_path)
+                continue
+
+            if part_path.is_file():
+                logger.warning(
+                    "Cached GGUF file '%s' failed validation (size=%d); removing and re-downloading.",
+                    part_path.name,
+                    part_path.stat().st_size,
+                )
+                part_path.unlink(missing_ok=True)
+
+            part_path.parent.mkdir(parents=True, exist_ok=True)
+            base_pct = (part_idx / float(total_parts)) * 100.0
+            span_pct = 100.0 / float(total_parts)
+            prior_bytes = completed_bytes_before_part
+            part_label = (
+                f"{part_fn} (part {part_idx + 1}/{total_parts})"
+                if total_parts > 1
+                else part_fn
             )
-            loop.call_soon_threadsafe(_emit, evt)
 
-        tqdm_bridge_cls = _HfTqdmProgressBridge.with_callback(_progress_hook)
-        downloaded_str: str = await asyncio.to_thread(
-            hf_hub_download,
-            repo_id=repo_id,
-            filename=resolved_filename,
-            local_dir=str(self.models_dir),
-            tqdm_class=tqdm_bridge_cls,
-        )
-        final_path = Path(downloaded_str).resolve()
-        if not has_gguf_magic(final_path):
-            if final_path.is_file() and final_path.is_relative_to(self.models_dir):
-                final_path.unlink(missing_ok=True)
-            raise ValueError(
-                f"Downloaded file '{final_path.name}' is not a valid GGUF binary "
-                "(missing 4-byte GGUF magic header)."
+            def _make_progress_hook(
+                _base_pct: float = base_pct,
+                _span_pct: float = span_pct,
+                _prior_bytes: int = prior_bytes,
+                _label: str = part_label,
+            ) -> Callable[[int, int], None]:
+                def _progress_hook(downloaded: int, total: int) -> None:
+                    ratio = (downloaded / float(total)) if total > 0 else 0.0
+                    pct = min(99.9, round(_base_pct + (ratio * _span_pct), 1))
+                    evt = DownloadProgressEvent(
+                        model_id=model_id,
+                        status="downloading",
+                        progress_percent=pct,
+                        downloaded_bytes=_prior_bytes + downloaded,
+                        total_bytes=(_prior_bytes + total) if total > 0 else 0,
+                        message=f"Downloading {_label} ({pct:.1f}%)...",
+                    )
+                    loop.call_soon_threadsafe(_emit, evt)
+
+                return _progress_hook
+
+            tqdm_bridge_cls = _HfTqdmProgressBridge.with_callback(_make_progress_hook())
+            downloaded_str: str = await asyncio.to_thread(
+                hf_hub_download,
+                repo_id=repo_id,
+                filename=part_fn,
+                local_dir=str(self.models_dir),
+                tqdm_class=tqdm_bridge_cls,
             )
+            downloaded_part_path = Path(downloaded_str).resolve()
+            if not has_gguf_magic(downloaded_part_path):
+                if downloaded_part_path.is_file() and downloaded_part_path.is_relative_to(
+                    self.models_dir
+                ):
+                    downloaded_part_path.unlink(missing_ok=True)
+                raise ValueError(
+                    f"Downloaded file '{downloaded_part_path.name}' is not a valid GGUF binary "
+                    "(missing 4-byte GGUF magic header)."
+                )
+            if downloaded_part_path.is_file():
+                completed_bytes_before_part += downloaded_part_path.stat().st_size
+            final_part_paths.append(downloaded_part_path)
 
+        final_path = final_part_paths[0]
         mmproj_path = await self._ensure_mmproj_downloaded(
             model_id=model_id,
             repo_id=repo_id,
@@ -1820,7 +2057,7 @@ class ModelDownloader:
         self._resolved_mmproj_paths[model_id] = mmproj_path
         self._resolved_mmproj_paths[repo_id] = mmproj_path
 
-        final_size = final_path.stat().st_size if final_path.is_file() else 0
+        final_size = sum(p.stat().st_size for p in final_part_paths if p.is_file())
         _emit(
             DownloadProgressEvent(
                 model_id=model_id,
