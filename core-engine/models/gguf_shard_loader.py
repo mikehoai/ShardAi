@@ -31,9 +31,11 @@ import torch.nn as nn  # type: ignore[import-not-found]
 import torch.nn.functional as F  # type: ignore[import-not-found]
 
 from models.ggml_native import (
+    GGML_TENSOR_ALIGNMENT,
     NATIVE_QUANTIZED_GGML_TYPES,
     GgmlNativeEngine,
     GgmlWeightHandle,
+    _alloc_aligned_cpu_u8,
     is_ggml_native_enabled,
 )
 from models.gguf_reader import (
@@ -1442,13 +1444,21 @@ def _build_model_config_from_gguf(index: GgufFileIndex) -> GgufModelConfig:
 
 
 def _read_tensor_raw_u8(f: BinaryIO, index: GgufFileIndex, t_info: GgufTensorInfo) -> torch.Tensor:
-    """Seek-read raw tensor bytes as a 1D `torch.uint8` tensor without loading other tensors."""
+    """Seek-read raw tensor bytes as a 32-byte-aligned 1D `torch.uint8` tensor."""
     f.seek(index.data_offset + t_info.rel_offset)
-    raw_bytes = f.read(t_info.nbytes)
-    if len(raw_bytes) < t_info.nbytes:
-        raise EOFError(f"Unexpected EOF reading tensor '{t_info.name}'")
-    arr = np.frombuffer(raw_bytes, dtype=np.uint8).copy()
-    return torch.from_numpy(arr)
+    nbytes = int(t_info.nbytes)
+    if nbytes == 0:
+        return torch.empty(0, dtype=torch.uint8, device="cpu")
+
+    buf, _backing = _alloc_aligned_cpu_u8(nbytes, alignment=GGML_TENSOR_ALIGNMENT)
+    mv = memoryview(buf.numpy())
+    read_total = 0
+    while read_total < nbytes:
+        chunk_len = f.readinto(mv[read_total:])
+        if not chunk_len:
+            raise EOFError(f"Unexpected EOF reading tensor '{t_info.name}'")
+        read_total += chunk_len
+    return buf
 
 
 def _read_tensor_dense(
