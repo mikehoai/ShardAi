@@ -46,11 +46,18 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-type TableAlignment = "left" | "center" | "right" | null;
+export type TableAlignment = "left" | "center" | "right" | null;
 
-type MarkdownBlock =
+export type HeadingLevel = 1 | 2 | 3 | 4 | 5 | 6;
+
+export interface ParsedHeading {
+  level: HeadingLevel;
+  text: string;
+}
+
+export type MarkdownBlock =
   | { type: "code"; language: string; code: string }
-  | { type: "heading"; level: 1 | 2 | 3 | 4 | 5 | 6; text: string }
+  | { type: "heading"; level: HeadingLevel; text: string }
   | { type: "hr" }
   | { type: "blockquote"; blocks: MarkdownBlock[] }
   | {
@@ -65,13 +72,64 @@ type MarkdownBlock =
 const FENCE_OPEN_RE = /^\s{0,3}```(.*)$/;
 const FENCE_CLOSE_RE = /^\s{0,3}```\s*$/;
 const HR_RE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
-const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/;
+const HEADING_PREFIX_RE = /^[ \t]{0,3}(#{1,6})[ \t]+/;
 const BLOCKQUOTE_RE = /^\s{0,3}>\s?(.*)$/;
 const UL_ITEM_RE = /^\s*[-*+]\s+(.*)$/;
 const OL_ITEM_RE = /^\s*(\d+)\.\s+(.*)$/;
 const TABLE_SEP_CELL_RE = /^:?-{1,}:?$/;
 const WORD_CHAR_RE = /^[A-Za-z0-9]$/;
 const ESCAPABLE_PUNCT_RE = /^[\\`*_{}[\]()#+\-.!~<>|]$/;
+
+function isHorizontalWhitespace(ch: string | undefined): boolean {
+  return ch === " " || ch === "\t" || ch === "\r";
+}
+
+export function parseHeadingLine(line: string): ParsedHeading | null {
+  if (line.includes("\n")) {
+    return null;
+  }
+
+  const prefixMatch = HEADING_PREFIX_RE.exec(line);
+  if (!prefixMatch) {
+    return null;
+  }
+
+  const start = prefixMatch[0].length;
+  let end = line.length;
+
+  while (end > start && isHorizontalWhitespace(line[end - 1])) {
+    end -= 1;
+  }
+  if (end <= start) {
+    return null;
+  }
+
+  let hashStart = end;
+  while (hashStart > start && line[hashStart - 1] === "#") {
+    hashStart -= 1;
+  }
+
+  if (hashStart < end) {
+    if (hashStart === start) {
+      return null;
+    }
+    if (isHorizontalWhitespace(line[hashStart - 1])) {
+      end = hashStart;
+      while (end > start && isHorizontalWhitespace(line[end - 1])) {
+        end -= 1;
+      }
+      if (end <= start) {
+        return null;
+      }
+    }
+  }
+
+  const level = Math.min(6, Math.max(1, prefixMatch[1].length)) as HeadingLevel;
+  return {
+    level,
+    text: line.slice(start, end),
+  };
+}
 
 function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && WORD_CHAR_RE.test(ch);
@@ -145,7 +203,7 @@ function isBlockStarter(lines: string[], index: number): boolean {
   if (
     FENCE_OPEN_RE.test(line) ||
     HR_RE.test(line) ||
-    HEADING_RE.test(line) ||
+    parseHeadingLine(line) !== null ||
     BLOCKQUOTE_RE.test(line) ||
     UL_ITEM_RE.test(line) ||
     OL_ITEM_RE.test(line)
@@ -162,7 +220,7 @@ function isBlockStarter(lines: string[], index: number): boolean {
   return false;
 }
 
-function parseBlocks(raw: string, depth = 0): MarkdownBlock[] {
+export function parseBlocks(raw: string, depth = 0): MarkdownBlock[] {
   const normalized = raw.replace(/\r\n?/g, "\n");
   const lines = normalized.split("\n");
   const blocks: MarkdownBlock[] = [];
@@ -204,19 +262,12 @@ function parseBlocks(raw: string, depth = 0): MarkdownBlock[] {
       continue;
     }
 
-    const headingMatch = HEADING_RE.exec(line);
-    if (headingMatch) {
-      const level = Math.min(6, Math.max(1, headingMatch[1].length)) as
-        | 1
-        | 2
-        | 3
-        | 4
-        | 5
-        | 6;
+    const parsedHeading = parseHeadingLine(line);
+    if (parsedHeading !== null) {
       blocks.push({
         type: "heading",
-        level,
-        text: headingMatch[2].trim(),
+        level: parsedHeading.level,
+        text: parsedHeading.text,
       });
       i += 1;
       continue;
@@ -261,7 +312,7 @@ function parseBlocks(raw: string, depth = 0): MarkdownBlock[] {
           }
           if (
             FENCE_OPEN_RE.test(rowLine) ||
-            HEADING_RE.test(rowLine) ||
+            parseHeadingLine(rowLine) !== null ||
             BLOCKQUOTE_RE.test(rowLine)
           ) {
             break;
