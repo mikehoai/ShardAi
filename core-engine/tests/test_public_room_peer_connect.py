@@ -230,13 +230,13 @@ async def test_send_activations_wraps_malformed_endpoint_as_peer_unreachable() -
 def test_ipv6_resolve_advertise_ip_and_binary_serializer_pack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """IPv6 public_ip and IPv6 peers never crash `_resolve_advertise_ip` or binary frame serializers."""
+    """IPv6 public_ip and IPv6 peers preserve canonical IPv6 in `_resolve_advertise_ip` and binary serializers."""
     monkeypatch.delenv("SHARDAI_ADVERTISE_IP", raising=False)
     orig_public_ip = runtime.public_ip
     try:
         runtime.public_ip = "2402:800:61c0::1"
         resolved_v6 = _resolve_advertise_ip("2402:800:61c0::2", 49152)
-        assert resolved_v6 == "127.0.0.1"
+        assert resolved_v6 == "2402:800:61c0::1"
 
         # IPv4 public_ip still applies for global IPv6 target
         assert _resolve_advertise_ip(
@@ -261,7 +261,7 @@ def test_ipv6_resolve_advertise_ip_and_binary_serializer_pack(
         max_tokens=4,
     )
     act_frame = deserialize_activation_tensor(act_bytes)
-    assert act_frame.origin_ip == "127.0.0.1"
+    assert act_frame.origin_ip == "2402:800:61c0::1"
 
     inf_bytes = serialize_inference_request(
         request_id=req_id,
@@ -271,7 +271,7 @@ def test_ipv6_resolve_advertise_ip_and_binary_serializer_pack(
         max_tokens=8,
     )
     inf_frame = deserialize_inference_request(inf_bytes)
-    assert inf_frame.requester_ip == "127.0.0.1"
+    assert inf_frame.requester_ip == "fe80::1"
 
     inf_v4_bytes = serialize_inference_request(
         request_id=req_id,

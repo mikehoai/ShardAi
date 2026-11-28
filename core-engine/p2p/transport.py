@@ -44,6 +44,9 @@ current_relay_source: ContextVar[str | None] = ContextVar(
 current_quic_peer_id: ContextVar[str | None] = ContextVar(
     "current_quic_peer_id", default=None
 )
+current_tcp_peer_ip: ContextVar[str | None] = ContextVar(
+    "current_tcp_peer_ip", default=None
+)
 
 
 class PeerUnreachableError(OSError):
@@ -290,14 +293,24 @@ async def handle_incoming_p2p_stream(
             timeout=timeout_seconds,
         )
 
-        await dispatch_p2p_frame(
-            frame_bytes=frame_bytes,
-            on_activation_frame=on_activation_frame,
-            on_token_frame=on_token_frame,
-            on_inference_request=on_inference_request,
-            on_inference_error=on_inference_error,
-            on_inference_heartbeat=on_inference_heartbeat,
+        peername = writer.get_extra_info("peername")
+        remote_ip: str | None = (
+            str(peername[0])
+            if isinstance(peername, tuple) and len(peername) >= 1 and peername[0]
+            else None
         )
+        tcp_token = current_tcp_peer_ip.set(remote_ip)
+        try:
+            await dispatch_p2p_frame(
+                frame_bytes=frame_bytes,
+                on_activation_frame=on_activation_frame,
+                on_token_frame=on_token_frame,
+                on_inference_request=on_inference_request,
+                on_inference_error=on_inference_error,
+                on_inference_heartbeat=on_inference_heartbeat,
+            )
+        finally:
+            current_tcp_peer_ip.reset(tcp_token)
 
         # Acknowledge ONLY after validation, deserialization, and handler execution succeed
         writer.write(ACK_BYTE)
