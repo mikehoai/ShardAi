@@ -658,6 +658,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     abortControllerRef.current = controller;
     let receivedAnyToken = false;
     let streamedChunkCount = 0;
+    let streamedContent = "";
     let reportedCompletionTokens: number | null = null;
     const streamStartedAt =
       typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -690,13 +691,16 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           }
           receivedAnyToken = true;
           streamedChunkCount += 1;
+          streamedContent += token;
+          const chunkCountSnapshot = streamedChunkCount;
+          const reportedTokensSnapshot = reportedCompletionTokens;
           const elapsedSec = Math.max(
             0.05,
             ((typeof performance !== "undefined" ? performance.now() : Date.now()) -
               streamStartedAt) /
               1000
           );
-          const instantTps = Math.round((streamedChunkCount / elapsedSec) * 10) / 10;
+          const instantTps = Math.round((chunkCountSnapshot / elapsedSec) * 10) / 10;
           setLatestTokensPerSec(instantTps);
           setMessages((prev) =>
             prev.map((item) => {
@@ -706,8 +710,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               const nextContent = `${item.content}${token}`;
               const parsed = parseThinkingContent(nextContent, true);
               const nextTokens =
-                reportedCompletionTokens ??
-                Math.max(streamedChunkCount, estimateTokenCount(nextContent));
+                reportedTokensSnapshot ??
+                Math.max(chunkCountSnapshot, estimateTokenCount(nextContent));
               return {
                 ...item,
                 content: nextContent,
@@ -728,31 +732,36 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             streamStartedAt) /
             1000
         );
+        const finalCompletionTokens =
+          reportedCompletionTokens ??
+          (streamedChunkCount > 1
+            ? streamedChunkCount
+            : estimateTokenCount(streamedContent));
+        const finalTps =
+          streamedChunkCount > 0
+            ? Math.round((finalCompletionTokens / finalElapsedSec) * 10) / 10
+            : null;
+        if (finalTps !== null && finalTps > 0) {
+          setLatestTokensPerSec(finalTps);
+        }
+        const finalParsed = parseThinkingContent(streamedContent, false);
+        const finalThinkingTokens = finalParsed.hasThinking
+          ? estimateTokenCount(finalParsed.thinking)
+          : undefined;
         setMessages((prev) =>
           prev.map((item) => {
             if (item.id !== assistantMsgId) {
               return item;
             }
-            const parsed = parseThinkingContent(item.content, false);
-            const finalCompletionTokens =
-              reportedCompletionTokens ??
-              (streamedChunkCount > 1
-                ? streamedChunkCount
-                : estimateTokenCount(item.content));
-            const finalTps =
-              streamedChunkCount > 0
-                ? Math.round((finalCompletionTokens / finalElapsedSec) * 10) / 10
-                : item.tokensPerSec;
-            if (finalTps) {
-              setLatestTokensPerSec(finalTps);
-            }
+            const resolvedTps =
+              finalTps !== null && finalTps > 0 ? finalTps : item.tokensPerSec;
             return {
               ...item,
               tokenCount: finalCompletionTokens,
-              ...(parsed.hasThinking
-                ? { thinkingTokenCount: estimateTokenCount(parsed.thinking) }
+              ...(finalThinkingTokens !== undefined
+                ? { thinkingTokenCount: finalThinkingTokens }
                 : {}),
-              ...(finalTps ? { tokensPerSec: finalTps } : {}),
+              ...(resolvedTps ? { tokensPerSec: resolvedTps } : {}),
             };
           })
         );
@@ -771,6 +780,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             ? err.message
             : "Failed to complete chat request against local gateway.";
         setChatError(message);
+        const didReceiveToken = receivedAnyToken;
         // Remove empty assistant placeholder and, for new sends that failed before any token,
         // drop the failed user message so rejected attachments are not resent on subsequent prompts.
         setMessages((prev) =>
@@ -780,7 +790,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             }
             if (
               !options?.preserveUserOnPreTokenError &&
-              !receivedAnyToken &&
+              !didReceiveToken &&
               item.id === userMsg.id
             ) {
               return false;
