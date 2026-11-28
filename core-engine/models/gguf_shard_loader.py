@@ -2024,137 +2024,145 @@ def load_gguf_pytorch_shard(
             )
             ggml_engine = None
 
-    if ggml_engine is not None and ggml_engine.is_cpu and device is None:
-        # Keep activations on CPU in float32 to eliminate per-op GPU transfer overhead
-        target_device = torch.device("cpu")
-        compute_dtype = torch.float32
-        mat_dtype = torch.float32
-
-    if ggml_engine is not None:
-        for lin in all_quantized_linears:
-            if lin.attach_ggml_engine(ggml_engine):
-                native_ggml_count += 1
-        if native_ggml_count == 0:
-            ggml_engine.close()
-            ggml_engine = None
-
-    dense_linears = [
-        lin for lin in decoder_linears if lin._ggml_handle is None
-    ]
-    decoder_elems = sum(lin.out_features * lin.in_features for lin in dense_linears)
-    decoder_raw_bytes = sum(int(lin.raw_weight.numel()) for lin in dense_linears)
-    non_decoder_bytes = kept_bytes
-
-    if ggml_engine is not None and ggml_engine.is_cpu and device is None:
-        compute_dtype = torch.float32
-        mat_dtype = torch.float32
-    elif target_device.type == "cuda":
-        bf16_supported = bool(
-            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
-        )
-        compute_dtype = torch.bfloat16 if bf16_supported else torch.float16
-        mat_dtype = compute_dtype
-    elif target_device.type == "mps":
-        compute_dtype = torch.bfloat16
-        mat_dtype = torch.bfloat16
-    else:
-        f32_total = non_decoder_bytes - decoder_raw_bytes + (decoder_elems * 4)
-        if f32_total <= budget_bytes:
+    try:
+        if ggml_engine is not None and ggml_engine.is_cpu and device is None:
+            # Keep activations on CPU in float32 to eliminate per-op GPU transfer overhead
+            target_device = torch.device("cpu")
             compute_dtype = torch.float32
             mat_dtype = torch.float32
-        else:
+
+        if ggml_engine is not None:
+            for lin in all_quantized_linears:
+                if lin.attach_ggml_engine(ggml_engine):
+                    native_ggml_count += 1
+            if native_ggml_count == 0:
+                ggml_engine.close()
+                ggml_engine = None
+
+        dense_linears = [
+            lin for lin in decoder_linears if lin._ggml_handle is None
+        ]
+        decoder_elems = sum(lin.out_features * lin.in_features for lin in dense_linears)
+        decoder_raw_bytes = sum(int(lin.raw_weight.numel()) for lin in dense_linears)
+        non_decoder_bytes = kept_bytes
+
+        if ggml_engine is not None and ggml_engine.is_cpu and device is None:
+            compute_dtype = torch.float32
+            mat_dtype = torch.float32
+        elif target_device.type == "cuda":
+            bf16_supported = bool(
+                hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+            )
+            compute_dtype = torch.bfloat16 if bf16_supported else torch.float16
+            mat_dtype = compute_dtype
+        elif target_device.type == "mps":
             compute_dtype = torch.bfloat16
             mat_dtype = torch.bfloat16
+        else:
+            f32_total = non_decoder_bytes - decoder_raw_bytes + (decoder_elems * 4)
+            if f32_total <= budget_bytes:
+                compute_dtype = torch.float32
+                mat_dtype = torch.float32
+            else:
+                compute_dtype = torch.bfloat16
+                mat_dtype = torch.bfloat16
 
-    for layer in kept_layers:
-        _move_norm_module(layer.input_layernorm, target_device, compute_dtype)
-        _move_norm_module(layer.post_attention_layernorm, target_device, compute_dtype)
-        _move_norm_module(layer.pre_feedforward_layernorm, target_device, compute_dtype)
-        _move_norm_module(layer.post_feedforward_layernorm, target_device, compute_dtype)
-        _move_norm_module(layer.self_attn.q_norm, target_device, compute_dtype)
-        _move_norm_module(layer.self_attn.k_norm, target_device, compute_dtype)
-    _move_norm_module(norm, target_device, compute_dtype)
-    rotary_emb.to(device=target_device)
+        for layer in kept_layers:
+            _move_norm_module(layer.input_layernorm, target_device, compute_dtype)
+            _move_norm_module(layer.post_attention_layernorm, target_device, compute_dtype)
+            _move_norm_module(layer.pre_feedforward_layernorm, target_device, compute_dtype)
+            _move_norm_module(layer.post_feedforward_layernorm, target_device, compute_dtype)
+            _move_norm_module(layer.self_attn.q_norm, target_device, compute_dtype)
+            _move_norm_module(layer.self_attn.k_norm, target_device, compute_dtype)
+        _move_norm_module(norm, target_device, compute_dtype)
+        rotary_emb.to(device=target_device)
 
-    if embed_tokens is not None:
-        embed_tokens.output_dtype = compute_dtype
-        embed_tokens.target_device = target_device
+        if embed_tokens is not None:
+            embed_tokens.output_dtype = compute_dtype
+            embed_tokens.target_device = target_device
 
-    used_bytes = non_decoder_bytes
-    elem_bytes = 4 if mat_dtype == torch.float32 else 2
-    materialized_count = 0
-    for lin in dense_linears:
-        projected_delta = (lin.out_features * lin.in_features * elem_bytes) - int(
-            lin.raw_weight.numel()
-        )
-        if (used_bytes + projected_delta) > budget_bytes:
-            continue
-        try:
-            actual_delta = lin.materialize(dtype=mat_dtype, device=target_device)
-            used_bytes += actual_delta
-            materialized_count += 1
-        except RuntimeError as exc:
-            logger.warning(
-                "Stopping weight materialization early on %s after %d tensors (%s)",
-                target_device,
-                materialized_count,
-                exc,
+        used_bytes = non_decoder_bytes
+        elem_bytes = 4 if mat_dtype == torch.float32 else 2
+        materialized_count = 0
+        for lin in dense_linears:
+            projected_delta = (lin.out_features * lin.in_features * elem_bytes) - int(
+                lin.raw_weight.numel()
             )
-            break
-
-    if (
-        lm_head is not None
-        and lm_head._ggml_handle is None
-        and target_device.type != "mps"
-        and lm_head.out_features <= _DEFAULT_LM_HEAD_CHUNK_ROWS
-    ):
-        lm_delta = (lm_head.out_features * lm_head.in_features * elem_bytes) - int(
-            lm_head.raw_weight.numel()
-        )
-        if (used_bytes + lm_delta) <= int(budget_bytes * 0.7):
+            if (used_bytes + projected_delta) > budget_bytes:
+                continue
             try:
-                used_bytes += lm_head.materialize(dtype=mat_dtype, device=target_device)
+                actual_delta = lin.materialize(dtype=mat_dtype, device=target_device)
+                used_bytes += actual_delta
                 materialized_count += 1
-            except RuntimeError:
+            except RuntimeError as exc:
+                logger.warning(
+                    "Stopping weight materialization early on %s after %d tensors (%s)",
+                    target_device,
+                    materialized_count,
+                    exc,
+                )
+                break
+
+        if (
+            lm_head is not None
+            and lm_head._ggml_handle is None
+            and target_device.type != "mps"
+            and lm_head.out_features <= _DEFAULT_LM_HEAD_CHUNK_ROWS
+        ):
+            lm_delta = (lm_head.out_features * lm_head.in_features * elem_bytes) - int(
+                lm_head.raw_weight.numel()
+            )
+            if (used_bytes + lm_delta) <= int(budget_bytes * 0.7):
+                try:
+                    used_bytes += lm_head.materialize(dtype=mat_dtype, device=target_device)
+                    materialized_count += 1
+                except RuntimeError:
+                    pass
+
+        container.eval()
+        for param in container.parameters():
+            param.requires_grad_(False)
+
+        logger.info(
+            "GGUF shard %d..%d prepared on %s (dtype=%s, ggml_native=%s [%d linears], materialized=%d/%d, est_ram=%.1f MB)",
+            clamped_start,
+            clamped_end,
+            target_device,
+            compute_dtype,
+            ggml_engine.backend_kind if ggml_engine is not None else "off",
+            native_ggml_count,
+            materialized_count,
+            len(decoder_linears),
+            used_bytes / (1024.0 * 1024.0),
+        )
+
+        tokenizer: GgufTokenizerAdapter | None = None
+        if is_head or is_tail:
+            tokenizer = GgufTokenizerAdapter(index)
+
+        return LoadedGgufShard(
+            hf_config=cfg,
+            container=container,
+            layers=kept_layers,
+            rotary_emb=rotary_emb,
+            embed_tokens=embed_tokens,
+            norm=norm,
+            lm_head=lm_head,
+            tokenizer=tokenizer,
+            total_layers=total_layers,
+            hidden_dim=hidden_dim,
+            shard_layer_start=clamped_start,
+            shard_layer_end=clamped_end,
+            compute_dtype=compute_dtype,
+            device=target_device,
+            materialized_tensors=materialized_count,
+            ggml_engine=ggml_engine,
+            native_ggml_tensors=native_ggml_count,
+        )
+    except BaseException:
+        if ggml_engine is not None:
+            try:
+                ggml_engine.close()
+            except Exception:
                 pass
-
-    container.eval()
-    for param in container.parameters():
-        param.requires_grad_(False)
-
-    logger.info(
-        "GGUF shard %d..%d prepared on %s (dtype=%s, ggml_native=%s [%d linears], materialized=%d/%d, est_ram=%.1f MB)",
-        clamped_start,
-        clamped_end,
-        target_device,
-        compute_dtype,
-        ggml_engine.backend_kind if ggml_engine is not None else "off",
-        native_ggml_count,
-        materialized_count,
-        len(decoder_linears),
-        used_bytes / (1024.0 * 1024.0),
-    )
-
-    tokenizer: GgufTokenizerAdapter | None = None
-    if is_head or is_tail:
-        tokenizer = GgufTokenizerAdapter(index)
-
-    return LoadedGgufShard(
-        hf_config=cfg,
-        container=container,
-        layers=kept_layers,
-        rotary_emb=rotary_emb,
-        embed_tokens=embed_tokens,
-        norm=norm,
-        lm_head=lm_head,
-        tokenizer=tokenizer,
-        total_layers=total_layers,
-        hidden_dim=hidden_dim,
-        shard_layer_start=clamped_start,
-        shard_layer_end=clamped_end,
-        compute_dtype=compute_dtype,
-        device=target_device,
-        materialized_tensors=materialized_count,
-        ggml_engine=ggml_engine,
-        native_ggml_tensors=native_ggml_count,
-    )
+        raise
