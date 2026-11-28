@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import logging
+import math
 import os
 import time
 from urllib.parse import urlparse
@@ -21,6 +22,8 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.protocol import State
 
 from p2p.relay_envelope import (
+    MAX_CHUNKS,
+    MAX_DATA_CHUNK_BYTES,
     MAX_NACK_REASON_BYTES,
     RelayEnvelope,
     RelayPacketKind,
@@ -81,6 +84,22 @@ def validate_relay_url(url: str, allowed_host: str | None = None) -> str:
             )
 
     return cleaned
+
+
+def _resolve_send_chunk_size(frame_len: int) -> int:
+    """Return a DATA chunk size that splits `frame_len` within `MAX_CHUNKS`."""
+    if frame_len <= 0:
+        raise ValueError("Cannot split an empty frame into relay chunks")
+    if frame_len > MAX_WIRE_FRAME_BYTES:
+        raise ValueError(
+            f"Frame size {frame_len} exceeds MAX_WIRE_FRAME_BYTES ({MAX_WIRE_FRAME_BYTES})"
+        )
+    if frame_len <= DEFAULT_RELAY_SEND_CHUNK_BYTES * MAX_CHUNKS:
+        return DEFAULT_RELAY_SEND_CHUNK_BYTES
+    return max(
+        DEFAULT_RELAY_SEND_CHUNK_BYTES,
+        min(MAX_DATA_CHUNK_BYTES, math.ceil(frame_len / MAX_CHUNKS)),
+    )
 
 
 class _RelayNoRouteError(RuntimeError):
@@ -306,7 +325,8 @@ class RelayClient:
         ack_timeout: float = 60.0,
     ) -> float:
         """Send a binary P2P frame through the relay to `dst_node_id` and await ACK."""
-        chunks = split_into_chunks(frame, chunk_size=DEFAULT_RELAY_SEND_CHUNK_BYTES)
+        chunk_size = _resolve_send_chunk_size(len(frame))
+        chunks = split_into_chunks(frame, chunk_size=chunk_size)
         chunk_count = len(chunks)
         retry_delays: tuple[float, ...] = (0.35, 0.75)
         start_ns = time.perf_counter_ns()
@@ -550,6 +570,7 @@ class RelayClient:
     async def _connection_loop(self) -> None:
         """Maintain the WebSocket relay connection with exponential reconnect backoff."""
         backoff = RELAY_RECONNECT_INITIAL_SECONDS
+        auth_immediate_retry_used = False
         stop_event = self._stop_event
         assert stop_event is not None
 
@@ -560,7 +581,7 @@ class RelayClient:
                 break
 
             connected_at: float | None = None
-            token_refreshed = False
+            immediate_auth_retry = False
             try:
                 async with ws_client.connect(
                     url,
@@ -572,6 +593,7 @@ class RelayClient:
                     self._ws = ws
                     connected_at = time.monotonic()
                     backoff = RELAY_RECONNECT_INITIAL_SECONDS
+                    auth_immediate_retry_used = False
                     if self._initial_connect_event is not None:
                         self._initial_connect_event.set()
                     if self._connected_event is not None:
@@ -607,15 +629,22 @@ class RelayClient:
                         raise
                     except Exception as auth_exc:
                         logger.warning("Relay auth failure refresh callback failed: %s", auth_exc)
-                    backoff = RELAY_RECONNECT_INITIAL_SECONDS
-                    if self._token != token:
-                        token_refreshed = True
+                    if not auth_immediate_retry_used and self._token != token:
+                        auth_immediate_retry_used = True
+                        immediate_auth_retry = True
                 if self._running:
-                    logger.warning(
-                        "Relay WebSocket disconnected (%s); reconnecting in %.1fs...",
-                        exc.__class__.__name__,
-                        backoff,
-                    )
+                    if immediate_auth_retry:
+                        logger.warning(
+                            "Relay WebSocket disconnected (%s); "
+                            "retrying immediately with refreshed token",
+                            exc.__class__.__name__,
+                        )
+                    else:
+                        logger.warning(
+                            "Relay WebSocket disconnected (%s); reconnecting in %.1fs...",
+                            exc.__class__.__name__,
+                            backoff,
+                        )
             finally:
                 self._ws = None
                 if self._connected_event is not None:
@@ -626,7 +655,7 @@ class RelayClient:
             if not self._running or stop_event.is_set():
                 break
 
-            if token_refreshed:
+            if immediate_auth_retry:
                 continue
 
             if connected_at is not None and (time.monotonic() - connected_at) >= 5.0:
