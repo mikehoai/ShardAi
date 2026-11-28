@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import socket
 from typing import Any
 
@@ -9,7 +10,13 @@ import httpx
 import pytest
 
 import p2p.upnp as upnp_module
-from p2p.upnp import UpnpClient, UpnpPortMapper, is_allowed_upnp_location
+from p2p.upnp import (
+    MAX_UPNP_DESCRIPTION_BYTES,
+    UpnpClient,
+    UpnpPortMapper,
+    UpnpServiceEndpoint,
+    is_allowed_upnp_location,
+)
 
 _DEVICE_DESC_XML = b"""<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -192,3 +199,144 @@ async def test_upnp_rejects_public_location_and_oversized_xml_and_never_raises(
     assert await mapper_err.ensure_port_mapped(49152) is False
     assert await mapper_err.get_external_ip() is None
     await mapper_err.cleanup()
+
+
+class _ChunkedByteStream(httpx.AsyncByteStream):
+    """Streaming response body yielding fixed chunks and tracking consumption."""
+
+    def __init__(self, chunks: list[bytes], *, fail_on_iter: bool = False) -> None:
+        self._chunks = chunks
+        self._fail_on_iter = fail_on_iter
+        self.consumed_chunks = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._fail_on_iter:
+            raise AssertionError("Stream should not be read when Content-Length exceeds limit")
+        for chunk in self._chunks:
+            self.consumed_chunks += 1
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_upnp_soap_call_aborts_oversized_streaming_response() -> None:
+    """_soap_call, add_port_mapping, and get_external_ip must abort responses > 64 KiB."""
+    endpoint = UpnpServiceEndpoint(
+        service_type="urn:schemas-upnp-org:service:WANIPConnection:1",
+        control_url="http://192.168.1.1:5000/ctl/IPConn",
+    )
+    streams: list[_ChunkedByteStream] = []
+
+    def _streaming_handler(_request: httpx.Request) -> httpx.Response:
+        # 12 chunks * 8192 bytes = 98,304 bytes (> 64 KiB), without Content-Length header.
+        stream = _ChunkedByteStream([b"A" * 8192 for _ in range(12)])
+        streams.append(stream)
+        return httpx.Response(status_code=200, stream=stream)
+
+    client = UpnpClient(transport=httpx.MockTransport(_streaming_handler), timeout_seconds=1.0)
+
+    assert await client._soap_call(endpoint, "AddPortMapping", "<x/>") is None
+    assert await client.add_port_mapping(endpoint, 49152, "192.168.1.42") is False
+    assert await client.get_external_ip(endpoint) is None
+    assert len(streams) == 3
+    # Streaming stops right after exceeding 64 KiB (9th chunk = 73,728 bytes) instead of reading all 12.
+    assert all(s.consumed_chunks < 12 for s in streams)
+
+
+@pytest.mark.asyncio
+async def test_upnp_soap_call_fast_fails_oversized_content_length() -> None:
+    """_soap_call must reject oversized Content-Length before reading response body."""
+    endpoint = UpnpServiceEndpoint(
+        service_type="urn:schemas-upnp-org:service:WANIPConnection:1",
+        control_url="http://192.168.1.1:5000/ctl/IPConn",
+    )
+
+    def _content_length_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=200,
+            headers={"Content-Length": str(MAX_UPNP_DESCRIPTION_BYTES + 1)},
+            stream=_ChunkedByteStream([b"<s:Envelope/>"], fail_on_iter=True),
+        )
+
+    client = UpnpClient(transport=httpx.MockTransport(_content_length_handler), timeout_seconds=1.0)
+
+    assert await client._soap_call(endpoint, "DeletePortMapping", "<x/>") is None
+    assert await client.add_port_mapping(endpoint, 49152, "192.168.1.42") is False
+    assert await client.get_external_ip(endpoint) is None
+
+
+@pytest.mark.parametrize(
+    "malicious_xml",
+    [
+        (
+            b'<?xml version="1.0"?>'
+            b'<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+            b"<s:Envelope><NewExternalIPAddress>&xxe;</NewExternalIPAddress></s:Envelope>"
+        ),
+        (
+            b'<?xml version="1.0"?>'
+            b"<!doctype html>"
+            b"<s:Envelope><NewExternalIPAddress>203.0.113.77</NewExternalIPAddress></s:Envelope>"
+        ),
+        (
+            b'<?xml version="1.0"?>'
+            b'<!ENTITY lol "lol">'
+            b"<s:Envelope><NewExternalIPAddress>203.0.113.77</NewExternalIPAddress></s:Envelope>"
+        ),
+        (
+            b'<?xml version="1.0"?>'
+            b'<!entity lol "lol">'
+            b"<s:Envelope><NewExternalIPAddress>203.0.113.77</NewExternalIPAddress></s:Envelope>"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upnp_get_external_ip_rejects_doctype_and_entity_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+    malicious_xml: bytes,
+) -> None:
+    """get_external_ip must reject DOCTYPE/ENTITY payloads before calling ET.fromstring."""
+    endpoint = UpnpServiceEndpoint(
+        service_type="urn:schemas-upnp-org:service:WANIPConnection:1",
+        control_url="http://192.168.1.1:5000/ctl/IPConn",
+    )
+    parser_called = False
+    original_fromstring = upnp_module.ET.fromstring
+
+    def _spy_fromstring(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parser_called
+        parser_called = True
+        return original_fromstring(*args, **kwargs)
+
+    monkeypatch.setattr(upnp_module.ET, "fromstring", _spy_fromstring)
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=200, content=malicious_xml)
+
+    client = UpnpClient(transport=httpx.MockTransport(_handler), timeout_seconds=1.0)
+    assert await client.get_external_ip(endpoint) is None
+    assert parser_called is False
+
+
+@pytest.mark.asyncio
+async def test_upnp_get_external_ip_accepts_exact_max_byte_limit() -> None:
+    """get_external_ip must succeed when SOAP XML response is exactly MAX_UPNP_DESCRIPTION_BYTES."""
+    endpoint = UpnpServiceEndpoint(
+        service_type="urn:schemas-upnp-org:service:WANIPConnection:1",
+        control_url="http://192.168.1.1:5000/ctl/IPConn",
+    )
+    prefix = (
+        b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+        b'<u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">'
+        b"<NewExternalIPAddress>203.0.113.99</NewExternalIPAddress><!--"
+    )
+    suffix = b"--></u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
+    padding_len = MAX_UPNP_DESCRIPTION_BYTES - len(prefix) - len(suffix)
+    assert padding_len > 0
+    exact_payload = prefix + (b"p" * padding_len) + suffix
+    assert len(exact_payload) == MAX_UPNP_DESCRIPTION_BYTES
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=200, content=exact_payload)
+
+    client = UpnpClient(transport=httpx.MockTransport(_handler), timeout_seconds=1.0)
+    assert await client.get_external_ip(endpoint) == "203.0.113.99"
