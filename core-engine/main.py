@@ -17,6 +17,7 @@ import inspect
 import ipaddress
 import json
 import logging
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -401,6 +402,19 @@ def _is_lan_or_loopback_ip(ip: str) -> bool:
         return bool(addr.is_loopback or addr.is_private or addr.is_link_local)
     except ValueError:
         return False
+
+
+def _normalize_rtt_ms(rtt_ms: Any) -> float | None:
+    """Return a finite float RTT in milliseconds, or `None` for invalid/non-finite inputs."""
+    if rtt_ms is None or isinstance(rtt_ms, bool):
+        return None
+    try:
+        numeric_rtt = float(rtt_ms)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_rtt):
+        return None
+    return numeric_rtt
 
 
 class LocalNodeRuntime:
@@ -832,9 +846,12 @@ class LocalNodeRuntime:
         self._peer_routes[peer_id] = (route, now + _PEER_ROUTE_TTL_SECONDS)
         self._prune_peer_routes(now=now)
 
-    def _record_p2p_transfer_metrics(self, frame_bytes: int, rtt_ms: float) -> None:
+    def _record_p2p_transfer_metrics(self, frame_bytes: int, rtt_ms: float | None) -> None:
         """Update smoothed P2P RTT (ms) and transfer throughput (Mbps) from recent sends."""
-        safe_rtt = max(0.1, float(rtt_ms))
+        numeric_rtt = _normalize_rtt_ms(rtt_ms)
+        if numeric_rtt is None:
+            return
+        safe_rtt = max(0.1, numeric_rtt)
         if self.last_p2p_rtt_ms is None:
             self.last_p2p_rtt_ms = round(safe_rtt, 1)
         else:
@@ -847,6 +864,15 @@ class LocalNodeRuntime:
                 self.p2p_throughput_mbps = round(
                     (0.7 * self.p2p_throughput_mbps) + (0.3 * mbps), 2
                 )
+
+    def _finalize_peer_send(
+        self, peer_id: str, route: str, frame_bytes: int, rtt_ms: Any
+    ) -> float:
+        """Cache route, record transfer metrics, and return a finite RTT in milliseconds."""
+        self._set_cached_peer_route(peer_id, route)
+        self._record_p2p_transfer_metrics(frame_bytes, rtt_ms)
+        normalized_rtt = _normalize_rtt_ms(rtt_ms)
+        return 0.0 if normalized_rtt is None else normalized_rtt
 
     def _resolve_active_p2p_transport(
         self,
@@ -920,9 +946,7 @@ class LocalNodeRuntime:
                     connect_timeout=max(timeout_seconds, QUIC_CONNECT_TIMEOUT_SECONDS),
                     ack_timeout=ack_wait,
                 )
-                self._set_cached_peer_route(peer.peer_id, "quic")
-                self._record_p2p_transfer_metrics(frame_len, rtt_ms)
-                return rtt_ms
+                return self._finalize_peer_send(peer.peer_id, "quic", frame_len, rtt_ms)
             except PeerUnreachableError:
                 self._peer_routes.pop(peer.peer_id, None)
 
@@ -935,9 +959,7 @@ class LocalNodeRuntime:
                 rtt_ms = await self.relay_client.send_frame(
                     peer.peer_id, frame, ack_timeout=ack_wait
                 )
-                self._set_cached_peer_route(peer.peer_id, "relay")
-                self._record_p2p_transfer_metrics(frame_len, rtt_ms)
-                return rtt_ms
+                return self._finalize_peer_send(peer.peer_id, "relay", frame_len, rtt_ms)
 
         prefer_quic = bool(
             can_quic
@@ -952,9 +974,7 @@ class LocalNodeRuntime:
                     connect_timeout=max(timeout_seconds, QUIC_CONNECT_TIMEOUT_SECONDS),
                     ack_timeout=ack_wait,
                 )
-                self._set_cached_peer_route(peer.peer_id, "quic")
-                self._record_p2p_transfer_metrics(frame_len, rtt_ms)
-                return rtt_ms
+                return self._finalize_peer_send(peer.peer_id, "quic", frame_len, rtt_ms)
             except PeerUnreachableError as quic_exc:
                 logger.warning(
                     "Iroh QUIC unreachable for peer %s (%s); falling back to TCP/Relay.",
@@ -977,9 +997,7 @@ class LocalNodeRuntime:
             send_kwargs["ack_timeout_seconds"] = ack_timeout_seconds
         try:
             rtt_ms = await send_activations(**send_kwargs)
-            self._set_cached_peer_route(peer.peer_id, "direct")
-            self._record_p2p_transfer_metrics(frame_len, rtt_ms)
-            return rtt_ms
+            return self._finalize_peer_send(peer.peer_id, "direct", frame_len, rtt_ms)
         except PeerUnreachableError:
             if can_quic and not prefer_quic:
                 try:
@@ -989,9 +1007,7 @@ class LocalNodeRuntime:
                         connect_timeout=max(timeout_seconds, QUIC_CONNECT_TIMEOUT_SECONDS),
                         ack_timeout=ack_wait,
                     )
-                    self._set_cached_peer_route(peer.peer_id, "quic")
-                    self._record_p2p_transfer_metrics(frame_len, rtt_ms)
-                    return rtt_ms
+                    return self._finalize_peer_send(peer.peer_id, "quic", frame_len, rtt_ms)
                 except PeerUnreachableError:
                     pass
             if (
@@ -1009,9 +1025,7 @@ class LocalNodeRuntime:
             rtt_ms = await self.relay_client.send_frame(
                 peer.peer_id, frame, ack_timeout=ack_wait
             )
-            self._set_cached_peer_route(peer.peer_id, "relay")
-            self._record_p2p_transfer_metrics(frame_len, rtt_ms)
-            return rtt_ms
+            return self._finalize_peer_send(peer.peer_id, "relay", frame_len, rtt_ms)
 
     def _peer_for_endpoint(self, ip: str, port: int) -> PeerNodeInfo | None:
         """Return the matching `PeerNodeInfo` for `(ip, port)` if known in `self.peers`."""
