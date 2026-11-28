@@ -22,34 +22,37 @@
 
 ---
 
-## 📖 Overview
+## Overview
 
 **ShardAi Node** (`shardai-node`) is an open-source, peer-to-peer (P2P) distributed LLM inference desktop client and **Local OpenAI-Compatible API Gateway** (`/v1/chat/completions`). It enables everyday consumer hardware (laptops, desktops, and local workstations) to pool idle RAM and GPU VRAM together to load and run Large Language Models collaboratively.
 
-Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) model layers across participating peers using **Pipeline Parallelism**. Each node loads only its assigned slice of model layers into memory and streams compressed intermediate activation tensors directly to the next peer in the pipeline.
+Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) model layers across participating peers using **Pipeline Parallelism**. Each node loads only its assigned slice of quantized weights into memory via zero-copy native `libggml` buffers and streams compressed intermediate activation tensors directly to the next peer over NAT-traversing **Iroh QUIC P2P**, direct TCP, or WebSocket relay.
 
 > **Client-Only Open-Source Repository:** This repository (`shardai-node`) contains **100% client-side code** — the native **Tauri v2 Desktop App** (`src-ui/` + `src-tauri/`) and the local **Python AI & P2P Core Engine** (`core-engine/`). It operates across three network modes: **Internet Swarm** (via a configurable Signaling REST API endpoint), **LAN Only** (zero-config local mDNS discovery), and **Offline Solo** (100% local execution).
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-* **🔌 Local OpenAI-Compatible API Gateway:** Exposes `POST http://127.0.0.1:8000/v1/chat/completions` (streaming SSE & non-streaming) and `GET /v1/models`, allowing drop-in integration with Cursor, Continue, OpenWebUI, LangChain, and the official OpenAI SDKs.
-* **💬 Built-in AI Chat Window:** Interactive chat interface directly inside the desktop client once swarm RAM coverage reaches 100%, featuring real-time SSE token streaming, markdown rendering, multi-turn history, stop generation, and error surface alerts.
-* **🎛 3-Tab AI Model Selector:** Unified model selection across the main panel and Create Room modal with Online Catalog (~5-8 GB RAM estimates & cloud sync), Custom HuggingFace Repos / Direct URLs, and Local `.gguf` file browsing.
-* **🧠 Dynamic Layer Sharding:** Automatically slices GGUF (`llama-cpp-python` with `mmap` fallback) and Hugging Face `safetensors` (`PyTorch`) models based on the RAM/VRAM budget you allocate in the desktop UI.
-* **🌐 Hybrid Network Modes & Smart Lobby:**
-  * **Internet Swarm:** Connects to public or private rooms via Signaling REST API (`SHARDAI_TRACKER_URL`) with session-scoped room randomization and clean frameless colored status indicators.
-  * **LAN Only (`zeroconf` mDNS):** Discovers peers automatically on your local network (`_shardai._tcp.local.`) with zero external internet dependency.
-  * **Offline Solo Fallback:** Runs all model layers locally on a single machine when offline or unassisted.
-* **⚡ Standard CLI & Lightweight Tauri Shell:**
+* **Local OpenAI-Compatible API Gateway:** Exposes `POST http://127.0.0.1:8000/v1/chat/completions` (streaming SSE with OpenAI `usage` token reporting and non-streaming JSON) plus `GET /v1/models`, allowing drop-in integration with Cursor, Continue, OpenWebUI, LangChain, and official OpenAI SDKs.
+* **Built-in Chat Window:** Clean native chat interface unlocked when swarm RAM coverage reaches 100%, featuring:
+  * **Single-Row Header Telemetry:** Compact inline icon indicators aligned alongside `Clear` and `Close` showing contributed RAM / total room RAM, room status & peer count, active transport (`QUIC P2P`, `WebSocket Relay`, `LAN Direct`, or `Local (Solo)`), live P2P network/inference speed (`Mbps`, `ms`, `tok/s`), and cumulative session tokens.
+  * **Full Markdown & Reasoning Collapsing:** Rich Markdown rendering for both user prompts and assistant replies, with DeepSeek and reasoning tags (`<think>`, `<thought>`, `<thinking>`) collapsed into a clickable header toggle so the main bubble shows only the final answer.
+  * **Icon Message Actions & Token Metrics:** Icon-only `Copy`, `Edit` (user prompts), and `Retry` (assistant replies) controls with per-message token counts, plus drag-and-drop multimodal image, video, and document attachments.
+* **3-Tab AI Model Selector & Room Stable RAM Estimation:** Unified selection across the main panel and Create Room modal (Online Catalog with cloud sync, Custom HuggingFace Repos / Direct URLs, and Local `.gguf` files) alongside Room Stable RAM target guidance accounting for zero-copy quantized weights, per-node KV/runtime overhead (`0.35–0.60 GB/node`), multi-node shard rounding slack, and KV-cache growth margin.
+* **Native `libggml` Quantized Sharding:** Executes GGUF layer shards through a zero-copy native C++ `libggml` MatMul engine (`models/ggml_native.py`) across quantized formats (`Q4_K`, `Q6_K`, `Q8_0`, `IQ`, etc.) without BF16/FP32 weight expansion, backed by a preallocated growing `GgufSimpleKVCache` as well as PyTorch `safetensors` and `llama-cpp-python` (`mmap` SSD offload) support.
+* **NAT-Traversing Hybrid Networking & Smart Lobby:**
+  * **Internet Swarm:** Establishes encrypted peer connections using **Iroh QUIC P2P** (`p2p/quic_transport.py`, UDP hole punching with E2EE relay fallback), dual-stack IPv4/IPv6 endpoint handling, optional UPnP port mapping, and authenticated WebSocket relay fallback (`p2p/relay_client.py`) with automatic credential refresh and `NO_ROUTE` retries.
+  * **LAN Only (`zeroconf` mDNS):** Discovers peers automatically on your local subnet (`_shardai._tcp.local.`) with zero external internet dependency.
+  * **Offline Solo Fallback:** Runs all model layers locally on a single machine (with optional `mmap` SSD offload).
+* **Standard CLI & Native Tauri v2 Desktop Shell:**
   * **`shardai` CLI:** Rich cross-platform terminal commands (`create`, `join`, `chat`, `status`, `stop`, `pull`, `models`, `rooms`, `serve`, `network`, `doctor`, `service`, `completion`, `version`) with automated Windows, macOS, and Ubuntu/Linux PATH & `systemd` installers.
-  * **Tauri v2 Desktop App:** Lightweight native window with system tray, collapsible sidebar, sun/moon dark theme, hardware telemetry, and automated Python sidecar supervisor (zero zombie processes).
-* **🔒 Binary Tensor Streaming & Loopback Security:** Uses `lz4`-compressed binary tensor framing over P2P sockets (never `pickle` or raw JSON tensors) and binds the local control plane strictly to `127.0.0.1` with IPC token authentication (`X-ShardAi-Local-Token`).
+  * **Tauri v2 Desktop App:** Lightweight native window with plain-text OS-style status indicators, `Open Chat` launcher, system tray, collapsible sidebar, light/dark theme switching, hardware memory inspection, and a Rust Python sidecar supervisor.
+* **Quantized Binary Tensor Streaming & Loopback Security:** Compresses P2P activation tensors using per-row dynamic **INT8** or **BF16** wire quantization paired with **`lz4`** binary framing (never `pickle` or raw JSON tensors), adaptive P2P timeouts, and fair-queue keepalive heartbeats, while binding the local control plane strictly to `127.0.0.1` with IPC token authentication (`X-ShardAi-Local-Token`).
 
 ---
 
-## 🏗 Client Architecture
+## Client Architecture
 
 `shardai-node` is structured into three decoupled client layers:
 
@@ -61,14 +64,14 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
 |  |  Tauri v2 Shell (UI + Rust)  |   |    Core Engine (Python)      |  |
 |  |  - React 18 + TypeScript UI  |-->|  - FastAPI (127.0.0.1:8000)  |  |
 |  |  - RAM/VRAM Budget Controls  |   |  - /v1/chat/completions      |  |
-|  |  - Rooms Lobby & Telemetry   |   |  - PyTorch / llama.cpp Shards|  |
-|  |  - Rust Sidecar Supervisor   |   |  - LAN mDNS & P2P Transport  |  |
+|  |  - Rooms Lobby & Chat UI     |   |  - Native libggml / PyTorch  |  |
+|  |  - Rust Sidecar Supervisor   |   |  - Iroh QUIC, TCP & Relay P2P|  |
 |  +------------------------------+   +--------------+---------------+  |
 +----------------------------------------------------|------------------+
                                                      |
           +------------------------------------------+------------------------------------------+
-          | 1a. Optional Room Discovery              | 1b. Local LAN Discovery                  | 2. Direct P2P Tensor Pipeline
-          |     (Configurable Signaling REST API)    |     (Zeroconf mDNS: _shardai._tcp.local) |    (Binary Frame + LZ4 Stream)
+          | 1a. Optional Room Discovery              | 1b. Local LAN Discovery                  | 2. Encrypted / Binary Tensor Pipeline
+          |     (Signaling REST API + QUIC Tickets)  |     (Zeroconf mDNS: _shardai._tcp.local) |    (Iroh QUIC / TCP / Relay + INT8/BF16 + LZ4)
           v                                          v                                          v
 +-----------------------+                  +-------------------+                      +-------------------+
 |   Signaling Tracker   |                  |     LAN Peers     |                      |   Peer Node B     |
@@ -76,29 +79,29 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
 +-----------------------+                  +-------------------+                      +-------------------+
 ```
 
-1. **Pre-Flight & Room Admission:** When joining a room, `core-engine` verifies room availability, downloads only the required model weights/shards from Hugging Face into `core-engine/cache_models/`, and loads the assigned layer range into RAM/VRAM.
-2. **Peer Discovery:** Nodes discover pipeline neighbors either via the configurable Signaling REST API (`POST /announce`, `GET /rooms`, `GET /peers/:room_id/:model`, `GET /config/models`) or locally on LAN via `zeroconf` mDNS.
-3. **Distributed Pipeline Inference:** Requests sent to `http://127.0.0.1:8000/v1/chat/completions` traverse the layer pipeline across connected peers using compressed binary tensor streams and return standard OpenAI chat completion payloads.
+1. **Pre-Flight & Room Admission:** When joining a room, `core-engine` verifies room availability, downloads only the required model weights/shards from Hugging Face into `~/.shardai` or `core-engine/cache_models/`, and loads the assigned layer range into physical RAM/VRAM via zero-copy `libggml` or `safetensors`.
+2. **Peer Discovery & NAT Traversal:** Nodes discover pipeline neighbors and exchange optional `p2p_endpoint_id` / `p2p_ticket` metadata either via the configurable Signaling REST API (`POST /announce`, `GET /rooms`, `GET /peers/:room_id/:model`, `GET /config/models`) or locally on LAN via `zeroconf` mDNS.
+3. **Distributed Pipeline Inference:** Requests sent to `http://127.0.0.1:8000/v1/chat/completions` traverse the layer pipeline across connected peers over Iroh QUIC, direct TCP, or WebSocket relay using `INT8`/`BF16` + `lz4` compressed binary frames and stream back OpenAI-compatible SSE chunks with token usage telemetry.
 
 ---
 
-## 🛠 Tech Stack (`shardai-node`)
+## Tech Stack (`shardai-node`)
 
 * **Desktop UI (`src-ui/`):** React 18, TypeScript (strict mode), Vite, Vitest, Testing Library
 * **Native Desktop Core (`src-tauri/`):** Rust (Edition 2021), Tauri v2 (`tray-icon`, native dialog plugin, thread-safe Python sidecar process supervisor)
-* **AI & P2P Engine (`core-engine/`):** Python 3.11+, FastAPI, Uvicorn, Pydantic v2, PyTorch, `transformers`, `safetensors`, `accelerate`, `llama-cpp-python` (optional GGUF extra), `huggingface-hub`, `typer`
-* **Networking & Serialization:** `httpx` (async REST client with exponential backoff), `zeroconf` (LAN mDNS discovery), `lz4` binary tensor compression, raw TCP / HTTP tensor transport
+* **AI & Inference Engine (`core-engine/`):** Python 3.11+, FastAPI, Uvicorn, Pydantic v2, PyTorch, `transformers`, `safetensors`, `accelerate`, `llama-cpp-python` (provides `libggml` native quantized backend + optional GGUF fallback), `huggingface-hub`, `typer`
+* **Networking & Serialization:** `iroh` (NAT-traversing QUIC P2P with hole punching & E2EE relay), `websockets` (relay fallback), `httpx` (async signaling REST client), `zeroconf` (LAN mDNS discovery), `lz4` + dynamic `INT8`/`BF16` binary tensor framing, raw dual-stack TCP transport
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
 * **Node.js** `>= 20` & **npm**
 * **Rust & Cargo** (latest stable toolchain via `rustup`)
 * **Python** `>= 3.11` (with `venv` or `uv`)
-* **C++ Build Tools** (optional, required only if compiling `llama-cpp-python` from source with CUDA / Metal / AVX2 acceleration)
+* **C++ Build Tools** (optional, required only if compiling `llama-cpp-python` / `libggml` from source with CUDA / Metal / AVX2 acceleration)
 
 ### Installation
 
@@ -158,7 +161,7 @@ Instead of requiring a single high-VRAM workstation, ShardAi splits (shards) mod
 
 ---
 
-## 💻 Command-Line Interface (`shardai` CLI)
+## Command-Line Interface (`shardai` CLI)
 
 ShardAi includes a developer-friendly command-line interface that allows you to operate nodes, manage rooms, pre-download models, and chat directly from any terminal.
 
@@ -175,7 +178,7 @@ Install the `shardai` command onto your system PATH:
   chmod +x ./scripts/install_linux.sh
   ./scripts/install_linux.sh --source --shell-completion --with-systemd
   ```
-  See the [Linux & Ubuntu Deployment](#-linux--ubuntu-deployment) section below and [`docs/LINUX.md`](docs/LINUX.md) for background daemonization, `.deb` packages, Docker, and firewall setup.
+  See the [Linux & Ubuntu Deployment](#linux--ubuntu-deployment) section below and [`docs/LINUX.md`](docs/LINUX.md) for background daemonization, `.deb` packages, Docker, and firewall setup.
 * **macOS / Generic Unix:**
   ```bash
   chmod +x ./scripts/install_cli.sh
@@ -210,7 +213,7 @@ Install the `shardai` command onto your system PATH:
 
 ---
 
-## 🐧 Linux & Ubuntu Deployment
+## Linux & Ubuntu Deployment
 
 ShardAi provides full native support for headless Linux environments (Ubuntu 22.04 LTS, 24.04 LTS, Debian, WSL2, and Linux VPS/container servers). In headless mode, the client operates autonomously via the `shardai` CLI, as a background daemon, or as a managed `systemd` service without requiring a desktop display server or GUI.
 
@@ -301,7 +304,7 @@ docker run -d --name shardai-node --network host -v ~/.shardai:/home/shardai/.sh
 
 ---
 
-## ⚙️ Environment Variables
+## Environment Variables
 
 `shardai-node` never hardcodes private keys or non-configurable endpoints. You can customize client behavior via environment variables:
 
@@ -310,11 +313,14 @@ docker run -d --name shardai-node --network host -v ~/.shardai:/home/shardai/.sh
 | `SHARDAI_TRACKER_URL` | `https://network.shardai.online` | Base URL of the public/custom Signaling REST API for Internet Swarm discovery |
 | `SHARDAI_OFFLINE_MODE` | `false` | Set to `true` (or `1`) to disable Internet Tracker calls and operate strictly in LAN / Offline Solo mode |
 | `SHARDAI_LOCAL_TOKEN` | Auto-generated by Tauri | Internal IPC authentication token verified via `X-ShardAi-Local-Token` on local control routes |
-| `SHARDAI_P2P_PORT` | `9100` | Local TCP port used for peer-to-peer binary tensor streaming |
+| `SHARDAI_P2P_PORT` | `49152` | Local TCP port used for direct peer-to-peer binary tensor streaming |
+| `SHARDAI_GGML_BACKEND` | `auto` | Preferred native `libggml` backend (`auto`, `cpu`, `metal`, `cuda`, etc.) |
+| `SHARDAI_GGML_THREADS` | Auto CPU count | Number of worker threads used by native `libggml` CPU compute graphs |
+| `SHARDAI_WIRE_QUANT` | `auto` | Wire activation quantization mode (`auto`, `int8`, `bf16`, `fp32`) for P2P tensor streaming |
 
 ---
 
-## 🧪 Running Automated Tests
+## Running Automated Tests
 
 ```bash
 # 1. Python Core Engine unit & integration tests (pytest)
@@ -335,16 +341,16 @@ For production packaging instructions (Standalone CLI executable, Windows `.msi`
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 ShardAi/
 ├── .github/             # GitHub Actions release workflows & declarative repo metadata
 ├── assets/              # Project branding and application logos
 ├── core-engine/         # Python AI sharding & P2P background engine (FastAPI)
-│   ├── models/          # Hugging Face downloader, GGUF reader & shard runner
-│   ├── p2p/             # Peer discovery, mDNS (zeroconf), LZ4 binary serializer & transport
-│   ├── shard_engine/    # CLI entrypoint, memory manager, Pydantic schemas & signaling client
+│   ├── models/          # Hugging Face downloader, GGUF reader, native libggml engine & shard runner
+│   ├── p2p/             # Iroh QUIC P2P, WebSocket relay client, mDNS discovery, INT8/BF16 + LZ4 serializer & TCP transport
+│   ├── shard_engine/    # CLI entrypoint, memory & Room Stable RAM planner, Pydantic schemas & signaling client
 │   ├── tests/           # Pytest unit and integration test suites
 │   ├── main.py          # FastAPI control plane, /v1/chat/completions gateway & sidecar entry
 │   ├── pyproject.toml   # Python project metadata, [project.scripts], & build config
@@ -353,14 +359,14 @@ ShardAi/
 ├── packaging/           # Linux systemd units, shell completions, and container assets
 ├── scripts/             # PyInstaller sidecar, CLI builders, .deb packager & PATH installers
 ├── src-tauri/           # Rust native shell (windowing, system tray, Python process guard)
-├── src-ui/              # React 18 + TypeScript desktop UI dashboard
+├── src-ui/              # React 18 + TypeScript native UI dashboard, ChatWindow & formatting/RAM utils
 ├── package.json         # Root Tauri CLI & UI workspace scripts
 └── README.md            # Client documentation
 ```
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions to `shardai-node` are welcome!
 
@@ -372,13 +378,13 @@ Contributions to `shardai-node` are welcome!
 
 ---
 
-## 🔗 Links
+## Links
 
 * **Official Website:** [https://shardai.online](https://shardai.online)
 * **GitHub Repository:** [https://github.com/mikehoai/ShardAi](https://github.com/mikehoai/ShardAi)
 * **Issue Tracker:** [https://github.com/mikehoai/ShardAi/issues](https://github.com/mikehoai/ShardAi/issues)
 
-## 📄 License
+## License
 
 Distributed under the MIT License. See `LICENSE` for more information.
 
