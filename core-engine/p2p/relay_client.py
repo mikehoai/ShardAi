@@ -36,6 +36,10 @@ logger = logging.getLogger("shardai.p2p.relay")
 MAX_CONCURRENT_PARTIALS_PER_SOURCE: int = 8
 MAX_TRACKED_PARTIAL_SOURCES: int = 256
 PARTIAL_MESSAGE_TTL_SECONDS: float = 90.0
+# Global byte budget across all in-flight partial reassembly buffers. Must stay at or above
+# `MAX_WIRE_FRAME_BYTES` so a single maximum-size frame can always be reassembled.
+MAX_TOTAL_PARTIAL_BYTES: int = max(256 * 1024 * 1024, MAX_WIRE_FRAME_BYTES)
+PARTIAL_SWEEP_MIN_INTERVAL_SECONDS: float = 1.0
 DEFAULT_RELAY_SEND_CHUNK_BYTES: int = 128 * 1024
 MAX_CONCURRENT_INCOMING_TASKS: int = 64
 RELAY_RECONNECT_INITIAL_SECONDS: float = 1.0
@@ -118,6 +122,8 @@ class RelayClient:
 
         self._pending_acks: dict[bytes, asyncio.Future[None]] = {}
         self._partials: dict[str, dict[bytes, _PartialMessageBuffer]] = {}
+        self._partial_total_bytes: int = 0
+        self._sweeper_task: asyncio.Task[None] | None = None
         self._incoming_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -192,6 +198,8 @@ class RelayClient:
                 if on_auth_failure is not None:
                     self._on_auth_failure = on_auth_failure
                 self.update_credentials(validated_url, cleaned_token)
+                if self._sweeper_task is None or self._sweeper_task.done():
+                    self._sweeper_task = asyncio.create_task(self._partial_sweeper_loop())
                 return
             await self.stop()
 
@@ -207,6 +215,7 @@ class RelayClient:
         self._send_lock = asyncio.Lock()
         self._running = True
         self._runner_task = asyncio.create_task(self._connection_loop())
+        self._sweeper_task = asyncio.create_task(self._partial_sweeper_loop())
 
         try:
             await asyncio.wait_for(self._initial_connect_event.wait(), timeout=2.0)
@@ -260,6 +269,8 @@ class RelayClient:
                 pass
             self._runner_task = None
 
+        await self._cancel_sweeper_task()
+
         incoming = list(self._incoming_tasks)
         for task in incoming:
             if not task.done():
@@ -269,7 +280,7 @@ class RelayClient:
         self._incoming_tasks.clear()
 
         self._fail_pending_acks(RuntimeError("Relay client stopped"))
-        self._partials.clear()
+        self._clear_partials()
         self._ws = None
         self._stop_event = None
         self._initial_connect_event = None
@@ -380,21 +391,68 @@ class RelayClient:
         except Exception as exc:
             logger.debug("Failed to send relay %s to %s: %s", kind.name, dst, exc)
 
+    @property
+    def partial_total_bytes(self) -> int:
+        """Return the aggregate byte count held by in-flight partial reassembly buffers."""
+        return self._partial_total_bytes
+
+    def _drop_partial(self, src: str, msg_id: bytes) -> None:
+        """Remove one partial buffer, release its bytes, and drop the source map when empty."""
+        src_map = self._partials.get(src)
+        if src_map is None:
+            return
+        buf = src_map.pop(msg_id, None)
+        if buf is not None:
+            self._partial_total_bytes -= buf.total_bytes
+        if not src_map:
+            self._partials.pop(src, None)
+
+    def _clear_partials(self) -> None:
+        """Discard every partial reassembly buffer and reset the aggregate byte counter."""
+        self._partials.clear()
+        self._partial_total_bytes = 0
+
     def _prune_expired_partials(self, now: float) -> None:
         """Remove partial reassembly buffers older than `PARTIAL_MESSAGE_TTL_SECONDS`."""
-        expired_sources: list[str] = []
-        for src, msg_map in self._partials.items():
-            expired_ids = [
-                msg_id
-                for msg_id, buf in msg_map.items()
-                if (now - buf.created_at) > PARTIAL_MESSAGE_TTL_SECONDS
-            ]
-            for msg_id in expired_ids:
-                msg_map.pop(msg_id, None)
-            if not msg_map:
-                expired_sources.append(src)
-        for src in expired_sources:
-            self._partials.pop(src, None)
+        expired: list[tuple[str, bytes]] = [
+            (src, msg_id)
+            for src, msg_map in self._partials.items()
+            for msg_id, buf in msg_map.items()
+            if (now - buf.created_at) > PARTIAL_MESSAGE_TTL_SECONDS
+        ]
+        for src, msg_id in expired:
+            self._drop_partial(src, msg_id)
+
+    def _ensure_partial_capacity(
+        self,
+        additional_bytes: int,
+        protected: tuple[str, bytes],
+        now: float,
+    ) -> bool:
+        """Make room for `additional_bytes` under `MAX_TOTAL_PARTIAL_BYTES`.
+
+        Prunes expired buffers first, then evicts the oldest partial buffers other than
+        `protected`. Returns False when the budget still cannot accommodate the bytes.
+        """
+        if self._partial_total_bytes + additional_bytes <= MAX_TOTAL_PARTIAL_BYTES:
+            return True
+
+        self._prune_expired_partials(now)
+        if self._partial_total_bytes + additional_bytes <= MAX_TOTAL_PARTIAL_BYTES:
+            return True
+
+        candidates: list[tuple[float, str, bytes]] = sorted(
+            (buf.created_at, src, msg_id)
+            for src, msg_map in self._partials.items()
+            for msg_id, buf in msg_map.items()
+            if (src, msg_id) != protected
+        )
+        for _, src, msg_id in candidates:
+            if self._partial_total_bytes + additional_bytes <= MAX_TOTAL_PARTIAL_BYTES:
+                break
+            logger.debug("Evicting relay partial from %s to respect global reassembly budget", src)
+            self._drop_partial(src, msg_id)
+        return self._partial_total_bytes + additional_bytes <= MAX_TOTAL_PARTIAL_BYTES
 
     def _reassemble_data_chunk(self, env: RelayEnvelope) -> tuple[bytes | None, str | None]:
         """Store an incoming DATA chunk and return `(completed_frame, error_reason)`."""
@@ -420,31 +478,64 @@ class RelayClient:
             buf = _PartialMessageBuffer(chunk_count=env.chunk_count, created_at=now)
             src_map[env.msg_id] = buf
         elif buf.chunk_count != env.chunk_count:
-            src_map.pop(env.msg_id, None)
-            if not src_map:
-                self._partials.pop(env.src, None)
+            self._drop_partial(env.src, env.msg_id)
             return None, "Inconsistent chunk_count across chunks"
 
         existing = buf.chunks.get(env.chunk_index)
         delta_bytes = len(env.payload) - (len(existing) if existing is not None else 0)
         if buf.total_bytes + delta_bytes > MAX_WIRE_FRAME_BYTES:
-            src_map.pop(env.msg_id, None)
-            if not src_map:
-                self._partials.pop(env.src, None)
+            self._drop_partial(env.src, env.msg_id)
             return None, "Reassembled frame exceeds maximum wire frame size"
+
+        if delta_bytes > 0 and not self._ensure_partial_capacity(
+            delta_bytes, (env.src, env.msg_id), now
+        ):
+            self._drop_partial(env.src, env.msg_id)
+            return None, "Relay reassembly memory budget exhausted"
 
         buf.chunks[env.chunk_index] = env.payload
         buf.total_bytes += delta_bytes
+        self._partial_total_bytes += delta_bytes
 
         if len(buf.chunks) < buf.chunk_count:
             return None, None
 
-        src_map.pop(env.msg_id, None)
-        if not src_map:
-            self._partials.pop(env.src, None)
-
+        self._drop_partial(env.src, env.msg_id)
         frame_bytes = b"".join(buf.chunks[idx] for idx in range(buf.chunk_count))
         return frame_bytes, None
+
+    @staticmethod
+    def _partial_sweep_interval() -> float:
+        """Return the idle partial sweeper interval derived from the partial TTL."""
+        return max(PARTIAL_SWEEP_MIN_INTERVAL_SECONDS, PARTIAL_MESSAGE_TTL_SECONDS / 2.0)
+
+    async def _partial_sweeper_loop(self) -> None:
+        """Periodically prune expired partial buffers even while the relay link is idle."""
+        stop_event = self._stop_event
+        if stop_event is None:
+            return
+        while self._running and not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self._partial_sweep_interval())
+                return
+            except asyncio.TimeoutError:
+                pass
+            self._prune_expired_partials(time.monotonic())
+
+    async def _cancel_sweeper_task(self) -> None:
+        """Cancel and await the idle partial sweeper task if it is running."""
+        task = self._sweeper_task
+        self._sweeper_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Relay partial sweeper exited with error: %s", exc)
 
     async def _dispatch_and_ack(
         self,
@@ -621,7 +712,7 @@ class RelayClient:
                 if self._connected_event is not None:
                     self._connected_event.clear()
                 self._fail_pending_acks(PeerUnreachableError("Relay connection closed"))
-                self._partials.clear()
+                self._clear_partials()
 
             if not self._running or stop_event.is_set():
                 break
