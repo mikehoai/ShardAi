@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import inspect
 import logging
 import os
 import time
@@ -41,8 +42,11 @@ except ImportError:
 
 SHARDAI_QUIC_ALPN: bytes = b"shardai/p2p/1"
 MAX_CONCURRENT_QUIC_STREAMS: int = 64
+MAX_CONCURRENT_INCOMING_QUIC_CONNECTIONS: int = 64
+MAX_CONNECT_LOCKS: int = 256
 MAX_QUIC_NACK_REASON_BYTES: int = MAX_NACK_REASON_BYTES
 QUIC_CONNECT_TIMEOUT_SECONDS: float = 12.0
+QUIC_INCOMING_HANDSHAKE_TIMEOUT_SECONDS: float = 10.0
 QUIC_ONLINE_WAIT_SECONDS: float = 4.0
 QUIC_STREAM_IO_TIMEOUT_SECONDS: float = 45.0
 
@@ -89,6 +93,20 @@ def _is_connection_closed(conn: Any) -> bool:
         return True
 
 
+async def _refuse_incoming(incoming: Any) -> None:
+    """Best-effort refusal or drop of an excess incoming QUIC connection."""
+    for method_name in ("refuse", "ignore", "close"):
+        method = getattr(incoming, method_name, None)
+        if callable(method):
+            try:
+                result = method()
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=1.0)
+            except Exception:
+                pass
+            return
+
+
 def _resolve_endpoint_addr(peer_ticket_or_id: str) -> tuple[str, Any]:
     """Decode an `EndpointTicket` string into `(endpoint_id_str, EndpointAddr)`."""
     if not IROH_AVAILABLE or iroh is None:
@@ -116,6 +134,7 @@ class IrohP2PTransport:
         self._on_frame: Callable[[bytes, str], Awaitable[None]] | None = None
         self._running: bool = False
         self._accept_task: asyncio.Task[None] | None = None
+        self._incoming_tasks: set[asyncio.Task[None]] = set()
         self._conn_tasks: set[asyncio.Task[None]] = set()
         self._stream_tasks: set[asyncio.Task[None]] = set()
         self._stream_semaphore: asyncio.Semaphore | None = None
@@ -254,7 +273,7 @@ class IrohP2PTransport:
                 pass
             self._accept_task = None
 
-        for task_set in (self._stream_tasks, self._conn_tasks):
+        for task_set in (self._stream_tasks, self._incoming_tasks, self._conn_tasks):
             tasks = list(task_set)
             for task in tasks:
                 if not task.done():
@@ -289,9 +308,28 @@ class IrohP2PTransport:
             except Exception as exc:
                 logger.debug("Error closing Iroh endpoint: %s", exc)
 
+    def _cleanup_connect_lock(self, remote_id: str) -> None:
+        """Evict an idle per-peer connect lock when no live pooled connection exists."""
+        lock = self._connect_locks.get(remote_id)
+        if lock is None or lock.locked():
+            return
+        if getattr(lock, "_waiters", None):
+            return
+        conn = self._connections.get(remote_id)
+        if conn is not None and not _is_connection_closed(conn):
+            return
+        self._connect_locks.pop(remote_id, None)
+
+    def _prune_idle_connect_locks(self) -> None:
+        """Remove unlocked connect locks that have no open pooled connection."""
+        for peer_id in list(self._connect_locks):
+            self._cleanup_connect_lock(peer_id)
+
     def _get_connect_lock(self, remote_id: str) -> asyncio.Lock:
         lock = self._connect_locks.get(remote_id)
         if lock is None:
+            if len(self._connect_locks) >= MAX_CONNECT_LOCKS:
+                self._prune_idle_connect_locks()
             lock = asyncio.Lock()
             self._connect_locks[remote_id] = lock
         return lock
@@ -308,9 +346,16 @@ class IrohP2PTransport:
                 incoming = await self._endpoint.accept_next()
                 if incoming is None:
                     break
+                if len(self._incoming_tasks) >= MAX_CONCURRENT_INCOMING_QUIC_CONNECTIONS:
+                    logger.warning(
+                        "Rejecting incoming QUIC connection: active incoming limit (%d) reached",
+                        MAX_CONCURRENT_INCOMING_QUIC_CONNECTIONS,
+                    )
+                    await _refuse_incoming(incoming)
+                    continue
                 task = asyncio.create_task(self._accept_one_connection(incoming))
-                self._conn_tasks.add(task)
-                task.add_done_callback(self._conn_tasks.discard)
+                self._incoming_tasks.add(task)
+                task.add_done_callback(self._incoming_tasks.discard)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -321,11 +366,23 @@ class IrohP2PTransport:
 
     async def _accept_one_connection(self, incoming: Any) -> None:
         """Complete QUIC handshake for an incoming connection and serve its streams."""
-        try:
+        async def _complete_handshake() -> Any:
             accepting = await incoming.accept()
-            conn = await accepting.connect()
+            return await accepting.connect()
+
+        try:
+            conn = await asyncio.wait_for(
+                _complete_handshake(),
+                timeout=QUIC_INCOMING_HANDSHAKE_TIMEOUT_SECONDS,
+            )
         except asyncio.CancelledError:
             raise
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.debug(
+                "Incoming QUIC handshake timed out after %.1fs",
+                QUIC_INCOMING_HANDSHAKE_TIMEOUT_SECONDS,
+            )
+            return
         except Exception as exc:
             logger.debug("Incoming QUIC handshake failed: %s", exc)
             return
@@ -350,6 +407,7 @@ class IrohP2PTransport:
         finally:
             if self._connections.get(remote_id) is conn:
                 self._connections.pop(remote_id, None)
+            self._cleanup_connect_lock(remote_id)
 
     async def _handle_bi_stream(self, bi: Any, remote_id: str) -> None:
         """Read one length-prefixed frame, invoke `on_frame`, and reply with ACK or NACK."""
@@ -425,33 +483,38 @@ class IrohP2PTransport:
             return existing
 
         lock = self._get_connect_lock(remote_id)
-        async with lock:
-            existing = self._connections.get(remote_id)
-            if not _is_connection_closed(existing):
-                return existing
+        try:
+            async with lock:
+                existing = self._connections.get(remote_id)
+                if not _is_connection_closed(existing):
+                    return existing
+                if existing is not None and self._connections.get(remote_id) is existing:
+                    self._connections.pop(remote_id, None)
 
-            if not self.is_running or self._endpoint is None:
-                raise PeerUnreachableError("Iroh QUIC transport is not running")
+                if not self.is_running or self._endpoint is None:
+                    raise PeerUnreachableError("Iroh QUIC transport is not running")
 
-            try:
-                conn = await asyncio.wait_for(
-                    self._endpoint.connect(addr, SHARDAI_QUIC_ALPN),
-                    timeout=connect_timeout,
-                )
-            except (TimeoutError, asyncio.TimeoutError) as exc:
-                raise PeerUnreachableError(
-                    f"QUIC connect to {remote_id} timed out after {connect_timeout:.1f}s"
-                ) from exc
-            except Exception as exc:
-                raise PeerUnreachableError(
-                    f"Unable to establish QUIC connection to {remote_id}: {exc}"
-                ) from exc
+                try:
+                    conn = await asyncio.wait_for(
+                        self._endpoint.connect(addr, SHARDAI_QUIC_ALPN),
+                        timeout=connect_timeout,
+                    )
+                except (TimeoutError, asyncio.TimeoutError) as exc:
+                    raise PeerUnreachableError(
+                        f"QUIC connect to {remote_id} timed out after {connect_timeout:.1f}s"
+                    ) from exc
+                except Exception as exc:
+                    raise PeerUnreachableError(
+                        f"Unable to establish QUIC connection to {remote_id}: {exc}"
+                    ) from exc
 
-            self._register_connection(remote_id, conn, replace=True)
-            reader_task = asyncio.create_task(self._connection_reader_loop(conn, remote_id))
-            self._conn_tasks.add(reader_task)
-            reader_task.add_done_callback(self._conn_tasks.discard)
-            return conn
+                self._register_connection(remote_id, conn, replace=True)
+                reader_task = asyncio.create_task(self._connection_reader_loop(conn, remote_id))
+                self._conn_tasks.add(reader_task)
+                reader_task.add_done_callback(self._conn_tasks.discard)
+                return conn
+        finally:
+            self._cleanup_connect_lock(remote_id)
 
     async def _open_bi_with_retry(
         self,
@@ -471,12 +534,19 @@ class IrohP2PTransport:
                 conn.close(0, b"stale")
             except Exception:
                 pass
+            self._cleanup_connect_lock(remote_id)
             fresh_conn = await self._get_or_connect(
                 remote_id, addr, connect_timeout=connect_timeout
             )
             try:
                 return await asyncio.wait_for(fresh_conn.open_bi(), timeout=connect_timeout)
             except Exception as exc:
+                if (
+                    _is_connection_closed(fresh_conn)
+                    and self._connections.get(remote_id) is fresh_conn
+                ):
+                    self._connections.pop(remote_id, None)
+                self._cleanup_connect_lock(remote_id)
                 raise PeerUnreachableError(
                     f"Failed opening QUIC stream to {remote_id}: {exc}"
                 ) from exc
