@@ -134,6 +134,36 @@ def _strip_xml_ns(tag: str) -> str:
     return tag
 
 
+def _has_unsafe_xml_declarations(raw_bytes: bytes) -> bool:
+    """Return True if raw XML bytes contain `<!DOCTYPE` or `<!ENTITY` declarations."""
+    upper = raw_bytes.upper()
+    return b"<!DOCTYPE" in upper or b"<!ENTITY" in upper
+
+
+async def _read_bounded_response(
+    resp: httpx.Response,
+    max_bytes: int,
+) -> bytes | None:
+    """Stream an HTTP response body up to `max_bytes`, returning `None` if exceeded."""
+    content_len = resp.headers.get("content-length")
+    if content_len is not None:
+        try:
+            parsed_len = int(content_len.strip())
+        except ValueError:
+            return None
+        if parsed_len < 0 or parsed_len > max_bytes:
+            return None
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.aiter_bytes(chunk_size=8192):
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @dataclass(frozen=True, slots=True)
 class UpnpServiceEndpoint:
     """Resolved UPnP WANIPConnection/WANPPPConnection SOAP control endpoint."""
@@ -148,7 +178,7 @@ def _parse_igd_control_endpoint(
     """Parse an IGD device description XML document and extract a valid WAN control URL."""
     if len(xml_bytes) > MAX_UPNP_DESCRIPTION_BYTES:
         return None
-    if b"<!DOCTYPE" in xml_bytes.upper() or b"<!ENTITY" in xml_bytes.upper():
+    if _has_unsafe_xml_declarations(xml_bytes):
         return None
     try:
         root = ET.fromstring(xml_bytes)
@@ -232,20 +262,10 @@ class UpnpClient:
                     async with client.stream("GET", loc) as resp:
                         if resp.status_code != 200:
                             continue
-                        content_len = resp.headers.get("content-length")
-                        if content_len is not None and int(content_len) > MAX_UPNP_DESCRIPTION_BYTES:
+                        body = await _read_bounded_response(resp, MAX_UPNP_DESCRIPTION_BYTES)
+                        if not body:
                             continue
-                        chunks: list[bytes] = []
-                        total = 0
-                        async for chunk in resp.aiter_bytes():
-                            total += len(chunk)
-                            if total > MAX_UPNP_DESCRIPTION_BYTES:
-                                chunks = []
-                                break
-                            chunks.append(chunk)
-                        if not chunks:
-                            continue
-                        endpoint = _parse_igd_control_endpoint(b"".join(chunks), loc)
+                        endpoint = _parse_igd_control_endpoint(body, loc)
                         if endpoint is not None:
                             return endpoint
                 except Exception:
@@ -282,14 +302,22 @@ class UpnpClient:
             transport=self._transport,
             follow_redirects=False,
         ) as client:
-            resp = await client.post(
+            async with client.stream(
+                "POST",
                 endpoint.control_url,
                 content=envelope.encode("utf-8"),
                 headers=headers,
-            )
-            if resp.status_code >= 400:
-                return None
-            return resp.text
+            ) as resp:
+                if resp.status_code >= 400:
+                    return None
+                raw_bytes = await _read_bounded_response(resp, MAX_UPNP_DESCRIPTION_BYTES)
+                if raw_bytes is None:
+                    return None
+                charset = resp.encoding or "utf-8"
+                try:
+                    return raw_bytes.decode(charset, errors="replace")
+                except LookupError:
+                    return raw_bytes.decode("utf-8", errors="replace")
 
     async def add_port_mapping(
         self,
@@ -319,8 +347,11 @@ class UpnpClient:
         text = await self._soap_call(endpoint, "GetExternalIPAddress", "")
         if not text:
             return None
+        raw_bytes = text.encode("utf-8")
+        if _has_unsafe_xml_declarations(raw_bytes):
+            return None
         try:
-            root = ET.fromstring(text.encode("utf-8"))
+            root = ET.fromstring(raw_bytes)
         except ET.ParseError:
             return None
         for elem in root.iter():
